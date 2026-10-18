@@ -70,6 +70,19 @@ więc tylko zgrubne: nowy silnik ma mieścić się w tym rozrzucie. O 1:1 rozstr
 6. **Przełączenie i usunięcie** emulacji XMA, haka `XmaKickStarvedContext` i ścieżki
    `XAudioSubmitRenderDriverFrame`.
 
+#### Stan etapów
+
+- **Etap 1 (2026-10-19):** mapa API w `docs/natywny-dzwiek-api.md`, rejestrator
+  `SR_LOG_AUDIO_API`, surowe nagranie miksu `--audio_dump_raw`, `tools/audio/mixdiff.py`.
+- **Etap 3, konwerter (2026-10-19):** `tools/audio/convert_audio.py` + `tools/audio/ea_ast.py`.
+  Czyta wszystkie archiwa BGFA (także zagnieżdżone i skompresowane RefPack), rekordy `sabr`
+  według reguły z kodu gry (`sub_8232DD10`: `numc` = liczba wpisów, SNR na granicy 16 bajtów),
+  dekoduje EA-XMA przez FFmpeg (4 kanały = dwa strumienie stereo). Wynik: 4648 dźwięków
+  (1616 z `sound.AST`, 3032 głosy z `voice.AST`), **4648/4648 z dokładną liczbą próbek
+  z nagłówka**, 0 błędów, 3,0 GB WAV z pętlami w `smpl` + `manifest.json`. Pozostałe archiwa
+  zawierają wyłącznie banki wariantów (781), które wskazują te dźwięki po nazwie.
+  Otwarte: pełny układ nagłówka banku (lista właściwości całego banku przed wariantami).
+
 #### Pierwszy eksperyment (najtańszy, najwięcej rozstrzyga)
 
 Surowe nagranie ramek miksu, które gra wysyła przez `XAudioSubmitRenderDriverFrame`
