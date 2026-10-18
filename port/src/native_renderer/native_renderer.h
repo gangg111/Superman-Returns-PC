@@ -395,7 +395,9 @@ class Renderer : public NativeFrontend {
                                    const DXGI_FORMAT rtv_formats[4], uint32_t rt_count,
                                    DXGI_FORMAT dsv_format,
                                    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut);
-  uint32_t GetTextureSrvIndex(uint8_t* base, const uint32_t fetch[6]);
+  // stacked_array: a TEXTURE2DARRAY view of a resolved texture (stacked 2D
+  // read by tfetch3D, space6); 0 when the fetch has no such view.
+  uint32_t GetTextureSrvIndex(uint8_t* base, const uint32_t fetch[6], bool stacked_array = false);
   uint32_t GetSamplerIndex(const uint32_t fetch[6], bool force_linear = false,
                            float lod_bias = 0.0f);
   bool UploadConstants(uint8_t* base, uint32_t dev);
@@ -652,6 +654,7 @@ class Renderer : public NativeFrontend {
   struct SlotCache {
     uint32_t fetch[6] = {};
     uint32_t srv = 0;
+    uint32_t stacked_srv = 0;  // array view for tfetch3D of a stacked 2D fetch
     uint64_t frame = ~0ull;
     bool smooth = false;  // point fetch of an upscaled color target -> linear
   } slot_cache_[16];

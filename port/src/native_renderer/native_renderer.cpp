@@ -276,6 +276,9 @@ REXCVAR_DEFINE_BOOL(sr_native_pipeline_cache, true, "Superman Returns Native",
 REXCVAR_DEFINE_INT32(sr_native_shadow_pcf_mode, 0, "Superman Returns Native",
                      "Debug: shadow atlas PCF at shadow_quality > 1 (0 = kernel on the host texel "
                      "grid, 1 = EXP-038 guest-texel kernel)");
+REXCVAR_DEFINE_BOOL(sr_native_stacked_textures, true, "Superman Returns Native",
+                    "Debug: read stacked 2D textures fetched by tfetch3D through 2D array views "
+                    "(the sun's shadow map); off binds the null volume as before");
 REXCVAR_DEFINE_BOOL(sr_native_gpu_breadcrumbs, false, "Superman Returns Native",
                     "Debug: GPU hang breadcrumbs (a pipeline-draining marker write after every "
                     "draw; enable only to diagnose GPU hangs)");
@@ -1228,7 +1231,7 @@ bool Renderer::EnsureInitialized() {
 
 bool Renderer::CreateDrawResources() {
   // --- Main root signature: 3 root CBVs + bindless SRV/sampler tables. ---
-  D3D12_DESCRIPTOR_RANGE srv_ranges[4] = {};
+  D3D12_DESCRIPTOR_RANGE srv_ranges[5] = {};
   for (uint32_t i = 0; i < 3; ++i) {
     srv_ranges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     srv_ranges[i].NumDescriptors = kSrvHeapSize;
@@ -1238,7 +1241,7 @@ bool Renderer::CreateDrawResources() {
   sampler_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
   sampler_range.NumDescriptors = kSamplerHeapSize;
   sampler_range.RegisterSpace = 3;
-  D3D12_ROOT_PARAMETER params[9] = {};
+  D3D12_ROOT_PARAMETER params[10] = {};
   for (uint32_t i = 0; i < 3; ++i) {
     params[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[i].Descriptor.ShaderRegister = i;
@@ -1261,16 +1264,24 @@ bool Renderer::CreateDrawResources() {
   params[7].DescriptorTable.NumDescriptorRanges = 1;
   params[7].DescriptorTable.pDescriptorRanges = &srv_ranges[3];
   params[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-  rs_desc.NumParameters = 8;
+  // space6: 2D array views of stacked textures read by tfetch3D (TEX_STACKED_BIT).
+  srv_ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  srv_ranges[4].NumDescriptors = kSrvHeapSize;
+  srv_ranges[4].RegisterSpace = 6;
+  params[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[8].DescriptorTable.NumDescriptorRanges = 1;
+  params[8].DescriptorTable.pDescriptorRanges = &srv_ranges[4];
+  params[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  rs_desc.NumParameters = 9;
   // Debug (sr_native_debug_rs_salt): an unused root-constant parameter makes every
   // pipeline new to the driver's shader cache - a cold first run on demand.
   if (int32_t salt = REXCVAR_GET(sr_native_debug_rs_salt); salt > 0) {
-    params[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[8].Constants.ShaderRegister = 15;
-    params[8].Constants.RegisterSpace = 7;
-    params[8].Constants.Num32BitValues = uint32_t(std::min(salt, 32));
-    params[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    rs_desc.NumParameters = 9;
+    params[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[9].Constants.ShaderRegister = 15;
+    params[9].Constants.RegisterSpace = 7;
+    params[9].Constants.Num32BitValues = uint32_t(std::min(salt, 32));
+    params[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rs_desc.NumParameters = 10;
   }
   rs_desc.pParameters = params;
   rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -3178,7 +3189,7 @@ ID3D12PipelineState* Renderer::GetPipeline(uint8_t* base, uint32_t dev, uint64_t
   return pso.Get();
 }
 
-uint32_t Renderer::GetTextureSrvIndex(uint8_t* base, const uint32_t fetch[6]) {
+uint32_t Renderer::GetTextureSrvIndex(uint8_t* base, const uint32_t fetch[6], bool stacked_array) {
   CpuTimer cpu_timer(cpu_timings.texture_lookup_ns);
   // Textures produced by resolves live on the host GPU only.
   uint32_t base_address = GuestPhysical(fetch[1] & 0xFFFFF000u);
@@ -3207,6 +3218,27 @@ uint32_t Renderer::GetTextureSrvIndex(uint8_t* base, const uint32_t fetch[6]) {
     }
     uint32_t encoded = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(mapping[0], mapping[1], mapping[2],
                                                                mapping[3]);
+    // Array views share srv_by_mapping (retired with the 2D views); bit 31 is
+    // outside the encoded mapping.
+    if (stacked_array) {
+      uint32_t key = encoded | 0x80000000u;
+      auto ait = rt.srv_by_mapping.find(key);
+      if (ait != rt.srv_by_mapping.end()) return ait->second;
+      uint32_t index = AllocSrvIndex();
+      if (!index) return 0;
+      D3D12_RESOURCE_DESC rd = rt.resource->GetDesc();
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+      srv.Format = rt.srv_format;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+      srv.Shader4ComponentMapping = encoded;
+      srv.Texture2DArray.MipLevels = 1;
+      srv.Texture2DArray.ArraySize = rd.DepthOrArraySize;
+      device_->CreateShaderResourceView(
+          rt.resource.Get(), &srv,
+          provider_->OffsetViewDescriptor(srv_heap_->GetCPUDescriptorHandleForHeapStart(), index));
+      rt.srv_by_mapping[key] = index;
+      return index;
+    }
     // A depth resolve fetched as k_8_8_8_8 reads the raw D24S8 bytes.
     if (rt.raw_resource && (fetch[1] & 0x3F) == uint32_t(xenos::TextureFormat::k_8_8_8_8)) {
       uint32_t raw_mapping[4];
@@ -3249,8 +3281,10 @@ uint32_t Renderer::GetTextureSrvIndex(uint8_t* base, const uint32_t fetch[6]) {
     return index;
   }
 
+  // Uploaded stacked textures are rejected by CreateTexture: no array view.
+  if (stacked_array) return 0;
   // Sign fields (dword 0 bits 2-9) are part of the key: gamma changes the view.
-  uint64_t key_parts[4] = {fetch[1] | (uint64_t((fetch[0] >> 2) & 0xFF) << 32), fetch[2],
+  uint64_t key_parts[4] ={fetch[1] | (uint64_t((fetch[0] >> 2) & 0xFF) << 32), fetch[2],
                            fetch[3] & 0x1FFE, fetch[5] & 0xFFFFFE00u};
   uint64_t key = XXH3_64bits(key_parts, sizeof(key_parts));
   auto it = textures_.find(key);
@@ -3961,6 +3995,12 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
       } else {
         if(CpuProfiling()) ++cpu_timings.slot_misses;
         srv = GetTextureSrvIndex(base, fetch);
+        // Stacked 2D (dword 1 bit 10) read by tfetch3D: Xenos reads array
+        // layer z * layers (the sun's shadow map), so bind an array view.
+        sc.stacked_srv = REXCVAR_GET(sr_native_stacked_textures) && srv > 2 &&
+                                 ((fetch[5] >> 9) & 3) <= 1 && (fetch[1] & (1u << 10))
+                             ? GetTextureSrvIndex(base, fetch, true)
+                             : 0;
         // Resolve textures rendered at render_scale / shadow_quality: bits
         // 29-30 carry scale - 1 so the shader keeps texel offsets and filter
         // weights in guest texels (TEX_SCALE in the XenosRecomp patch).
@@ -4040,9 +4080,13 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
                   srv, src);
     }
     // Each dimension reads its own descriptor heap view; the others get nulls.
+    // Bit 28 of a 3D index is TEX_STACKED_BIT (array view in space6), so the
+    // smooth-effects bit of the 2D index must not reach it.
     uint32_t dimension = (fetch[5] >> 9) & 3;
     s[slot] = dimension <= 1 ? srv : 0;
-    s[16 + slot] = dimension == 2 && srv ? srv : 1;
+    s[16 + slot] = dimension == 2 && srv ? srv & ~0x10000000u : 1;
+    if (dimension <= 1 && srv && slot_cache_[slot].stacked_srv)
+      s[16 + slot] = (srv & 0x8FFF0000u) | slot_cache_[slot].stacked_srv | 0x10000000u;
     s[32 + slot] = dimension == 3 && srv ? srv : 2;
     s[48 + slot] = sampler;
   }
@@ -4548,6 +4592,8 @@ bool Renderer::PrepareDraw(uint8_t* base, uint32_t dev, uint32_t prim,
         6, sampler_heap_->GetGPUDescriptorHandleForHeapStart());
     command_list_->SetGraphicsRootDescriptorTable(
         7, srv_heap_->GetGPUDescriptorHandleForHeapStart());
+    command_list_->SetGraphicsRootDescriptorTable(
+        8, srv_heap_->GetGPUDescriptorHandleForHeapStart());
     frame_state_bound_ = true;
   }
   // Primitive restart only matters for strips.

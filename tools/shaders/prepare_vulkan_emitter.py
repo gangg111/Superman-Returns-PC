@@ -11,9 +11,17 @@ def prepare(root=ROOT):
  shutil.copytree(source/'src/XenosRecomp',target/'src/XenosRecomp',dirs_exist_ok=True)
  for name in ('fmt','xxHash'):
   shutil.copytree(source/'deps'/name,target/'deps'/name,dirs_exist_ok=True,ignore=shutil.ignore_patterns('.git','test','tests','doc','docs','build'))
- patches=[root/'tools/shaders/xenosrecomp/patches'/name for name in ('0011-vulkan-buffer-bindings.patch','0012-vulkan-stacked-tfetch3d.patch')]
+ patches=[root/'tools/shaders/xenosrecomp/patches'/name for name in ('0011-vulkan-buffer-bindings.patch','0014-stacked-tfetch3d.patch')]
  args=['git','apply','--directory',(target.relative_to(root)/'src').as_posix()]
- for patch in patches:
+ # fetch_xenosrecomp.py applies every patch to the source and stamps .sr_pin with
+ # their names and fingerprint; later patches change the context of earlier ones,
+ # so a per-patch reverse check cannot tell that they are already there.
+ from fetch_xenosrecomp import patch_fingerprint
+ stamp=source/'src/.sr_pin'
+ lines=stamp.read_text().splitlines() if stamp.is_file() else []
+ series=sorted((root/'tools/shaders/xenosrecomp/patches').glob('*.patch'))
+ applied=bool(lines) and lines[-1]==patch_fingerprint(series) and all(p.name in lines for p in patches)
+ for patch in ([] if applied else patches):
   check=subprocess.run([*args,'--check',str(patch)],cwd=root,capture_output=True,text=True)
   if check.returncode:
    reverse=subprocess.run([*args,'--reverse','--check',str(patch)],cwd=root,capture_output=True,text=True)

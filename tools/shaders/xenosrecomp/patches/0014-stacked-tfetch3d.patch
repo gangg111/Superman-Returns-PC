@@ -1,25 +1,26 @@
 --- a/XenosRecomp/shader_common.h
 +++ b/XenosRecomp/shader_common.h
-@@ -222,6 +222,14 @@ Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
+@@ -221,6 +221,16 @@
+ #else
  TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
  #endif
- #ifdef SR_VULKAN_BUFFERS
 +// Stacked (2D array) textures fetched through a 3D instruction. Xenos reads
 +// array layer z * layers there (the hardware rounds the layer coordinate), not
 +// a volume; the renderer sets TEX_STACKED_BIT on the 3D index of such a slot
-+// and binds the array view at the 2D index.
-+[[vk::binding(3,1)]] Texture2DArray<float4> g_Texture2DArrayDescriptorHeap[32];
-+#define TEX_STACKED_BIT 0x10000000u
-+#endif
++// and points it at an array view of the texture.
 +#ifdef SR_VULKAN_BUFFERS
++[[vk::binding(3,1)]] Texture2DArray<float4> g_Texture2DArrayDescriptorHeap[32];
++#else
++Texture2DArray<float4> g_Texture2DArrayDescriptorHeap[] : register(t0, space6);
++#endif
++#define TEX_STACKED_BIT 0x10000000u
+ #ifdef SR_VULKAN_BUFFERS
  [[vk::binding(0,2)]] SamplerState g_SamplerDescriptorHeap[32];
  #else
- SamplerState g_SamplerDescriptorHeap[] : register(s0, space3);
-@@ -355,6 +363,16 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+@@ -355,6 +365,14 @@
  
  float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
  {
-+#ifdef SR_VULKAN_BUFFERS
 +    if (resourceDescriptorIndex & TEX_STACKED_BIT)
 +    {
 +        Texture2DArray<float4> stack = g_Texture2DArrayDescriptorHeap[TEX_INDEX(resourceDescriptorIndex)];
@@ -28,7 +29,6 @@
 +        return conanGamma(resourceDescriptorIndex, stack.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex],
 +            float3(texCoord.xy, texCoord.z * float(layers))));
 +    }
-+#endif
      return conanGamma(resourceDescriptorIndex, g_Texture3DDescriptorHeap[TEX_INDEX(resourceDescriptorIndex)].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord));
  }
  
