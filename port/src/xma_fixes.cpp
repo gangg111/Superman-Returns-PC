@@ -36,6 +36,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <cstdlib>
 #include <thread>
 
@@ -104,8 +105,34 @@ void MaybeLogCounters() {
               g_kicks.load(), g_giveups.load());
 }
 
+// SR_LOG_XMA=2: every 10 s, the streams the mixer gave up on, with their XMA
+// context and reason (matches the context addresses of xma_log_contexts).
+// Called from the single mixer thread only.
+void CountGiveUp(const char* reason, uint32_t xma_context, uint32_t stream) {
+  static const bool enabled = [] {
+    const char* v = std::getenv("SR_LOG_XMA");
+    return v && std::atoi(v) >= 2;
+  }();
+  if (!enabled) return;
+  struct Entry { uint32_t context; const char* reason; uint32_t count; };
+  static std::map<uint32_t, Entry> streams;
+  static Clock::time_point last = Clock::now();
+  auto& entry = streams[stream];
+  entry.context = xma_context;
+  entry.reason = reason;
+  ++entry.count;
+  if (Clock::now() - last < std::chrono::seconds(10)) return;
+  last = Clock::now();
+  for (const auto& [address, e] : streams) {
+    REXAPU_INFO("XMA fix: stream {:08X} context {:08X} gave up {} times ({})", address, e.context,
+                e.count, e.reason);
+  }
+  streams.clear();
+}
+
 void LogGiveUp(const char* reason, uint32_t xma_context, uint32_t stream) {
   static std::atomic<uint32_t> count{0};
+  CountGiveUp(reason, xma_context, stream);
   g_giveups.fetch_add(1, std::memory_order_relaxed);
   if (count.fetch_add(1) < 10) {
     REXAPU_INFO("XMA fix: stopped waiting on context {:08X} (stream {:08X}): {}", xma_context,
