@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.IO;
 using System.Globalization;
 using System.Text;
@@ -28,6 +28,11 @@ public sealed class LauncherSettings
     public bool SkipIntro { get; set; }
     public bool FrameGeneration { get; set; }
     public string FrameGenerationDll { get; set; } = "";
+    public string Language { get; set; } = L.DefaultLanguage();
+    // Device-state draws with the original XDK draw/resolve/clear/inline/fence
+    // code skipped (Vulkan only); see port/src/graphics/guest/state_source.h.
+    public bool NativePort { get; set; } = true;
+    public bool DiagnosticLogs { get; set; }
 
     public static LauncherSettings Load(string path)
     {
@@ -61,6 +66,9 @@ public sealed class LauncherSettings
                 case "skip_intro": if (bool.TryParse(value, out var si)) s.SkipIntro = si; break;
                 case "frame_generation": if (bool.TryParse(value, out var fg)) s.FrameGeneration = fg; break;
                 case "frame_generation_dll": s.FrameGenerationDll = value; break;
+                case "language": s.Language = L.Normalize(value); break;
+                case "native_port": if (bool.TryParse(value, out var np)) s.NativePort = np; break;
+                case "diagnostic_logs": if (bool.TryParse(value, out var dl)) s.DiagnosticLogs = dl; break;
             }
         }
         return s;
@@ -69,13 +77,15 @@ public sealed class LauncherSettings
     public void Save(string path)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
-        var lines = new[] { "# Superman Returns — launcher", $"game_exe={GameExe}", $"game_data={GameData}",
+        var lines = new[] { "# Superman Returns PC launcher", $"game_exe={GameExe}", $"game_data={GameData}",
             $"resolution={Resolution}", $"display_mode={DisplayMode}", $"gpu={Gpu}", $"gpu_luid={GpuLuid}",
             $"vsync={VSync.ToString().ToLowerInvariant()}", $"fps_limit={FpsLimit}", $"render_scale={RenderScale}",
             $"texture_filter={TextureFilter}", $"antialiasing={Antialiasing}", $"shadow_quality={ShadowQuality}",
             $"msaa={Msaa}", $"input={InputMode}", $"renderer={Renderer}", $"graphics_api={GraphicsApi}",
             $"skip_intro={SkipIntro.ToString().ToLowerInvariant()}",
-            $"frame_generation={FrameGeneration.ToString().ToLowerInvariant()}", $"frame_generation_dll={FrameGenerationDll}" };
+            $"frame_generation={FrameGeneration.ToString().ToLowerInvariant()}", $"frame_generation_dll={FrameGenerationDll}",
+            $"language={Language}", $"native_port={NativePort.ToString().ToLowerInvariant()}",
+            $"diagnostic_logs={DiagnosticLogs.ToString().ToLowerInvariant()}" };
         var temporary = path + ".tmp";
         File.WriteAllLines(temporary, lines, new UTF8Encoding(false));
         File.Move(temporary, path, true);
@@ -128,24 +138,42 @@ public sealed class LauncherSettings
         return result;
     }
 
+    // Environment for the game process: the native-port switches (Vulkan only, the
+    // only path that builds draws from the device state) and the diagnostic logs.
+    public IReadOnlyList<(string Name, string Value)> BuildEnvironment()
+    {
+        var env = new List<(string, string)>();
+        if (NativePort && UsesVulkan) {
+            env.Add(("SR_NATIVE_STATE_SOURCE", "device"));
+            env.Add(("SR_NATIVE_SKIP_ORIGINAL", "draw,resolve,clear,inline,fence"));
+        }
+        if (DiagnosticLogs) {
+            env.Add(("SR_LOG_MEM", "10"));
+            env.Add(("SR_LOG_FPS", "1"));
+            env.Add(("SR_LOG_XMA", "1"));
+        }
+        return env;
+    }
+
     public string BuildArguments() => string.Join(' ', BuildArgumentList());
 
     public ProcessStartInfo CreateLaunch(string baseDirectory)
     {
         var exe = Path.GetFullPath(GameExe, baseDirectory);
         if (!File.Exists(exe) || !Path.GetFileName(exe).Equals("superman_returns.exe", StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("Selecione o executável superman_returns.exe da build do jogo.");
+            throw new InvalidOperationException(L.T("ErrExe"));
         var data = Path.GetFullPath(string.IsNullOrWhiteSpace(GameData) ? Path.Combine(Path.GetDirectoryName(exe)!, "game") : GameData, baseDirectory);
         if (!File.Exists(Path.Combine(data, "default.xex")) || !Directory.Exists(Path.Combine(data, "DATA")))
-            throw new InvalidOperationException("Selecione a pasta game que contém default.xex e a pasta DATA.");
+            throw new InvalidOperationException(L.T("ErrData"));
         if (FrameGeneration && (string.IsNullOrWhiteSpace(FrameGenerationDll) || !File.Exists(FrameGenerationDll)))
-            throw new InvalidOperationException("Selecione a Lossless.dll instalada para ativar a geração de quadros.");
+            throw new InvalidOperationException(L.T("ErrDll"));
         var logDir = Path.Combine(Path.GetDirectoryName(exe)!, "logs");
         Directory.CreateDirectory(logDir);
         var start = new ProcessStartInfo(exe) { WorkingDirectory = Path.GetDirectoryName(exe)!, UseShellExecute = false };
         foreach (var argument in BuildArgumentList()) start.ArgumentList.Add(argument);
         start.ArgumentList.Add($"--game_data_root={data}");
         start.ArgumentList.Add($"--log_file={Path.Combine(logDir, "game.log")}");
+        foreach (var (name, value) in BuildEnvironment()) start.Environment[name] = value;
         return start;
     }
 

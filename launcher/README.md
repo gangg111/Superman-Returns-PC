@@ -1,6 +1,6 @@
 # Launcher Windows
 
-GUI WPF em português, adaptada do pacote fornecido pelo usuário. Inicia o renderer
+GUI WPF em inglês e polonês (seletor EN | PL na barra lateral, salvo em `language`; o padrão segue o idioma do Windows). Os textos ficam em `Localization.cs`. A opção "Native renderer without XDK emulation" (Vulkan) define `SR_NATIVE_STATE_SOURCE=device` e `SR_NATIVE_SKIP_ORIGINAL`; "Diagnostic logs" define `SR_LOG_MEM`, `SR_LOG_FPS` e `SR_LOG_XMA`. Inicia o renderer
 nativo com a API escolhida: Vulkan (padrão, experimental) ou Direct3D 12 (`--sr_native_api`).
 Com Vulkan, escala interna, FXAA, MSAA, sombras e filtro anisotrópico ficam no padrão do jogo.
 O launcher só envia `--sr_native_gpu_luid` quando uma GPU específica foi escolhida: um argumento

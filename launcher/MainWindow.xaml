@@ -1,6 +1,6 @@
 <Window x:Class="SupermanReturnsLauncher.MainWindow"
  xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
- Title="Superman Returns — Launcher" Width="1040" Height="780" MinWidth="860" MinHeight="620" WindowStartupLocation="CenterScreen"
+ Title="Superman Returns PC" Width="1040" Height="780" MinWidth="860" MinHeight="620" WindowStartupLocation="CenterScreen"
  Background="{StaticResource Bg}">
  <Grid Margin="24">
   <Grid.ColumnDefinitions><ColumnDefinition Width="240"/><ColumnDefinition Width="24"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
@@ -9,63 +9,67 @@
     <StackPanel>
      <TextBlock Text="SUPERMAN" FontSize="29" FontWeight="ExtraBold"/>
      <TextBlock Text="RETURNS" FontSize="28" FontWeight="Bold" Foreground="{StaticResource Accent}"/>
-     <TextBlock Text="RECOMPILED" FontSize="13" Margin="1,4,0,28" Foreground="{StaticResource Muted}"/>
-     <TextBlock Text="Pronto para Metropolis" FontSize="16" FontWeight="SemiBold" TextWrapping="Wrap"/>
-     <TextBlock Text="Ajuste o jogo antes de começar. Suas preferências ficam salvas neste computador." TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,10,0,24"/>
-     <Button Content="JOGAR" Height="52" FontSize="18" Click="Play_Click" AutomationProperties.Name="Jogar"/>
-     <Button Content="Salvar preferências" Margin="0,12,0,0" Background="#30394A" Click="Save_Click"/>
-     <Button Content="Restaurar qualidade original" Margin="0,10,0,0" Background="Transparent" FontSize="11" Padding="4,10" Click="Defaults_Click"/>
-     <TextBlock x:Name="StatusText" Text="Pronto." Foreground="{StaticResource Muted}" Margin="0,18,0,0" TextWrapping="Wrap"/>
+     <TextBlock x:Name="TaglineText" FontSize="13" Margin="1,4,0,28" Foreground="{StaticResource Muted}"/>
+     <TextBlock x:Name="ReadyText" FontSize="16" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,20"/>
+     <Button x:Name="PlayButton" Height="52" FontSize="18" Click="Play_Click"/>
+     <Button x:Name="SaveButton" Margin="0,12,0,0" Background="#30394A" Click="Save_Click"/>
+     <Button x:Name="DefaultsButton" Margin="0,10,0,0" Background="Transparent" FontSize="11" Padding="4,10" Click="Defaults_Click"/>
+     <TextBlock x:Name="StatusText" Foreground="{StaticResource Muted}" Margin="0,18,0,0" TextWrapping="Wrap"/>
     </StackPanel>
-    <StackPanel Grid.Row="2"><TextBlock Text="MOTOR E API" FontSize="11" FontWeight="Bold" Foreground="{StaticResource Accent}"/>
-     <TextBlock Text="Nativo + Direct3D 12 é a combinação validada." TextWrapping="Wrap" Foreground="{StaticResource Muted}" Margin="0,6,0,0" FontSize="12"/></StackPanel>
+    <StackPanel Grid.Row="2">
+     <TextBlock x:Name="LanguageLabel" FontSize="11" FontWeight="Bold" Foreground="{StaticResource Accent}"/>
+     <UniformGrid Columns="2" Margin="0,8,0,0">
+      <Button x:Name="EnglishButton" Content="EN" Margin="0,0,4,0" Click="English_Click" AutomationProperties.Name="English"/>
+      <Button x:Name="PolishButton" Content="PL" Margin="4,0,0,0" Click="Polish_Click" AutomationProperties.Name="Polski"/>
+     </UniformGrid>
+    </StackPanel>
    </Grid>
   </Border>
   <ScrollViewer Grid.Column="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="0,0,10,0">
    <StackPanel>
-    <TextBlock Text="Configure sua experiência" FontSize="27" FontWeight="SemiBold"/>
+    <TextBlock x:Name="HeadingText" FontSize="27" FontWeight="SemiBold"/>
     <TextBlock x:Name="SummaryText" Foreground="{StaticResource Muted}" Margin="0,7,0,20"/>
     <UniformGrid Columns="2">
      <StackPanel Margin="0,0,12,0">
-      <TextBlock Text="Motor de renderização"/><ComboBox x:Name="RendererBox" AutomationProperties.Name="Motor de renderização"/>
-       <TextBlock Text="API gráfica"/><ComboBox x:Name="ApiBox" AutomationProperties.Name="API gráfica"/>
-       <TextBlock Text="Resolução da janela"/><ComboBox x:Name="ResolutionBox" AutomationProperties.Name="Resolução"/>
-      <TextBlock Text="Modo de exibição"/><ComboBox x:Name="DisplayModeBox" AutomationProperties.Name="Modo de exibição"/>
-      <TextBlock Text="Placa de vídeo"/><ComboBox x:Name="GpuBox" AutomationProperties.Name="Placa de vídeo"/>
-      <TextBlock Text="Como você vai jogar"/><ComboBox x:Name="InputBox" AutomationProperties.Name="Controles"/>
+      <TextBlock x:Name="RendererLabel"/><ComboBox x:Name="RendererBox"/>
+      <TextBlock x:Name="ApiLabel"/><ComboBox x:Name="ApiBox"/>
+      <TextBlock x:Name="ResolutionLabel"/><ComboBox x:Name="ResolutionBox"/>
+      <TextBlock x:Name="DisplayModeLabel"/><ComboBox x:Name="DisplayModeBox"/>
+      <TextBlock x:Name="GpuLabel"/><ComboBox x:Name="GpuBox"/>
+      <TextBlock x:Name="InputLabel"/><ComboBox x:Name="InputBox"/>
      </StackPanel>
      <StackPanel Margin="12,0,0,0">
-      <TextBlock Text="Resolução interna"/><ComboBox x:Name="RenderScaleBox" AutomationProperties.Name="Resolução interna"/>
-      <TextBlock Text="Suavização da imagem"/><ComboBox x:Name="AaBox" AutomationProperties.Name="Suavização"/>
-      <TextBlock Text="Filtro de texturas"/><ComboBox x:Name="FilterBox" AutomationProperties.Name="Filtro de texturas"/>
-      <TextBlock Text="Limite de quadros"/><ComboBox x:Name="FpsBox" AutomationProperties.Name="Limite de FPS"/>
+      <TextBlock x:Name="RenderScaleLabel"/><ComboBox x:Name="RenderScaleBox"/>
+      <TextBlock x:Name="AaLabel"/><ComboBox x:Name="AaBox"/>
+      <TextBlock x:Name="FilterLabel"/><ComboBox x:Name="FilterBox"/>
+      <TextBlock x:Name="FpsLabel"/><ComboBox x:Name="FpsBox"/>
      </StackPanel>
     </UniformGrid>
-    <TextBlock x:Name="FpsNote" Foreground="{StaticResource Muted}" TextWrapping="Wrap" FontSize="12" Margin="0,0,0,10"/>
-    <CheckBox x:Name="FrameGenerationBox" Content="Geração de quadros (2x)" AutomationProperties.Name="Geração de quadros"/>
-    <TextBlock Text="Melhora a fluidez com quadros intermediários. A velocidade e a resposta do jogo continuam nos FPS reais." Foreground="{StaticResource Muted}" TextWrapping="Wrap" FontSize="12" Margin="0,0,0,8"/>
+    <TextBlock x:Name="FpsWarning" Foreground="{StaticResource Accent}" TextWrapping="Wrap" FontSize="12" Margin="0,0,0,10"/>
+    <CheckBox x:Name="NativePortBox"/>
+    <CheckBox x:Name="DiagnosticLogsBox"/>
+    <CheckBox x:Name="FrameGenerationBox"/>
     <StackPanel x:Name="FrameGenerationPanel" Margin="0,0,0,12">
-     <TextBlock Text="Lossless.dll instalada" Foreground="{StaticResource Muted}"/>
-     <DockPanel Margin="0,6,0,0"><Button DockPanel.Dock="Right" Content="Procurar" Margin="8,0,0,0" Background="#30394A" Click="BrowseFrameGeneration_Click"/><TextBox x:Name="FrameGenerationDllBox" AutomationProperties.Name="Lossless.dll"/></DockPanel>
+     <TextBlock x:Name="FrameGenDllLabel" Foreground="{StaticResource Muted}"/>
+     <DockPanel Margin="0,6,0,0"><Button x:Name="BrowseDllButton" DockPanel.Dock="Right" Margin="8,0,0,0" Background="#30394A" Click="BrowseFrameGeneration_Click"/><TextBox x:Name="FrameGenerationDllBox"/></DockPanel>
     </StackPanel>
-    <Expander Header="Mais opções gráficas" Foreground="{StaticResource Text}" Margin="0,0,0,16">
-     <StackPanel Margin="0,10,0,0"><TextBlock x:Name="EngineNote" Foreground="{StaticResource Muted}" TextWrapping="Wrap" FontSize="12" Margin="0,0,0,10"/><UniformGrid Columns="2">
-      <StackPanel Margin="0,0,12,0"><TextBlock Text="Resolução das sombras"/><ComboBox x:Name="ShadowBox"/></StackPanel>
-      <StackPanel Margin="12,0,0,0"><TextBlock Text="MSAA das sombras"/><ComboBox x:Name="MsaaBox"/></StackPanel>
-     </UniformGrid><CheckBox x:Name="VSyncBox" Content="Sincronização vertical (VSync)"/>
-       <CheckBox x:Name="SkipIntroBox" Content="Pular logos e vídeos legais da abertura"/>
-      <TextBlock Text="Sombras maiores e MSAA podem aumentar bastante o custo de renderização." Foreground="{StaticResource Muted}" TextWrapping="Wrap" FontSize="12"/>
+    <Expander x:Name="MoreGraphicsExpander" Foreground="{StaticResource Text}" Margin="0,0,0,16">
+     <StackPanel Margin="0,10,0,0"><UniformGrid Columns="2">
+      <StackPanel Margin="0,0,12,0"><TextBlock x:Name="ShadowLabel"/><ComboBox x:Name="ShadowBox"/></StackPanel>
+      <StackPanel Margin="12,0,0,0"><TextBlock x:Name="MsaaLabel"/><ComboBox x:Name="MsaaBox"/></StackPanel>
+     </UniformGrid><CheckBox x:Name="VSyncBox"/>
+      <CheckBox x:Name="SkipIntroBox"/>
      </StackPanel>
     </Expander>
     <Border Background="{StaticResource Panel}" CornerRadius="10" Padding="16">
-     <StackPanel><TextBlock Text="Arquivos do jogo" FontSize="17" FontWeight="SemiBold" Margin="0,0,0,12"/>
-      <TextBlock Text="Executável da build" Foreground="{StaticResource Muted}"/>
-      <DockPanel Margin="0,6,0,12"><Button DockPanel.Dock="Right" Content="Procurar" Margin="8,0,0,0" Background="#30394A" Click="Browse_Click"/><TextBox x:Name="GameExeBox" AutomationProperties.Name="Executável do jogo"/></DockPanel>
-      <TextBlock Text="Pasta game — default.xex e DATA" Foreground="{StaticResource Muted}"/>
-      <DockPanel Margin="0,6,0,0"><Button DockPanel.Dock="Right" Content="Procurar" Margin="8,0,0,0" Background="#30394A" Click="BrowseData_Click"/><TextBox x:Name="GameDataBox" AutomationProperties.Name="Pasta do jogo"/></DockPanel>
+     <StackPanel><TextBlock x:Name="GameFilesText" FontSize="17" FontWeight="SemiBold" Margin="0,0,0,12"/>
+      <TextBlock x:Name="GameExeLabel" Foreground="{StaticResource Muted}"/>
+      <DockPanel Margin="0,6,0,12"><Button x:Name="BrowseExeButton" DockPanel.Dock="Right" Margin="8,0,0,0" Background="#30394A" Click="Browse_Click"/><TextBox x:Name="GameExeBox"/></DockPanel>
+      <TextBlock x:Name="GameDataLabel" Foreground="{StaticResource Muted}"/>
+      <DockPanel Margin="0,6,0,0"><Button x:Name="BrowseDataButton" DockPanel.Dock="Right" Margin="8,0,0,0" Background="#30394A" Click="BrowseData_Click"/><TextBox x:Name="GameDataBox"/></DockPanel>
      </StackPanel>
     </Border>
-    <Expander Header="Detalhes de inicialização" Foreground="{StaticResource Muted}" Margin="0,16,0,0"><TextBox x:Name="ArgumentsPreview" IsReadOnly="True" TextWrapping="Wrap" MinHeight="72" Margin="0,10,0,0"/></Expander>
+    <Expander x:Name="LaunchDetailsExpander" Foreground="{StaticResource Muted}" Margin="0,16,0,0"><TextBox x:Name="ArgumentsPreview" IsReadOnly="True" TextWrapping="Wrap" MinHeight="72" Margin="0,10,0,0"/></Expander>
    </StackPanel>
   </ScrollViewer>
  </Grid>

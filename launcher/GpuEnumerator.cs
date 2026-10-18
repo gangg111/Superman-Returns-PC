@@ -2,7 +2,7 @@ using System.Runtime.InteropServices;
 
 namespace SupermanReturnsLauncher;
 
-public sealed record GpuAdapter(int Index, string Name, string Luid = "") { public override string ToString() => Name; }
+public sealed record GpuAdapter(int Index, string Name, string Luid = "") { public override string ToString() => Index < 0 ? L.T("AutoGpu") : Name; }
 internal static class GpuEnumerator
 {
     [DllImport("dxgi.dll", ExactSpelling = true)]
@@ -26,7 +26,7 @@ internal static class GpuEnumerator
 
     public static IReadOnlyList<GpuAdapter> GetAdapters()
     {
-        var result = new List<GpuAdapter> { new(-1, "Automática") };
+        var result = new List<GpuAdapter> { new(-1, "Auto") };
         nint factory = 0;
         try
         {
