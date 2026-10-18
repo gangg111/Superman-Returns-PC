@@ -87,9 +87,25 @@ SR_TEST(build_bindings_writes_vs_ps_and_patches_shared_in_the_block) {
   std::memcpy(&word,block.data()+3*4,4);SR_CHECK_EQ(word,0x11111111u);
   std::memcpy(&word,block.data()+4096+5*4,4);SR_CHECK_EQ(word,0x22222222u);
   SR_CHECK_EQ(uint32_t(block.shared()[300]),0x7eu);
-  std::memcpy(&word,block.shared()+7*4,4);SR_CHECK_EQ(word,b.texture_indices[7]);   // texture index of slot 7
-  std::memcpy(&word,block.shared()+128+7*4,4);SR_CHECK_EQ(word,7u);                // sampler index of slot 7
+  // Shader ABI: 2D [4r], 3D [64+4r], cube [128+4r], sampler [192+4r].
+  std::memcpy(&word,block.shared()+7*4,4);SR_CHECK_EQ(word,b.texture_indices[7]);   // 2D index of slot 7
+  std::memcpy(&word,block.shared()+64+7*4,4);SR_CHECK_EQ(word,31u);                // no 3D texture: dummy
+  std::memcpy(&word,block.shared()+128+7*4,4);SR_CHECK_EQ(word,31u);               // no cube texture: dummy
+  std::memcpy(&word,block.shared()+192+7*4,4);SR_CHECK_EQ(word,7u);                // sampler index of slot 7
   SR_CHECK_EQ(b.sampler_indices[7],7u);
+}
+SR_TEST(build_bindings_puts_3d_and_cube_indices_in_their_tables) {
+  guest::DrawPacket p;
+  p.texture_fetch[2][0]=2;p.texture_fetch[2][5]=2<<9;p.texture_fetch[2][1]=0x2006;  // 3D
+  p.texture_fetch[3][0]=2;p.texture_fetch[3][5]=3<<9;p.texture_fetch[3][1]=0x3006;  // cube
+  Block block;DrawBindings b;Error e;
+  SR_CHECK(BuildBindings(p,block.data(),b,e));
+  uint32_t word=0;
+  std::memcpy(&word,block.shared()+64+2*4,4);SR_CHECK_EQ(word,b.texture_indices[2]);
+  std::memcpy(&word,block.shared()+2*4,4);SR_CHECK_EQ(word,31u);
+  std::memcpy(&word,block.shared()+128+3*4,4);SR_CHECK_EQ(word,b.texture_indices[3]);
+  std::memcpy(&word,block.shared()+64+3*4,4);SR_CHECK_EQ(word,31u);
+  std::memcpy(&word,block.shared()+192+3*4,4);SR_CHECK_EQ(word,3u);
 }
 SR_TEST(build_bindings_reused_banks_preserve_destination_and_rebuild_shared) {
   guest::DrawPacket p;p.constants.vs.fill(0x12345678);p.constants.ps.fill(0x87654321);p.constants.shared[300]=0x7e;
@@ -144,10 +160,13 @@ bool ReferenceBuildBindings(const guest::DrawPacket& draw,std::byte* block,DrawB
     } else {meta={31,0,0,0};}
     std::memcpy(shared+512+i*16,&meta,16);
   }
-  for(uint32_t slot=0;slot<32;++slot) {
-    out.sampler_indices[slot]=slot;
-    std::memcpy(shared+slot*4,&out.texture_indices[slot],4);
-    std::memcpy(shared+128+slot*4,&out.sampler_indices[slot],4);
+  for(uint32_t slot=0;slot<32;++slot) out.sampler_indices[slot]=slot;
+  for(uint32_t slot=0;slot<16;++slot) {
+    std::array<uint32_t,3> index{31u,31u,31u};
+    const auto& fetch=draw.texture_fetch[slot];
+    if((fetch[0]&3)==2) {uint32_t dim=(fetch[5]>>9)&3;dim=dim?dim-1:0;index[dim]=out.texture_indices[slot];}
+    for(uint32_t dim=0;dim<3;++dim) std::memcpy(shared+dim*64+slot*4,&index[dim],4);
+    std::memcpy(shared+192+slot*4,&out.sampler_indices[slot],4);
   }
   error={};return true;
 }

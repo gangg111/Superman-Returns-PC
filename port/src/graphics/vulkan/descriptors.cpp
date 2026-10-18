@@ -78,10 +78,24 @@ bool BuildBindings(const guest::DrawPacket& draw,std::byte* block,DrawBindings& 
     } else {meta={31,0,0,0};}
     std::memcpy(shared+512+i*16,&meta,16);
   }
-  for(uint32_t slot=0;slot<32;++slot) {
-    out.sampler_indices[slot]=slot;
-    std::memcpy(shared+slot*4,&out.texture_indices[slot],4);
-    std::memcpy(shared+128+slot*4,&out.sampler_indices[slot],4);
+  for(uint32_t slot=0;slot<32;++slot) out.sampler_indices[slot]=slot;
+  // Shader ABI of the Vulkan emitter (patch 0011, the same tables the D3D12 path
+  // fills): four tables of 16 dwords by fetch register r, with the 2D index at
+  // [4r], the 3D index at [64+4r], the cube index at [128+4r] and the sampler at
+  // [192+4r]. Only the table of the texture's own dimension gets its index; the
+  // others point at index 31, which RemapTextureBindings leaves on the dummy of
+  // that dimension. Before this, 3D and cube fetches read another slot's index
+  // and every sampler came from slot r+16 (usually an empty fetch constant).
+  for(uint32_t slot=0;slot<16;++slot) {
+    std::array<uint32_t,3> index{31u,31u,31u};
+    const auto& fetch=draw.texture_fetch[slot];
+    if((fetch[0]&3)==2) {
+      uint32_t dim=(fetch[5]>>9)&3;
+      dim=dim?dim-1:0;  // 1D and 2D share the 2D table, as in the requests above
+      index[dim]=out.texture_indices[slot];
+    }
+    for(uint32_t dim=0;dim<3;++dim) std::memcpy(shared+dim*64+slot*4,&index[dim],4);
+    std::memcpy(shared+192+slot*4,&out.sampler_indices[slot],4);
   }
   error={};return true;
 }

@@ -136,7 +136,7 @@ function Assert-Gameplay($proc) {
     if ($i -gt 0) { Start-Sleep 1 }
     if (Has-Gameplay-Frame $proc) { return }
   }
-  Screenshot "$root\logs\bench_${Name}_not_gameplay.png"
+  Save-GameRegion $proc "$root\logs\bench_${Name}_not_gameplay.png"
   throw "scene is not gameplay during measurement (menu or title?)"
 }
 
@@ -174,7 +174,7 @@ function Measure-Window($proc, $scenario) {
   $fps = @(Get-Content $log | Select-Object -Skip $lines0 | Select-String 'guest fps: ([\d.]+)' |
     ForEach-Object { [double]::Parse($_.Matches[0].Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture) })
   if (-not $fps.Count) { throw "No guest FPS samples during $scenario; benchmark is invalid" }
-  Screenshot "$root\logs\bench_${Name}_$scenario.png"
+  Save-GameRegion $proc "$root\logs\bench_${Name}_$scenario.png"
   $row = [pscustomobject]@{
     time = Get-Date -Format s; name = $Name; scenario = $scenario
     avg_fps = [math]::Round(($fps | Measure-Object -Average).Average, 1)
@@ -225,7 +225,7 @@ try {
     if ($proc.HasExited) { throw "game exited before rendering the save" }
     $samples++; if (Capture-IsBlack) { $blackSamples++ }
     if ((Get-Date) -gt $worldDeadline) {
-      Screenshot "$root\logs\bench_${Name}_not_gameplay.png"
+      Save-GameRegion $proc "$root\logs\bench_${Name}_not_gameplay.png"
       $why = if ($blackSamples -eq $samples) {
         "every screen capture was black: the game window cannot be captured (fullscreen?); run windowed (--fullscreen=false)"
       } else { "the Superman HUD was never seen" }
