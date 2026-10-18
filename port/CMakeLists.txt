@@ -42,6 +42,7 @@ endif()
 # Sources
 set(SUPERMANRETURNS_SOURCES
     src/main.cpp
+    src/frame_rate.cpp
     src/frame_stats.cpp
     src/mem_stats.cpp
     src/xma_fixes.cpp
