@@ -129,7 +129,9 @@ std::string WalkThread(HANDLE process, DWORD tid, int max_frames) {
       if (SymFromAddr(process, frame.AddrPC.Offset, &disp, sym)) {
         out += fmt::format("\n    {}+0x{:X}", sym->Name, disp);
       } else if (auto name = GuestFunctionName(frame.AddrPC.Offset); !name.empty()) {
-        out += "\n    " + name;
+        // The executable offset resolves renderer frames against a linker map.
+        static const uint64_t exe = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+        out += fmt::format("\n    {} [exe+0x{:X}]", name, frame.AddrPC.Offset - exe);
       } else {
         out += fmt::format("\n    0x{:X}", frame.AddrPC.Offset);
       }
@@ -162,7 +164,7 @@ void SampleSwapThread() {
   std::vector<std::pair<uint32_t, std::string>> sorted;
   for (auto& [stack, count] : stacks) sorted.emplace_back(count, stack);
   std::sort(sorted.rbegin(), sorted.rend());
-  for (size_t i = 0; i < sorted.size() && i < 8; ++i) {
+  for (size_t i = 0; i < sorted.size() && i < 40; ++i) {
     REXLOG_INFO("native swap thread sample: {}/{} samples:{}", sorted[i].first, kSamples,
                 sorted[i].second);
   }

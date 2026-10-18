@@ -6,6 +6,7 @@
 #include <array>
 #include <string>
 #include <memory>
+#include <mutex>
 #include "pm4_mirror.h"
 #include "texture_content.h"
 #include "../graphics/guest/texture_capture.h"
@@ -60,6 +61,12 @@ struct NativeFrontend {
   uint32_t ring_last_ = 0;
   uint64_t ring_resyncs_ = 0;
   std::vector<RingConstants> pending_ring_constants_;
+  // Guards pending_ring_constants_ only: the game thread notes and flushes them
+  // on every draw, so it must not wait for mutex_, which the worker holds for a
+  // whole batch.
+  std::mutex ring_constants_mutex_;
+  // Offset of the last float-bank capture in the current batch (CaptureDevice).
+  uint32_t last_constants_offset_ = ~0u;
   uint64_t swap_number_ = 0;
   uint64_t profiled_texture_writes_ = 0;
   uint32_t pass_draw_index_[32] = {};

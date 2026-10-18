@@ -3815,7 +3815,7 @@ bool DeviceShadowConstants() {
 
 void Renderer::NoteRingConstants(bool pixel, uint32_t start, uint32_t count, uint32_t ring_ptr) {
   if (!DeviceShadowConstants()) return;  // the mirror parses the packets itself
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  std::lock_guard<std::mutex> lock(ring_constants_mutex_);
   if (trace_state_ == 1) {
     REXLOG_INFO("trace p{} ring consts {} start {} count {} ptr {:08X}", g_current_pass,
                 pixel ? "ps" : "vs", start, count, ring_ptr);
@@ -3828,7 +3828,6 @@ void Renderer::NoteRingConstants(bool pixel, uint32_t start, uint32_t count, uin
 void Renderer::ApplyLoadAluConstants(uint8_t* base, uint32_t dev, uint32_t table,
                                      uint32_t data) {
   if (!DeviceShadowConstants()) return;  // the mirror parses the packet itself
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
   // Earlier ring writes precede this load on the GPU.
   FlushRingConstants(base, dev);
   uint32_t rel = Load32(base, table + 20);
@@ -3853,6 +3852,7 @@ void Renderer::ApplyLoadAluConstants(uint8_t* base, uint32_t dev, uint32_t table
 }
 
 void Renderer::FlushRingConstants(uint8_t* base, uint32_t dev) {
+  std::lock_guard<std::mutex> lock(ring_constants_mutex_);
   if (!REXCVAR_GET(sr_native_ring_constants) || !DeviceShadowConstants()) {
     pending_ring_constants_.clear();
     return;
@@ -6785,11 +6785,18 @@ void Renderer::CaptureDevice(uint8_t* base, uint32_t dev) {
   if (graphics::guest::StateFromDevice() || graphics::guest::StateCompare()) {
     // Device-state packets: ring constants first (they precede the draw on the
     // GPU), then the float constant banks and the scissor pair.
-    {
-      std::lock_guard<std::recursive_mutex> lock(mutex_);
-      FlushRingConstants(base, dev);
+    FlushRingConstants(base, dev);
+    // The 8 KB float banks usually match the previous draw's: point this draw's
+    // range at those bytes instead of appending another copy. The bytes are
+    // compared, so a reused offset always holds exactly the live banks.
+    const uint32_t banks = dev + kDev.vs_constants, size = 2048 * 4;
+    if (uint64_t(last_constants_offset_) + size <= batch_->bytes.size() &&
+        !std::memcmp(batch_->bytes.data() + last_constants_offset_, base + banks, size)) {
+      batch_->ranges.push_back({banks, size, last_constants_offset_});
+    } else {
+      last_constants_offset_ = uint32_t(batch_->bytes.size());
+      CaptureBytes(base, banks, size);
     }
-    CaptureBytes(base, dev + kDev.vs_constants, 2048 * 4);
     CaptureBytes(base, dev + graphics::guest::kDeviceScissor, 12);
   }
   CaptureBytes(base, dev + kDev.vertex_decl - 4, 8);
