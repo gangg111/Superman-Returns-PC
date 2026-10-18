@@ -39,6 +39,14 @@ tryb cienia), vgmstream (EAAC, EA-XMA), QuickBMS nbajamfire.bms (BGFA).
    XAudio2 liczy inaczej niż DSP RenderWare.
 4. **Odsłuch:** pary klipów przed/po dla kluczowych scen (muzyka, dialogi, walka, lot).
 
+**Zmierzony margines miksu (2026-10-19).** Dwa identyczne przebiegi ORYGINAŁU (Vulkan, port
+natywny, 30 FPS, start nowej gry i trzy wzbicia), nagrane `--audio_dump_raw`, porównane
+`tools/audio/mixdiff.py`: ekran tytułowy i menu (0-60 s) mediana różnicy 1,4-3,8 dB,
+95. percentyl 6-19 dB; rozgrywka ma okna z dźwiękiem w jednym przebiegu i ciszą w drugim
+(p95 do 79 dB), bo przechodnie, ruch i wczytywanie nie są deterministyczne. Kryterium 3 jest
+więc tylko zgrubne: nowy silnik ma mieścić się w tym rozrzucie. O 1:1 rozstrzygają kryteria
+1 (dziennik wywołań API) i 2 (każdy dźwięk osobno, co do próbki).
+
 #### Etapy
 
 1. **Mapa API** (bez zmian w zachowaniu gry): lista funkcji granicznych z argumentami,
