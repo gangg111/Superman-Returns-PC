@@ -6,6 +6,7 @@
 
 #include "frame_stats.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -22,7 +23,10 @@ namespace {
 
 std::atomic<uint64_t> g_frames{0};
 
-// SR_LOG_FPS=1 writes the frame rate to the log every 2 seconds.
+// SR_LOG_FPS=1 writes the frame rate to the log every 2 seconds, with the
+// longest frame of the window and the frames over 50 ms (stutter). A frame
+// over 100 ms is also logged on its own, so it lines up with what the log
+// says the game was doing at that moment.
 void MaybeLogFps(uint64_t frames) {
   using clock = std::chrono::steady_clock;
   static const bool enabled = [] {
@@ -31,13 +35,24 @@ void MaybeLogFps(uint64_t frames) {
   }();
   if (!enabled) return;
   static clock::time_point last_time = clock::now();
+  static clock::time_point last_frame = last_time;
   static uint64_t last_frames = 0;
+  static double max_ms = 0.0;
+  static uint32_t hitches = 0;
   const auto now = clock::now();
+  const double frame_ms = std::chrono::duration<double, std::milli>(now - last_frame).count();
+  last_frame = now;
+  max_ms = std::max(max_ms, frame_ms);
+  if (frame_ms > 50.0) ++hitches;
+  if (frame_ms > 100.0) REXLOG_INFO("guest frame hitch: {:.0f} ms", frame_ms);
   const double elapsed = std::chrono::duration<double>(now - last_time).count();
   if (elapsed < 2.0) return;
-  REXLOG_INFO("guest fps: {:.1f}", (frames - last_frames) / elapsed);
+  REXLOG_INFO("guest fps: {:.1f} max {:.0f} ms, {} over 50 ms", (frames - last_frames) / elapsed,
+              max_ms, hitches);
   last_time = now;
   last_frames = frames;
+  max_ms = 0.0;
+  hitches = 0;
 }
 
 }  // namespace
