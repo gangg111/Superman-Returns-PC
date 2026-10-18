@@ -62,6 +62,18 @@ endif()
 
 rexglue_setup_target(superman_returns GPU_PLUGINS xenos)
 
+# Application icon (resources/superman_returns.ico, local and optional). It is the
+# first RT_GROUP_ICON of the executable, so Explorer shows it for the file and
+# SDL3 uses it for the game window and the taskbar.
+set(SR_APP_ICON "${CMAKE_CURRENT_SOURCE_DIR}/resources/superman_returns.ico")
+if(WIN32 AND EXISTS "${SR_APP_ICON}")
+    enable_language(RC)
+    set(SR_APP_ICON_RC "${CMAKE_CURRENT_BINARY_DIR}/superman_returns_icon.rc")
+    file(WRITE "${SR_APP_ICON_RC}" "1 ICON \"${SR_APP_ICON}\"\n")
+    set_source_files_properties("${SR_APP_ICON_RC}" PROPERTIES OBJECT_DEPENDS "${SR_APP_ICON}")
+    target_sources(superman_returns PRIVATE "${SR_APP_ICON_RC}")
+endif()
+
 if(SR_LSFG)
     # Instantiate the project presenter explicitly: rexruntime is a DLL and
     # its internal provider factory would otherwise create the SDK presenter.

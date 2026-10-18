@@ -7,5 +7,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>SupermanReturnsLauncher</AssemblyName>
     <RootNamespace>SupermanReturnsLauncher</RootNamespace>
+    <ApplicationIcon Condition="Exists('app.ico')">app.ico</ApplicationIcon>
   </PropertyGroup>
+  <ItemGroup Condition="Exists('app.ico')">
+    <Resource Include="app.ico" />
+  </ItemGroup>
 </Project>
