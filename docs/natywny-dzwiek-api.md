@@ -1,3 +1,22 @@
+> **Zmierzone w grze (2026-10-19, `SR_LOG_AUDIO_API`, start nowej gry, trzy wzbicia, bieg,
+> około 2 minuty, 508 637 wywołań):** gra używa 14 klas wtyczek w czterech typach łańcuchów
+> (FourCC odczytane z deskryptorów w `Voice::Create`, co zamyka pytanie otwarte nr 1):
+>
+> | łańcuch | ile głosów | rola |
+> |---|---|---|
+> | `SnP0(2) > Pit0 > LI20 > HI20 > Gai0 > PnS0(6) > Sen0(6)` | 767 | każdy zwykły dźwięk |
+> | `Sub0(2) > LI20 > HI20 > Gai0 > PnS0(6) > Sen0(6)` | 4 | podmiksy grup |
+> | `SnP0(4) > Pit0 > Rou0 > Rou0` | 2 | muzyka 4-kanałowa (przód/tył) |
+> | `Sub0(1) > RM10 > VuM0 > LI20 > PnS0(6) > Sen0(6)` | 1 | magistrala pogłosu |
+> | `Sub0(1) > Sen0 > Del0 > Sen0 > VuM0 > LI20 > PnS0(6) > Sen0(6)` | 1 | magistrala opóźnienia |
+> | `Sub0(6) > VuM0 > AiW0 > Dac0` | 1 | wyjście |
+>
+> Ruch parametrów (`SetParamF`, na każdy głos co klatkę): `Gai0` p0 84 944, `PnS0` p0 i p1 po
+> 84 746, `LI20` p0 83 303, `HI20` p0 83 300, `Pit0` p0 83 112, `PnS0` p2 863, pojedyncze dla
+> `Sen0`, `RM10`, `Del0`. Sterowanie (`Control`): `Sen0` index 0 (867, podpięcie do magistrali),
+> `SnP0` index 0 (861, start próbki ze wskaźnikiem do jej opisu), `Rou0` index 0 (4),
+> `Dac0` index 3. Funkcje strumieni filmów nie były wołane w tym scenariuszu.
+>
 > Mapa API granicy gra / silnik dźwięku. Analiza statyczna asemblera z wygenerowanego kodu
 > (subagent, 2026-10-19), z poprawką własną po weryfikacji: rzekomy odczyt `sys+0` dotyczy
 > menedżera dźwięku gry. Każda pozycja ma oznaczenie VERIFIED (odczytane w asm) albo INFERRED.
