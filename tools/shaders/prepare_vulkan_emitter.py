@@ -12,7 +12,7 @@ def prepare(root=ROOT):
  for name in ('fmt','xxHash'):
   shutil.copytree(source/'deps'/name,target/'deps'/name,dirs_exist_ok=True,ignore=shutil.ignore_patterns('.git','test','tests','doc','docs','build'))
  patch=root/'tools/shaders/xenosrecomp/patches/0011-vulkan-buffer-bindings.patch'
- args=['git','apply','--directory',str(target.relative_to(root)/'src')]
+ args=['git','apply','--directory',(target.relative_to(root)/'src').as_posix()]
  check=subprocess.run([*args,'--check',str(patch)],cwd=root,capture_output=True,text=True)
  if check.returncode:
   reverse=subprocess.run([*args,'--reverse','--check',str(patch)],cwd=root,capture_output=True,text=True)

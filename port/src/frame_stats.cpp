@@ -14,6 +14,7 @@
 #include <rex/hook.h>
 
 #include "generated/default/superman_returns_init.h"
+#include "mem_stats.h"
 #include "native_renderer/native_bridge.h"
 #include "renderdoc_capture.h"
 
@@ -44,6 +45,7 @@ void MaybeLogFps(uint64_t frames) {
 REX_HOOK_RAW(sub_82112050) {
   const uint64_t frames = g_frames.fetch_add(1, std::memory_order_relaxed) + 1;
   MaybeLogFps(frames);
+  superman_returns::MaybeLogMemory(base);
   OnGuestFrameForCapture(frames);
   // sub_82112050 is also the candidate D3DDevice_Swap(dev, front_buffer, ...)
   // of the native renderer (game_profile.h); a no-op unless that is built,

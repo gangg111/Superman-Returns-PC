@@ -10,6 +10,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(generated/rexglue.cmake)
 
+# Building the SDK from source (REXSDK_DIR) exposes xxHash under its own name,
+# not the rex::xxhash alias the installed package exports.
+if(NOT TARGET rex::xxhash AND TARGET xxhash)
+    add_library(rex::xxhash ALIAS xxhash)
+endif()
+# The installed package ships imgui.h next to the rex headers; the source tree
+# keeps it in the imgui OBJECT library, which rexruntime already links in.
+if(REXSDK_DIR AND TARGET imgui)
+    include_directories($<TARGET_PROPERTY:imgui,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
+
 option(SR_VULKAN_FOUNDATION "Build standalone Vulkan foundation smoke test" OFF)
 option(SR_VULKAN_GAME "Build the native Vulkan game renderer (explicit runtime selection)" OFF)
 option(SR_GUEST_TEXTURE_TESTS "Build texture layout tests using SDK Xenos helpers" OFF)
@@ -32,6 +43,7 @@ endif()
 set(SUPERMANRETURNS_SOURCES
     src/main.cpp
     src/frame_stats.cpp
+    src/mem_stats.cpp
     src/xma_fixes.cpp
     src/sr_settings.cpp
     src/graphics/backend_selection.cpp

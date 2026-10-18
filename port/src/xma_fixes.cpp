@@ -36,6 +36,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include <rex/hook.h>
@@ -80,8 +81,32 @@ bool IsDeadContext(const ContextState& state) {
   return !input_valid && !output_valid;
 }
 
+// SR_LOG_XMA=1: every 10 s, how often the mixer found a stream short of
+// samples (starved), how many kicks that took, and how many give-ups.
+std::atomic<uint64_t> g_starved{0}, g_kicks{0}, g_giveups{0};
+
+void MaybeLogCounters() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("SR_LOG_XMA");
+    return v && *v && *v != '0';
+  }();
+  if (!enabled) return;
+  static std::atomic<int64_t> last{0};
+  const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                          Clock::now().time_since_epoch()).count();
+  int64_t prev = last.load();
+  if (prev == 0) {
+    last.compare_exchange_strong(prev, now);
+    return;
+  }
+  if (now - prev < 10 || !last.compare_exchange_strong(prev, now)) return;
+  REXAPU_INFO("XMA fix: starved {} kicks {} give-ups {} (cumulative)", g_starved.load(),
+              g_kicks.load(), g_giveups.load());
+}
+
 void LogGiveUp(const char* reason, uint32_t xma_context, uint32_t stream) {
   static std::atomic<uint32_t> count{0};
+  g_giveups.fetch_add(1, std::memory_order_relaxed);
   if (count.fetch_add(1) < 10) {
     REXAPU_INFO("XMA fix: stopped waiting on context {:08X} (stream {:08X}): {}", xma_context,
                 stream, reason);
@@ -95,10 +120,12 @@ void XmaKickStarvedContext(PPCRegister& r26, PPCRegister& r31) {
   static thread_local uint32_t waiting_stream = 0;
   static thread_local Clock::time_point waiting_since;
 
+  MaybeLogCounters();
   if (r26.u32 == 0) {  // Enough samples; the mixer is not waiting.
     waiting_stream = 0;
     return;
   }
+  g_starved.fetch_add(1, std::memory_order_relaxed);
 
   uint8_t* base = rex::system::kernel_state()->memory()->virtual_membase();
   const uint32_t stream = r31.u32;
@@ -131,6 +158,7 @@ void XmaKickStarvedContext(PPCRegister& r26, PPCRegister& r31) {
 
   PPCContext call_ctx{};
   call_ctx.r3.u64 = xma_context;
+  g_kicks.fetch_add(1, std::memory_order_relaxed);
   __imp__XMAEnableContext(call_ctx, base);
 
   // The kick decoded synchronously. No change means no input left or no room

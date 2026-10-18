@@ -1,7 +1,10 @@
 #include "render_packet.h"
+#include "state_source.h"
 #include "../../native_renderer/game_profile.h"
 #include "../../native_renderer/pm4_mirror.h"
+#include <rex/logging.h>
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <chrono>
@@ -239,6 +242,107 @@ const std::vector<VertexAttribute>& Declaration(const CapturedMemory& memory,uin
   return fallback;
 }
 namespace {
+// Device-shadow state for a draw (see state_source.h). In compare mode the
+// packet keeps its PM4 values and mismatches are counted per field; in device
+// mode the device values replace them.
+struct StateCompareCounters {
+  std::atomic<uint64_t> draws{0}, uncaptured{0}, vs{0}, ps{0}, bools{0}, loops{0}, poly{0},
+      scissor{0}, fetch{0};
+  std::atomic<int64_t> last_log{0};
+};
+StateCompareCounters state_compare;
+
+void ApplyDeviceState(DrawPacket &d, uint32_t dev, const CapturedMemory &memory) {
+  const auto &layout = native::profile::kDevice;
+  const auto constants = memory.ReadUnambiguous(Address(dev, layout.vs_constants), 2048 * 4);
+  const auto scissor_bytes = memory.ReadUnambiguous(Address(dev, kDeviceScissor), 12);
+  const bool compare = StateCompare() && !StateFromDevice();
+  auto &c = state_compare;
+  ++c.draws;
+  if (constants.empty() || scissor_bytes.empty()) {
+    ++c.uncaptured;
+    return;
+  }
+  std::array<uint32_t, 1024> vs, ps;
+  // A float constant the game never set keeps the XDK shadow's initial
+  // 0xFFFFFFFF; the XDK never sends it, so the GPU reads its reset value 0.
+  for (uint32_t i = 0; i < 1024; ++i) {
+    vs[i] = CapturedWord(constants, i * 4);
+    ps[i] = CapturedWord(constants, 4096 + i * 4);
+    if (vs[i] == 0xFFFFFFFFu) vs[i] = 0;
+    if (ps[i] == 0xFFFFFFFFu) ps[i] = 0;
+  }
+  std::array<uint32_t, 4> poly;
+  for (uint32_t i = 0; i < 4; ++i) poly[i] = d.registers[0x380 + i];
+  const uint32_t offset = CapturedWord(scissor_bytes, 0), tl = CapturedWord(scissor_bytes, 4),
+                 br = CapturedWord(scissor_bytes, 8);
+  const Rect scissor = DecodeScissor({tl, br, offset, d.registers[0xe], d.registers[0xf]}, true,
+                                     d.tiling_active, 1);
+  std::array<std::array<uint32_t, 6>, 32> fetch;
+  const auto fetch_bytes = memory.ReadUnambiguous(Address(dev, layout.fetch_constants), 32 * 24);
+  for (uint32_t s = 0; s < 32; ++s)
+    for (uint32_t i = 0; i < 6; ++i)
+      fetch[s][i] = fetch_bytes.empty() ? d.texture_fetch[s][i] : CapturedWord(fetch_bytes, s * 24 + i * 4);
+  std::array<uint32_t, 40> bool_loop;
+  const auto bl = memory.ReadUnambiguous(Address(dev, layout.vs_bools), 40 * 4);
+  for (uint32_t i = 0; i < 40; ++i) {
+    uint32_t packet_value;
+    std::memcpy(&packet_value, d.constants.shared.data() + (i < 8 ? 256 + i * 4 : 304 + (i - 8) * 4), 4);
+    bool_loop[i] = bl.empty() ? packet_value : CapturedWord(bl, i * 4);
+  }
+  if (compare) {
+    static std::atomic<uint32_t> details[3]{};
+    auto detail = [&](const char *what, uint32_t index, uint32_t pm4, uint32_t device) {
+      if (details[what[0] == 'v' ? 0 : what[0] == 'p' ? 1 : 2].fetch_add(1) < 15)
+        REXLOG_INFO("native state compare detail: {} index={} pm4={:08X} device={:08X} prim={} count={} serial={}",
+                    what, index, pm4, device, int(d.primitive), d.count, d.command_serial);
+    };
+    if (vs != d.constants.vs) {
+      ++c.vs;
+      for (uint32_t i = 0; i < 1024; ++i)
+        if (vs[i] != d.constants.vs[i]) { detail("vs", i, d.constants.vs[i], vs[i]); break; }
+    }
+    if (ps != d.constants.ps) {
+      ++c.ps;
+      for (uint32_t i = 0; i < 1024; ++i)
+        if (ps[i] != d.constants.ps[i]) { detail("ps", i, d.constants.ps[i], ps[i]); break; }
+    }
+    // Inline (UP) draws: the XDK points vertex fetch slot 31 at the ring copy in
+    // PM4 only; the renderer binds the captured inline vertices instead.
+    if (fetch != d.texture_fetch && !d.inline_vertices)
+      for (uint32_t s = 0; s < 32; ++s)
+        for (uint32_t i = 0; i < 6; ++i)
+          if (fetch[s][i] != d.texture_fetch[s][i]) {
+            detail(d.inline_vertices ? "fetch(inline)" : "fetch", s * 6 + i, d.texture_fetch[s][i], fetch[s][i]);
+            s = 32;
+            break;
+          }
+    for (uint32_t i = 0; i < 40; ++i) {
+      uint32_t packet_value;
+      std::memcpy(&packet_value, d.constants.shared.data() + (i < 8 ? 256 + i * 4 : 304 + (i - 8) * 4), 4);
+      if (packet_value != bool_loop[i]) { ++(i < 8 ? c.bools : c.loops); break; }
+    }
+    if (poly != d.polygon_offset_registers) ++c.poly;
+    if (std::memcmp(&scissor, &d.scissor, sizeof(Rect)) != 0) ++c.scissor;
+    if (fetch != d.texture_fetch) ++c.fetch;
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t prev = c.last_log.load();
+    if (now - prev >= 10 && c.last_log.compare_exchange_strong(prev, now))
+      REXLOG_INFO("native state compare: draws={} uncaptured={} differ vs={} ps={} bools={} loops={} poly={} scissor={} fetch={}",
+                  c.draws.load(), c.uncaptured.load(), c.vs.load(), c.ps.load(), c.bools.load(),
+                  c.loops.load(), c.poly.load(), c.scissor.load(), c.fetch.load());
+    return;
+  }
+  d.constants.vs = vs;
+  d.constants.ps = ps;
+  for (uint32_t i = 0; i < 40; ++i)
+    std::memcpy(d.constants.shared.data() + (i < 8 ? 256 + i * 4 : 304 + (i - 8) * 4), &bool_loop[i], 4);
+  d.polygon_offset_registers = poly;
+  d.scissor = scissor;
+  d.texture_fetch = fetch;
+}
+
 // Replay and decoding share the same owned snapshot. Packets retain it after
 // the worker recycles the source batch; no live guest reads are introduced.
 bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
@@ -306,6 +410,8 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
           std::memcpy(d.constants.shared.data() + 304 + i * 4, &value, 4);
         }
       }
+      if (cmd.device && (StateFromDevice() || StateCompare()))
+        ApplyDeviceState(d, cmd.device, memory);
       if (uint64_t(cmd.stream_first) + cmd.stream_count > batch.streams.size())
         throw std::out_of_range("Command stream range exceeds batch");
       if (!cmd.streams_ok)

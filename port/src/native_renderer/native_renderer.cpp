@@ -21,6 +21,7 @@
 #include "../graphics/guest/render_state.h"
 #include "../graphics/guest/edram_alias.h"
 #include "../graphics/guest/render_packet.h"
+#include "../graphics/guest/state_source.h"
 #include "../graphics/guest/primitive_expansion.h"
 #include "../graphics/guest/pm4_capture.h"
 #include "../graphics/frame_timeline.h"
@@ -334,6 +335,19 @@ bool TextureAuditing() {
     return value && *value && *value!='0';
   }();
   return enabled;
+}
+// Longest gap between verification hashes of an unchanged, watched texture, as
+// log2 frames. With the physical write watch armed every texture change in
+// the intro videos, menus and title (3500+ changes over 1560 frames) arrived
+// notified, so the periodic re-hash only guards against unobserved writers.
+// 9 = 512 frames (~17 s); SR_NATIVE_TEXTURE_BACKOFF=4 restores the old 16.
+uint32_t TextureBackoffLog2() {
+  static const uint32_t value=[] {
+    const char* v=std::getenv("SR_NATIVE_TEXTURE_BACKOFF");
+    if(!v || !*v) return 9u;
+    return std::clamp<uint32_t>(uint32_t(std::atoi(v)),1u,12u);
+  }();
+  return value;
 }
 bool SharedConstantsCaching() {
   static const bool enabled=[] {
@@ -3758,8 +3772,15 @@ uint32_t Renderer::GpuConstant(uint8_t* base, uint32_t dev, uint32_t reg,
   return Load32(base, dev + shadow_offset);
 }
 
+// Literal and inline-ring constants are written into the device shadow when a
+// path reads constants from it: the D3D12 non-mirror mode or device-state packets.
+bool DeviceShadowConstants() {
+  return !REXCVAR_GET(sr_native_pm4_mirror) || graphics::guest::StateFromDevice() ||
+         graphics::guest::StateCompare();
+}
+
 void Renderer::NoteRingConstants(bool pixel, uint32_t start, uint32_t count, uint32_t ring_ptr) {
-  if (REXCVAR_GET(sr_native_pm4_mirror)) return;  // the mirror parses the packets itself
+  if (!DeviceShadowConstants()) return;  // the mirror parses the packets itself
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   if (trace_state_ == 1) {
     REXLOG_INFO("trace p{} ring consts {} start {} count {} ptr {:08X}", g_current_pass,
@@ -3772,7 +3793,7 @@ void Renderer::NoteRingConstants(bool pixel, uint32_t start, uint32_t count, uin
 
 void Renderer::ApplyLoadAluConstants(uint8_t* base, uint32_t dev, uint32_t table,
                                      uint32_t data) {
-  if (REXCVAR_GET(sr_native_pm4_mirror)) return;  // the mirror parses the packet itself
+  if (!DeviceShadowConstants()) return;  // the mirror parses the packet itself
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   // Earlier ring writes precede this load on the GPU.
   FlushRingConstants(base, dev);
@@ -3798,7 +3819,7 @@ void Renderer::ApplyLoadAluConstants(uint8_t* base, uint32_t dev, uint32_t table
 }
 
 void Renderer::FlushRingConstants(uint8_t* base, uint32_t dev) {
-  if (!REXCVAR_GET(sr_native_ring_constants) || REXCVAR_GET(sr_native_pm4_mirror)) {
+  if (!REXCVAR_GET(sr_native_ring_constants) || !DeviceShadowConstants()) {
     pending_ring_constants_.clear();
     return;
   }
@@ -6397,6 +6418,88 @@ void Renderer::BeginCmd(Op op) {
   cur_.stream_first = uint32_t(batch_->streams.size());
 }
 
+// SR_NATIVE_RESOLVE_AUDIT=1: the two resolve inputs that still come from PM4
+// (did the XDK emit a copy draw, and RB_COPY_DEST_INFO's endian-swap bit),
+// tallied against what the hook arguments already give: flags, whether there is
+// a destination texture, and its fetch format/endianness.
+void AuditResolveSources(uint8_t* base, uint32_t flags, uint32_t dest, bool copy_draw,
+                         uint32_t dest_info) {
+  static const bool on=[] {const char* v=std::getenv("SR_NATIVE_RESOLVE_AUDIT");return v && *v && *v!='0';}();
+  if(!on) return;
+  const uint32_t fetch1=dest?Load32(base,dest+0x1c+4):0;
+  const uint32_t key_fmt=dest?(fetch1&0x3f):0xff, key_endian=dest?((fetch1>>6)&3):0xff;
+  static std::map<std::array<uint32_t,6>,uint64_t> table;
+  static std::chrono::steady_clock::time_point last=std::chrono::steady_clock::now();
+  ++table[{flags,dest?1u:0u,key_fmt,key_endian,copy_draw?1u:0u,(dest_info>>24)&1u}];
+  if(std::chrono::steady_clock::now()-last<std::chrono::seconds(10)) return;
+  last=std::chrono::steady_clock::now();
+  std::string s;
+  for(const auto& [k,n]:table) s+=fmt::format(" [flags={:X} dest={} fmt={} endian={} -> copy={} swap={}]x{}",k[0],k[1],k[2],k[3],k[4],k[5],n);
+  REXLOG_INFO("native resolve audit:{}",s);
+}
+
+// SR_NATIVE_PM4_AUDIT=<n>: on every n-th draw, compare the state the renderer
+// takes from the parsed PM4 stream with the D3DDevice shadow the XDK keeps in
+// guest memory, right after the original XDK code wrote both. Counts per
+// category show which state still needs the PM4 path before the original D3D
+// code can stop running. Only registers the stream has written are compared.
+void AuditStateSources(const Pm4Mirror& mirror, uint8_t* base, uint32_t dev, uint64_t frame) {
+  static const uint32_t interval=[] {
+    const char* v=std::getenv("SR_NATIVE_PM4_AUDIT");
+    return v && *v ? uint32_t(std::max(0,std::atoi(v))) : 0u;
+  }();
+  if(!interval || !dev) return;
+  static uint64_t draws=0;
+  if(++draws%interval) return;
+  struct Category {const char* name; uint64_t checked=0, differ=0, draws_differ=0;};
+  static Category cats[5]={{"float_constants"},{"fetch_constants"},{"bool_loop"},{"render_state"},{"pm4_only_scissor"}};
+  static std::map<uint32_t,uint64_t> top[5];  // per category: register -> mismatches
+  static uint64_t sampled=0, last_frame=0;
+  ++sampled;
+  auto compare=[&](Category& c,uint32_t reg,uint32_t addr) {
+    if(reg>=Pm4Mirror::kAluConstantBase && !mirror.written(reg)) return false;
+    ++c.checked;
+    if(mirror.reg(reg)==Load32(base,addr)) return false;
+    ++c.differ; ++top[&c-cats][reg]; return true;
+  };
+  bool any[4]={};
+  for(uint32_t i=0;i<2048;++i) any[0]|=compare(cats[0],Pm4Mirror::kAluConstantBase+i,dev+kDev.vs_constants+i*4);
+  for(uint32_t i=0;i<192;++i) any[1]|=compare(cats[1],Pm4Mirror::kFetchConstantBase+i,dev+kDev.fetch_constants+i*4);
+  for(uint32_t i=0;i<40;++i) any[2]|=compare(cats[2],Pm4Mirror::kBoolConstantBase+i,dev+kDev.vs_bools+i*4);
+  for(const auto& r:profile::kRegisterShadow)
+    for(uint32_t i=0;i<r.count;++i) any[3]|=compare(cats[3],r.first+i,dev+r.offset+i*4);
+  for(int k=0;k<4;++k) if(any[k]) ++cats[k].draws_differ;
+  cats[4].checked+=3;  // scissor 0x2080-0x2082: no device shadow range covers it
+  // Locate the scissor in the device: offsets holding the PM4 TL/BR pair.
+  static std::map<uint32_t,uint64_t> scissor_hits;
+  static uint64_t scissor_samples=0;
+  {
+    const uint32_t tl=mirror.reg(0x2081), br=mirror.reg(0x2082);
+    if(br) {
+      ++scissor_samples;
+      for(uint32_t off=0;off+8<=kDev.size;off+=4)
+        if(Load32(base,dev+off)==tl && Load32(base,dev+off+4)==br) ++scissor_hits[off];
+    }
+  }
+  if(frame>=last_frame+300) {
+    last_frame=frame;
+    for(const auto& c:cats)
+      REXLOG_INFO("native pm4 audit: frame={} sampled_draws={} {} checked={} differ={} draws_differ={}",
+                  frame,sampled,c.name,c.checked,c.differ,c.draws_differ);
+    for(int k=0;k<4;++k) {
+      std::vector<std::pair<uint32_t,uint64_t>> v(top[k].begin(),top[k].end());
+      std::sort(v.begin(),v.end(),[](auto& a,auto& b){return a.second>b.second;});
+      std::string s;
+      for(size_t i=0;i<v.size() && i<10;++i) s+=fmt::format(" {:04X}x{}",v[i].first,v[i].second);
+      REXLOG_INFO("native pm4 audit: top differing {}:{}",cats[k].name,s);
+    }
+    std::string so;
+    for(const auto& [off,n]:scissor_hits) if(n*10>=scissor_samples*9) so+=fmt::format(" +{:#x}:{}",off,n);
+    REXLOG_INFO("native pm4 audit: scissor samples={} offsets matching >=90%:{} (last tl={:08X} br={:08X} offset={:08X})",
+                scissor_samples,so,mirror.reg(0x2081),mirror.reg(0x2082),mirror.reg(0x2080));
+  }
+}
+
 void Renderer::EndCmd(uint8_t* base) {
   DetailScope scope(capture_timings.fe_end_ns);
   if(worker_stop_) return;
@@ -6436,10 +6539,19 @@ void Renderer::EndCmd(uint8_t* base) {
     CaptureTextures(base);
     capture_timings.textures_us+=std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-started).count();
     textures_scope.Stop();
+    AuditStateSources(capture_mirror_, base, cur_.device, front_frame_);
   }
   if(cur_.op==Op::kResolve && cur_.packet_check) {
     cur_.resolve_copy_draw=capture_mirror_.copy_draws!=capture_copies_before;
     cur_.resolve_copy_dest_info=capture_mirror_.last_copy_dest_info;
+    if(graphics::guest::SkipOriginalRequested(graphics::guest::OriginalCall::kResolve) && packet_sink_) {
+      // The original resolve did not run: nothing new in PM4. Derive both
+      // values from the destination texture (see state_source.h).
+      const uint32_t dest=cur_.u[2];
+      cur_.resolve_copy_draw=graphics::guest::ResolveCopyDraw(dest);
+      cur_.resolve_copy_dest_info=graphics::guest::ResolveCopyDestInfo(dest?Load32(base,dest+0x1c+4):0);
+    }
+    AuditResolveSources(base, cur_.u[0], cur_.u[2], cur_.resolve_copy_draw, cur_.resolve_copy_dest_info);
   }
   cur_.range_count = uint32_t(batch_->ranges.size()) - cur_.range_first;
   cur_.stream_count = uint32_t(batch_->streams.size()) - cur_.stream_first;
@@ -6477,7 +6589,7 @@ void Renderer::CaptureTextures(uint8_t* base) {
     std::array<uint32_t,6> fetch{};
     for(uint32_t i=0;i<6;++i) {
       uint32_t reg=Pm4Mirror::kFetchConstantBase+slot*6+i;
-      fetch[i]=capture_mirror_.written(reg) ? capture_mirror_.reg(reg)
+      fetch[i]=(!graphics::guest::StateFromDevice() && capture_mirror_.written(reg)) ? capture_mirror_.reg(reg)
           : Load32(base,cur_.device+kDev.fetch_constants+slot*24+i*4);
     }
     if(!IsTextureBound(fetch[0])) continue;
@@ -6562,7 +6674,7 @@ void Renderer::CaptureTextures(uint8_t* base) {
         AuditTextureHash(packet_sink_?"vulkan":"d3d12_capture",front_frame_,
             fetch[1]&0x1ffff000u,bytes,fetch[1]&0x3fu,!unchanged,notified,texture_watch_);
       }
-      entry.stable_checks=unchanged?std::min(entry.stable_checks+1,4u):0;
+      entry.stable_checks=unchanged?std::min(entry.stable_checks+1,TextureBackoffLog2()):0;
       entry.next_check_frame=front_frame_+(uint64_t(1)<<entry.stable_checks);
       if(!unchanged) ++capture_timings.changed;
       if(!unchanged) {
@@ -6624,6 +6736,16 @@ void Renderer::CaptureDevice(uint8_t* base, uint32_t dev) {
   CaptureBytes(base, dev, 8);
   CaptureBytes(base, dev + kDev.fetch_constants + 0x280, 0x80);  // vertex fetch slots
   CaptureBytes(base, dev + kDev.register_shadow, 0x1D0);
+  if (graphics::guest::StateFromDevice() || graphics::guest::StateCompare()) {
+    // Device-state packets: ring constants first (they precede the draw on the
+    // GPU), then the float constant banks and the scissor pair.
+    {
+      std::lock_guard<std::recursive_mutex> lock(mutex_);
+      FlushRingConstants(base, dev);
+    }
+    CaptureBytes(base, dev + kDev.vs_constants, 2048 * 4);
+    CaptureBytes(base, dev + graphics::guest::kDeviceScissor, 12);
+  }
   CaptureBytes(base, dev + kDev.vertex_decl - 4, 8);
   CaptureBytes(base, dev + kDev.index_buffer - 0xC, 0x120);  // pointers .. viewport
   for (uint32_t i = 0; i < 4; ++i) {

@@ -23,12 +23,19 @@
 
 #include <cstring>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <string>
+#include <vector>
 #include <cstdlib>
 #include <map>
 #include <mutex>
 
 #include <rex/ppc.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xmemory.h>
 
 #include "game_profile.h"
 #include "hang_watchdog.h"
@@ -40,6 +47,7 @@
 #include "idle_yield.h"
 #include "xdk_constant_copy.h"
 #include "resource_unlock_audit.h"
+#include "../graphics/guest/state_source.h"
 
 namespace {
 
@@ -231,12 +239,127 @@ inline uint32_t GuestLoad32(uint8_t* base, uint32_t address) {
 }
 
 // Common entry of the hooks that receive the device in r3.
+// SR_NATIVE_RING_STATS=1 also counts calls per hooked XDK role (cumulative, 10 s).
+// Wall time spent inside selected originals (ns, cumulative), same log.
+std::atomic<uint64_t> g_wait_ns[3]{};  // BlockOnFence, RingMakeSpace, RingAllocLarge
+struct WaitTimer {
+  int slot; std::chrono::steady_clock::time_point t0=std::chrono::steady_clock::now();
+  explicit WaitTimer(int s):slot(s) {}
+  ~WaitTimer() {g_wait_ns[slot]+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-t0).count());}
+};
+void CountRole(const char* role) {
+  static const bool on = [] {const char* v=std::getenv("SR_NATIVE_RING_STATS");return v && *v && *v!='0';}();
+  if (!on) return;
+  static std::mutex m;
+  static std::map<std::string,uint64_t> counts;
+  static auto last = std::chrono::steady_clock::now();
+  std::lock_guard lock(m);
+  ++counts[role];
+  if (std::chrono::steady_clock::now() - last < std::chrono::seconds(10)) return;
+  last = std::chrono::steady_clock::now();
+  std::string s;
+  for (const auto& [k, n] : counts) s += fmt::format(" {}={}", k, n);
+  REXLOG_INFO("native role calls:{} | wait_ms BlockOnFence={} RingMakeSpace={} RingAllocLarge={}", s,
+              g_wait_ns[0].load()/1000000, g_wait_ns[1].load()/1000000, g_wait_ns[2].load()/1000000);
+}
 inline void OnDeviceCall(const char* role, uint32_t dev, uint32_t arg) {
+  CountRole(role);
   native::NoteGuestDevice(dev);
   native::NoteHookCall(role, dev, arg);
 }
 
 // DrawVerticesUP calls BeginVertices/EndVertices itself.
+
+// SR_NATIVE_DRAW_SHADOW_AUDIT=<n>: on every n-th DrawVertices/DrawIndexedVertices,
+// snapshot the whole D3DDevice before the original XDK draw and list the dwords
+// it changed. Skipping the original is only safe for state the renderer reads
+// from the device if the draw itself writes nothing there (or only bookkeeping
+// such as dirty masks and ring pointers, which this audit names by offset).
+struct DrawShadowAudit {
+  uint32_t interval=0;
+  uint64_t calls[3]={}, sampled[3]={};
+  std::map<uint32_t,uint64_t> changed[3];  // per kind: device offset -> times changed
+  std::chrono::steady_clock::time_point last_log=std::chrono::steady_clock::now();
+  std::vector<uint8_t> before;
+};
+DrawShadowAudit draw_shadow_audit=[] {
+  DrawShadowAudit a;
+  const char* v=std::getenv("SR_NATIVE_DRAW_SHADOW_AUDIT");
+  if(v && *v) a.interval=uint32_t(std::max(0,std::atoi(v)));
+  return a;
+}();
+// kind: 0 = draws (every n-th), 1 = Resolve, 2 = Clear (every call)
+bool BeginDrawShadowAudit(uint8_t* base, uint32_t dev, int kind = 0) {
+  auto& a=draw_shadow_audit;
+  if(!a.interval || !dev) return false;
+  if(kind==0 && (++a.calls[0] % a.interval)) return false;
+  const uint32_t size=superman_returns::native::profile::kDevice.size;
+  a.before.assign(base+dev, base+dev+size);
+  return true;
+}
+void EndDrawShadowAudit(uint8_t* base, uint32_t dev, int kind = 0) {
+  auto& a=draw_shadow_audit;
+  ++a.sampled[kind];
+  const uint8_t* now=base+dev;
+  for(uint32_t off=0;off+4<=a.before.size();off+=4)
+    if(std::memcmp(a.before.data()+off,now+off,4)) ++a.changed[kind][off];
+  const auto t=std::chrono::steady_clock::now();
+  if(t-a.last_log<std::chrono::seconds(10)) return;
+  a.last_log=t;
+  static const char* names[3]={"draw","resolve","clear"};
+  for(int k=0;k<3;++k) {
+    std::vector<std::pair<uint32_t,uint64_t>> v(a.changed[k].begin(),a.changed[k].end());
+    std::sort(v.begin(),v.end(),[](auto& x,auto& y){return x.second>y.second;});
+    std::string s;
+    for(size_t i=0;i<v.size() && i<40;++i) s+=fmt::format(" +{:#x}:{}",v[i].first,v[i].second);
+    REXLOG_INFO("native {} shadow audit: sampled={} offsets_changed={} top:{}",names[k],a.sampled[k],v.size(),s);
+  }
+}
+
+// SR_NATIVE_SKIP_DRAW=1 with SR_NATIVE_STATE_SOURCE=device: the renderer builds
+// draws from the D3DDevice shadow alone, so the original XDK draw (state flush
+// into PM4 + DRAW_INDX) no longer runs. Measured with SR_NATIVE_DRAW_SHADOW_AUDIT,
+// the original only changes dirty masks, ring pointers, resource bookkeeping and
+// registers 0x2180-0x2182/0x2203, none of which the renderer reads. Dirty masks
+// stay set; with resolve/clear also skipped they are simply never flushed.
+bool SkipOriginal(superman_returns::graphics::guest::OriginalCall call) {
+  // Device-state packets exist only on the Vulkan replay path.
+  static const bool vulkan = rex::cvar::Query<std::string>("sr_native_api") == "vulkan";
+  if (!vulkan || !native::Enabled() || !superman_returns::graphics::guest::SkipOriginalRequested(call))
+    return false;
+  static std::atomic<uint64_t> skipped{0};
+  static std::atomic<int64_t> last{0};
+  const uint64_t n = skipped.fetch_add(1) + 1;
+  const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::steady_clock::now().time_since_epoch()).count();
+  int64_t prev = last.load();
+  if (now - prev >= 10 && last.compare_exchange_strong(prev, now))
+    REXLOG_INFO("native: original XDK draw/resolve/clear calls skipped: {} (cumulative)", n);
+  return true;
+}
+bool SkipOriginalDraw() { return SkipOriginal(superman_returns::graphics::guest::OriginalCall::kDraw); }
+
+// Inline vertices without the XDK ring (SR_NATIVE_SKIP_ORIGINAL=...,inline):
+// BeginVertices hands out the next slice of an 8 MB guest buffer instead of
+// command-segment space, and EndVertices draws it natively. The renderer copies
+// the vertices when it captures the draw, so a slice may be reused right away.
+struct InlineArena {
+  uint32_t base_address = 0, size = 8u << 20, next = 0;
+  uint32_t Take(uint32_t bytes) {
+    if (!base_address) {
+      base_address = REX_KERNEL_MEMORY()->SystemHeapAlloc(size, 4096);
+      if (!base_address) return 0;
+    }
+    bytes = (bytes + 63) & ~63u;
+    if (!bytes || bytes > size) return 0;
+    if (next + bytes > size) next = 0;
+    const uint32_t address = base_address + next;
+    next += bytes;
+    return address;
+  }
+};
+InlineArena inline_arena;
+thread_local bool t_native_inline = false;
 thread_local bool t_in_draw_up = false;
 
 // Inline-vertex draw opened by BeginVertices, consumed by EndVertices.
@@ -393,10 +516,33 @@ SR_DEFINE_HOOK(SR_ADDR_FRAME_HANDOFF) {
 SR_DEFINE_HOOK(SR_ADDR_DRAW_VERTICES) {
   const uint32_t dev = ctx.r3.u32, prim = ctx.r4.u32, start = ctx.r5.u32, count = ctx.r6.u32;
   OnDeviceCall("DrawVertices", dev, prim);
-  SR_ORIGINAL(SR_ADDR_DRAW_VERTICES)(ctx, base);
+  const bool audit = BeginDrawShadowAudit(base, dev);
+  if (!SkipOriginalDraw()) SR_ORIGINAL(SR_ADDR_DRAW_VERTICES)(ctx, base);
+  if (audit) EndDrawShadowAudit(base, dev);
   if (native::Enabled()) native::Renderer::Get().DrawVertices(base, prim, start, count);
 }
 #endif
+
+// sub_820FC478: an XDK DrawVertices variant (dev, prim, start, count) that
+// first loads primitive-type state (dev+10484, +10504..+10528) from a table,
+// then flushes and emits DRAW_INDX like DrawVertices. Its only caller is
+// sub_82786B60 (via sub_8277B998), ~125 draws per frame in gameplay; the native
+// renderer never saw them before this hook. SR_NATIVE_PRESET_DRAWS=0 turns the
+// native capture off (the original then runs as before).
+bool NativePresetDraws() {
+  static const bool on = [] {
+    const char* v = std::getenv("SR_NATIVE_PRESET_DRAWS");
+    return !(v && *v == '0');
+  }();
+  return on;
+}
+SR_DEFINE_HOOK(820FC478) {
+  const uint32_t dev = ctx.r3.u32, prim = ctx.r4.u32 & 0x3F, start = ctx.r5.u32, count = ctx.r6.u32;
+  OnDeviceCall("PresetDrawVertices", dev, prim);
+  const bool native_draw = NativePresetDraws() && native::Enabled();
+  if (!(native_draw && SkipOriginalDraw())) SR_ORIGINAL(820FC478)(ctx, base);
+  if (native_draw) native::Renderer::Get().DrawVertices(base, prim, start, count);
+}
 
 #if SR_HOOK_ENABLED(DRAW_INDEXED_VERTICES)
 // D3DDevice_DrawIndexedVertices(dev, PrimType, BaseVertexIndex, StartIndex, IndexCount)
@@ -404,7 +550,9 @@ SR_DEFINE_HOOK(SR_ADDR_DRAW_INDEXED_VERTICES) {
   const uint32_t dev = ctx.r3.u32, prim = ctx.r4.u32, base_vertex = ctx.r5.u32,
                  start = ctx.r6.u32, count = ctx.r7.u32;
   OnDeviceCall("DrawIndexedVertices", dev, prim);
-  SR_ORIGINAL(SR_ADDR_DRAW_INDEXED_VERTICES)(ctx, base);
+  const bool audit = BeginDrawShadowAudit(base, dev);
+  if (!SkipOriginalDraw()) SR_ORIGINAL(SR_ADDR_DRAW_INDEXED_VERTICES)(ctx, base);
+  if (audit) EndDrawShadowAudit(base, dev);
   if (native::Enabled()) {
     native::Renderer::Get().DrawIndexedVertices(base, prim, int32_t(base_vertex), start, count);
   }
@@ -417,8 +565,9 @@ SR_DEFINE_HOOK(SR_ADDR_DRAW_VERTICES_UP) {
   const uint32_t dev = ctx.r3.u32, prim = ctx.r4.u32, count = ctx.r5.u32, data = ctx.r6.u32,
                  stride = ctx.r7.u32;
   OnDeviceCall("DrawVerticesUP", dev, prim);
+  const bool skip_up = SkipOriginal(superman_returns::graphics::guest::OriginalCall::kInline);
   t_in_draw_up = true;
-  SR_ORIGINAL(SR_ADDR_DRAW_VERTICES_UP)(ctx, base);
+  if (!skip_up) SR_ORIGINAL(SR_ADDR_DRAW_VERTICES_UP)(ctx, base);
   t_in_draw_up = false;
   if (native::Enabled()) native::Renderer::Get().DrawInlineVertices(base, prim, data, count, stride);
 }
@@ -430,7 +579,14 @@ SR_DEFINE_HOOK(SR_ADDR_DRAW_VERTICES_UP) {
 SR_DEFINE_HOOK(SR_ADDR_BEGIN_VERTICES) {
   const uint32_t dev = ctx.r3.u32, prim = ctx.r4.u32, count = ctx.r5.u32, stride = ctx.r6.u32;
   if (!t_in_draw_up) OnDeviceCall("BeginVertices", dev, prim);
-  SR_ORIGINAL(SR_ADDR_BEGIN_VERTICES)(ctx, base);
+  t_native_inline = false;
+  if (!t_in_draw_up && SkipOriginal(superman_returns::graphics::guest::OriginalCall::kInline)) {
+    if (const uint32_t slice = inline_arena.Take(count * stride)) {
+      ctx.r3.u64 = slice;
+      t_native_inline = true;
+    }
+  }
+  if (!t_native_inline) SR_ORIGINAL(SR_ADDR_BEGIN_VERTICES)(ctx, base);
   if (native::Enabled() && !t_in_draw_up) {
     g_pending_inline = {true, prim, count, stride, ctx.r3.u32};
   }
@@ -445,6 +601,10 @@ SR_DEFINE_HOOK(SR_ADDR_END_VERTICES) {
     g_pending_inline.active = false;
     native::Renderer::Get().DrawInlineVertices(base, g_pending_inline.prim, g_pending_inline.data,
                                                g_pending_inline.count, g_pending_inline.stride);
+  }
+  if (t_native_inline) {
+    t_native_inline = false;  // BeginVertices did not open a ring draw
+    return;
   }
   SR_ORIGINAL(SR_ADDR_END_VERTICES)(ctx, base);
 }
@@ -466,7 +626,10 @@ SR_DEFINE_HOOK(SR_ADDR_RESOLVE) {
   OnDeviceCall("Resolve", dev, flags);
   // Original first: the resolve's RB_COPY_* registers land in the command
   // stream the PM4 mirror parses.
-  SR_ORIGINAL(SR_ADDR_RESOLVE)(ctx, base);
+  const bool audit = BeginDrawShadowAudit(base, dev, 1);
+  if (!SkipOriginal(superman_returns::graphics::guest::OriginalCall::kResolve))
+    SR_ORIGINAL(SR_ADDR_RESOLVE)(ctx, base);
+  if (audit) EndDrawShadowAudit(base, dev, 1);
   if (native::Enabled()) {
     native::Renderer::Get().Resolve(base, flags, rect, dest, point, clear_color, clear_z, clear_stencil,level,slice);
   }
@@ -509,7 +672,10 @@ SR_DEFINE_HOOK(SR_ADDR_CLEAR) {
   }
   const float z = float(ctx.f1.f64);
   OnDeviceCall("Clear", dev, flags);
-  SR_ORIGINAL(SR_ADDR_CLEAR)(ctx, base);
+  const bool audit = BeginDrawShadowAudit(base, dev, 2);
+  if (!SkipOriginal(superman_returns::graphics::guest::OriginalCall::kClear))
+    SR_ORIGINAL(SR_ADDR_CLEAR)(ctx, base);
+  if (audit) EndDrawShadowAudit(base, dev, 2);
   if (native::Enabled()) {
     native::Renderer::Get().Clear(base, rect ? 1u : 0u, rect, flags, color, z, stencil);
   }
@@ -525,7 +691,10 @@ SR_DEFINE_HOOK(SR_ADDR_RING_MAKE_SPACE) {
   const uint32_t dev = ctx.r3.u32;
   OnDeviceCall("RingMakeSpace", dev, 0);
   if (native::Enabled()) native::Renderer::Get().SyncRing(base, dev);
-  SR_ORIGINAL(SR_ADDR_RING_MAKE_SPACE)(ctx, base);
+  {
+    WaitTimer timer(1);
+    SR_ORIGINAL(SR_ADDR_RING_MAKE_SPACE)(ctx, base);
+  }
   if (native::Enabled()) native::Renderer::Get().ResyncRing(base, dev);
 }
 #endif
@@ -536,7 +705,10 @@ SR_DEFINE_HOOK(SR_ADDR_RING_ALLOC_LARGE) {
   const uint32_t dev = ctx.r3.u32;
   OnDeviceCall("RingAllocLarge", dev, 0);
   if (native::Enabled()) native::Renderer::Get().SyncRing(base, dev);
-  SR_ORIGINAL(SR_ADDR_RING_ALLOC_LARGE)(ctx, base);
+  {
+    WaitTimer timer(2);
+    SR_ORIGINAL(SR_ADDR_RING_ALLOC_LARGE)(ctx, base);
+  }
   if (native::Enabled()) native::Renderer::Get().ResyncRing(base, dev);
 }
 #endif
@@ -655,7 +827,30 @@ SR_DEFINE_HOOK(SR_ADDR_BLOCK_ON_FENCE) {
   t_fence_dev = ctx.r3.u32;
   t_fence_value = ctx.r4.u32;
   OnDeviceCall("BlockOnFence", ctx.r3.u32, ctx.r4.u32);
-  SR_ORIGINAL(SR_ADDR_BLOCK_ON_FENCE)(ctx, base);
+  // Native fences (SR_NATIVE_SKIP_ORIGINAL=...,fence): every draw, resolve and
+  // clear is captured with its data when issued, so nothing the guest later
+  // overwrites is still pending on a GPU; complete the fence right away instead
+  // of waiting for the ring consumer. The consumer's fence writes are monotonic
+  // in this mode (native_graphics_system.cpp), so it never moves it back.
+  if (SkipOriginal(superman_returns::graphics::guest::OriginalCall::kFence)) {
+    const auto& layout = native::profile::kDevice;
+    const uint32_t dev = ctx.r3.u32, fence = ctx.r4.u32;
+    const uint32_t completed_ptr = GuestLoad32(base, dev + layout.fence_completed_ptr);
+    if (completed_ptr) {
+      const uint32_t completed = GuestLoad32(base, completed_ptr);
+      if (int32_t(fence - completed) > 0) {
+        const uint32_t be = __builtin_bswap32(fence);
+        std::memcpy(base + completed_ptr, &be, 4);
+      }
+    }
+    t_fence_dev = saved_dev;
+    t_fence_value = saved_value;
+    return;
+  }
+  {
+    WaitTimer timer(0);
+    SR_ORIGINAL(SR_ADDR_BLOCK_ON_FENCE)(ctx, base);
+  }
   t_fence_dev = saved_dev;
   t_fence_value = saved_value;
 }

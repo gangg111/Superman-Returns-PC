@@ -13,6 +13,7 @@
 // frame-time counters below are only live in non-Release builds.)
 
 #include "native_graphics_system.h"
+#include "../graphics/guest/state_source.h"
 
 #include <algorithm>
 #include <charconv>
@@ -490,6 +491,28 @@ void D3D12NativeGraphicsSystem::ExecuteBuffer(uint32_t address, uint32_t dwords,
   }
 }
 
+namespace {
+// SR_NATIVE_RING_STATS=1: what the ring still carries, every 10 s (cumulative):
+// type-0 dwords for render state (>= kFirstUnusedRegister) vs sync registers,
+// and type-3 packets per opcode with their payload dwords.
+struct RingStats {
+  bool on = [] {const char* v=std::getenv("SR_NATIVE_RING_STATS");return v && *v && *v!='0';}();
+  std::atomic<uint64_t> state_dwords{0}, sync_dwords{0}, type3[128]{}, type3_dwords[128]{};
+  std::atomic<int64_t> last{0};
+  void MaybeLog() {
+    const int64_t now=std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t prev=last.load();
+    if(prev==0) {last.compare_exchange_strong(prev,now);return;}
+    if(now-prev<10 || !last.compare_exchange_strong(prev,now)) return;
+    std::string t;
+    for(uint32_t i=0;i<128;++i) if(type3[i]) t+=fmt::format(" {:02X}:{}/{}",i,type3[i].load(),type3_dwords[i].load());
+    REXLOG_INFO("native ring stats: type0 state_dwords={} sync_dwords={} type3 op:packets/dwords{}",
+                state_dwords.load(),sync_dwords.load(),t);
+  }
+} ring_stats;
+}  // namespace
+
 bool D3D12NativeGraphicsSystem::ExecutePacket(Reader& reader) {
   uint32_t packet = reader.Read();
   if (packet == 0) return true;
@@ -501,6 +524,10 @@ bool D3D12NativeGraphicsSystem::ExecutePacket(Reader& reader) {
       bool one = (packet >> 15) & 1;
       // Render state / constants (>= 0x2000) are only mirrored by the native
       // renderer; this sync-only consumer never reads them: skip the burst.
+      if (ring_stats.on) {
+        (index >= kFirstUnusedRegister ? ring_stats.state_dwords : ring_stats.sync_dwords) += count;
+        ring_stats.MaybeLog();
+      }
       if (index >= kFirstUnusedRegister) {
         reader.Skip(count);
         return true;
@@ -638,6 +665,10 @@ bool D3D12NativeGraphicsSystem::ExecuteType3(Reader& reader, uint32_t packet) {
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   if (reader.remaining < count) return false;
+  if (ring_stats.on) {
+    ++ring_stats.type3[opcode];
+    ring_stats.type3_dwords[opcode] += count;
+  }
   {
     static int logged = 0;
     if (logged < 60 && REXCVAR_GET(sr_native_gpu_trace)) {
@@ -760,7 +791,15 @@ bool D3D12NativeGraphicsSystem::ExecuteType3(Reader& reader, uint32_t packet) {
     case xenos::PM4_EVENT_WRITE_SHD: {  // fence value (or the frame counter) to memory
       uint32_t initiator = reader.Read(), address = reader.Read(), value = reader.Read();
       WriteRegister(gpu::XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
-      StoreMemory(address, (initiator >> 31) & 1 ? counter_.load() : value);
+      const uint32_t stored = (initiator >> 31) & 1 ? counter_.load() : value;
+      // Native fences complete ahead of the ring; never move a value back.
+      if (superman_returns::graphics::guest::SkipOriginalRequested(superman_returns::graphics::guest::OriginalCall::kFence)) {
+        uint32_t current;
+        std::memcpy(&current, memory_->TranslatePhysical<const uint8_t*>(address & ~3u), 4);
+        current = xenos::GpuSwap(current, xenos::Endian(address & 3));
+        if (int32_t(stored - current) < 0) return finish();
+      }
+      StoreMemory(address, stored);
       return finish();
     }
     case xenos::PM4_EVENT_WRITE_EXT: {  // screen extents of the previous draws
