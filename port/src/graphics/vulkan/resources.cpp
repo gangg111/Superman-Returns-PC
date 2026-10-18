@@ -120,6 +120,7 @@ BufferResource::~BufferResource() {
 TextureResource::~TextureResource() {
   if(!context || !context->device) return;
   if(view) context->f.vkDestroyImageView(context->device,view,nullptr);
+  if(array_view) context->f.vkDestroyImageView(context->device,array_view,nullptr);
   if(image_owner) return;
   if(memory) {--LiveMemory().images;LiveMemory().image_bytes-=int64_t(allocation);}
   if(state && handle) state->Forget(handle);
@@ -309,6 +310,10 @@ bool ResourceStore::UploadTexture(guest::ResourceId id,const guest::LinearTextur
   VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};view.image=gpu->handle;view.viewType=plan.view_type;view.format=plan.format;view.components=plan.swizzle;
   view.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,plan.mips,0,plan.view_type==VK_IMAGE_VIEW_TYPE_CUBE?6u:1u};
   if(!Check(c_.f.vkCreateImageView(c_.device,&view,nullptr,&gpu->view),"Create texture view",e)) return false;
+  if(plan.view_type==VK_IMAGE_VIEW_TYPE_2D) {
+    view.viewType=VK_IMAGE_VIEW_TYPE_2D_ARRAY;view.subresourceRange.layerCount=plan.layers;
+    if(!Check(c_.f.vkCreateImageView(c_.device,&view,nullptr,&gpu->array_view),"Create texture array view",e)) return false;
+  }
   VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.image=gpu->handle;barrier.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,plan.mips,0,plan.layers};barrier.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;barrier.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
   auto command=upload_?upload_:command_;
   c_.f.vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&barrier);
@@ -345,6 +350,10 @@ std::shared_ptr<TextureResource> ResourceStore::ResolveTexture(guest::ResourceId
   t->allocation=mr.size;++LiveMemory().images;LiveMemory().image_bytes+=int64_t(mr.size);
   VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};view.image=t->handle;view.viewType=view_type;view.format=format;view.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,mips,0,cube?layers:1};
   if(!Check(c_.f.vkCreateImageView(c_.device,&view,nullptr,&t->view),"Create resolve view",e) || !state.Register(t->handle,mips,layers,VK_IMAGE_ASPECT_COLOR_BIT,e)) return {};
+  if(!cube) {
+    view.viewType=VK_IMAGE_VIEW_TYPE_2D_ARRAY;view.subresourceRange.layerCount=layers;
+    if(!Check(c_.f.vkCreateImageView(c_.device,&view,nullptr,&t->array_view),"Create resolve array view",e)) return {};
+  }
   t->state=&state;
   VkImageSubresourceRange allocation_range{VK_IMAGE_ASPECT_COLOR_BIT,0,mips,0,layers};
   if(!state.Transition(command_,t->handle,allocation_range,ImageUsage::TransferDestination(),e)) return {};
@@ -360,6 +369,10 @@ bool ResourceStore::BindTextureView(guest::ResourceId id,std::shared_ptr<Texture
   auto t=std::make_shared<TextureResource>();t->context=&c_;t->image_owner=owner;t->handle=owner->handle;t->state=owner->state;t->format=owner->format;t->extent=owner->extent;t->layers=owner->layers;t->mips=owner->mips;t->view_type=owner->view_type;
   VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};view.image=t->handle;view.viewType=t->view_type;view.format=t->format;view.components=mapping;view.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,t->mips,0,t->view_type==VK_IMAGE_VIEW_TYPE_2D?1:t->layers};
   if(!Check(c_.f.vkCreateImageView(c_.device,&view,nullptr,&t->view),"Resolved fetch view",e)) return false;
+  if(t->view_type==VK_IMAGE_VIEW_TYPE_2D) {
+    view.viewType=VK_IMAGE_VIEW_TYPE_2D_ARRAY;view.subresourceRange.layerCount=t->layers;
+    if(!Check(c_.f.vkCreateImageView(c_.device,&view,nullptr,&t->array_view),"Resolved fetch array view",e)) return false;
+  }
   submissions_.Hold(serial_,t);textures_[id]=t;e={};return true;
 }
 std::shared_ptr<BufferResource> ResourceStore::ResolveScratch(VkDeviceSize size,Error& e) {

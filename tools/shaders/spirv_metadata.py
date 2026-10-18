@@ -81,7 +81,7 @@ def inspect_spirv(data):
   if 33 in deco or 34 in deco:
    if not deco.get(33) or not deco.get(34):raise ValueError('Incomplete descriptor binding')
    if op==26:kind='sampler'
-   elif op==25:kind={1:'sampled_image_2d',2:'sampled_image_3d',3:'sampled_image_cube'}.get(a[1],'unsupported_image') if a[5]==1 else 'storage_image'
+   elif op==25:kind=('sampled_image_2d_array' if a[1]==1 and a[3]==1 else {1:'sampled_image_2d',2:'sampled_image_3d',3:'sampled_image_cube'}.get(a[1],'unsupported_image')) if a[5]==1 else 'storage_image'
    elif op==30 and v['storage'] in (2,12):kind='storage_buffer' if v['storage']==12 or 3 in decorations.get(tid,{}) else 'uniform_buffer'
    else:kind='unsupported_resource'
    descriptors.append(dict(set=deco[34][0],binding=deco[33][0],type=kind,count=count,runtime_array=runtime,dynamic_indexing=(count!=1 and vid in dynamic_roots)))

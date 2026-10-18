@@ -67,6 +67,9 @@ struct TextureResource {
   VkImage handle=VK_NULL_HANDLE;
   VkDeviceMemory memory=VK_NULL_HANDLE;
   VkImageView view=VK_NULL_HANDLE;
+  // 2D_ARRAY view over every layer of a 2D image (stacked textures read by
+  // tfetch3D; the 2D view above shows layer 0 only). Null for 3D and cube.
+  VkImageView array_view=VK_NULL_HANDLE;
   VkFormat format=VK_FORMAT_UNDEFINED;
   VkExtent3D extent{};
   uint32_t layers=1,mips=1;

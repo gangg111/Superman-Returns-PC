@@ -11,14 +11,15 @@ def prepare(root=ROOT):
  shutil.copytree(source/'src/XenosRecomp',target/'src/XenosRecomp',dirs_exist_ok=True)
  for name in ('fmt','xxHash'):
   shutil.copytree(source/'deps'/name,target/'deps'/name,dirs_exist_ok=True,ignore=shutil.ignore_patterns('.git','test','tests','doc','docs','build'))
- patch=root/'tools/shaders/xenosrecomp/patches/0011-vulkan-buffer-bindings.patch'
+ patches=[root/'tools/shaders/xenosrecomp/patches'/name for name in ('0011-vulkan-buffer-bindings.patch','0012-vulkan-stacked-tfetch3d.patch')]
  args=['git','apply','--directory',(target.relative_to(root)/'src').as_posix()]
- check=subprocess.run([*args,'--check',str(patch)],cwd=root,capture_output=True,text=True)
- if check.returncode:
-  reverse=subprocess.run([*args,'--reverse','--check',str(patch)],cwd=root,capture_output=True,text=True)
-  if reverse.returncode:raise RuntimeError('ABI patch conflicts with copied emitter source; original source preserved: '+check.stderr)
- else:subprocess.run([*args,str(patch)],cwd=root,check=True)
- fingerprint=hashlib.sha256(patch.read_bytes()).hexdigest()
+ for patch in patches:
+  check=subprocess.run([*args,'--check',str(patch)],cwd=root,capture_output=True,text=True)
+  if check.returncode:
+   reverse=subprocess.run([*args,'--reverse','--check',str(patch)],cwd=root,capture_output=True,text=True)
+   if reverse.returncode:raise RuntimeError('ABI patch '+patch.name+' conflicts with copied emitter source; original source preserved: '+check.stderr)
+  else:subprocess.run([*args,str(patch)],cwd=root,check=True)
+ fingerprint=hashlib.sha256(b''.join(p.read_bytes() for p in patches)).hexdigest()
  (target/'abi-patch.sha256').write_text(fingerprint,encoding='ascii')
  return target
 if __name__=='__main__':

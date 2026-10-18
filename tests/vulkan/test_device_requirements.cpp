@@ -41,7 +41,8 @@ SR_TEST(game_layout_binds_the_constants_with_dynamic_offsets_inside_the_guarante
   }
   SR_CHECK_EQ(dynamic, 3u);  // o Vulkan garante maxDescriptorSetStorageBuffersDynamic >= 4
   DeviceCaps caps{};
-  caps.stage.storage_buffers = 35;caps.stage.sampled_images = 96;caps.stage.samplers = 32;caps.stage.descriptor_sets = 4;
+  // 2D, 3D, cube and 2D-array tables of 32 images each.
+  caps.stage.storage_buffers = 35;caps.stage.sampled_images = 128;caps.stage.samplers = 32;caps.stage.descriptor_sets = 4;
   caps.layout = caps.stage;
   SR_CHECK(CheckDeviceRequirements({}, {}, GameBindingLayout(), caps).empty());
   caps.layout.storage_buffers = 34;  // 3 dinâmicos + 32 de vertex buffers exigem 35

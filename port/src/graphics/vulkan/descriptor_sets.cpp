@@ -97,6 +97,7 @@ DescriptorCacheEntry* DescriptorStore::Shared(const DrawBindings& bindings,
   auto entry=std::make_shared<DescriptorCacheEntry>();entry->key.assign(key.begin(),key.begin()+words);entry->last_used=serial;entry->context=&c_;
   std::array<VkDescriptorBufferInfo,32> vertex_info{};
   std::array<std::array<VkDescriptorImageInfo,32>,3> texture_info{};
+  std::array<VkDescriptorImageInfo,32> array_info{};  // binding 3: array views of the 2D table
   std::array<VkDescriptorImageInfo,32> sampler_info{};
   std::vector<std::shared_ptr<BufferResource>> buffers;std::vector<std::shared_ptr<TextureResource>> textures;
   for(uint32_t slot=0;slot<32;++slot) {
@@ -107,6 +108,10 @@ DescriptorCacheEntry* DescriptorStore::Shared(const DrawBindings& bindings,
       auto expected=dimension==0?VK_IMAGE_VIEW_TYPE_2D:(dimension==1?VK_IMAGE_VIEW_TYPE_3D:VK_IMAGE_VIEW_TYPE_CUBE);
       if(texture->view_type!=expected) {e={"Texture descriptors",VK_ERROR_INITIALIZATION_FAILED,"Texture view dimension mismatches shader array"};return nullptr;}
       texture_info[dimension][slot]={VK_NULL_HANDLE,texture->view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};textures.push_back(texture);
+      if(dimension==0) {
+        if(!texture->array_view) {e={"Texture descriptors",VK_ERROR_INITIALIZATION_FAILED,"2D texture has no array view"};return nullptr;}
+        array_info[slot]={VK_NULL_HANDLE,texture->array_view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+      }
     }
     // Non-texture slots only expose the dummy texture: any sampler will do.
     static constexpr std::array<uint32_t,6> no_texture{};
@@ -136,7 +141,7 @@ DescriptorCacheEntry* DescriptorStore::Shared(const DrawBindings& bindings,
   for(auto& pool:cache_pools_) if(pool->draws<entries_per_pool) {entry->pool=pool;break;}
   if(!entry->pool) {
     auto pool=std::make_shared<DescriptorPage>();pool->context=&c_;
-    VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,32*entries_per_pool},{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,96*entries_per_pool},{VK_DESCRIPTOR_TYPE_SAMPLER,32*entries_per_pool}};
+    VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,32*entries_per_pool},{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,128*entries_per_pool},{VK_DESCRIPTOR_TYPE_SAMPLER,32*entries_per_pool}};
     VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};info.flags=VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;info.maxSets=3*entries_per_pool;info.poolSizeCount=3;info.pPoolSizes=sizes;
     if(!Check(c_.f.vkCreateDescriptorPool(c_.device,&info,nullptr,&pool->pool),"Create shared descriptor pool",e)) return nullptr;
     cache_pools_.push_back(pool);entry->pool=pool;
@@ -144,13 +149,14 @@ DescriptorCacheEntry* DescriptorStore::Shared(const DrawBindings& bindings,
   VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};allocate.descriptorPool=entry->pool->pool;allocate.descriptorSetCount=3;allocate.pSetLayouts=layouts_.data()+1;
   if(!Check(c_.f.vkAllocateDescriptorSets(c_.device,&allocate,entry->sets.data()),"Allocate shared descriptor sets",e)) return nullptr;
   ++entry->pool->draws;
-  std::array<VkWriteDescriptorSet,5> writes{};
+  std::array<VkWriteDescriptorSet,6> writes{};
   auto write=[&](uint32_t index,uint32_t set,uint32_t binding,VkDescriptorType type,const VkDescriptorBufferInfo* buffers,const VkDescriptorImageInfo* images) {
     auto& w=writes[index];w={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};w.dstSet=entry->sets[set];w.dstBinding=binding;w.descriptorCount=32;w.descriptorType=type;w.pBufferInfo=buffers;w.pImageInfo=images;
   };
   for(uint32_t dim=0;dim<3;++dim) write(dim,0,dim,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,nullptr,texture_info[dim].data());
   write(3,1,0,VK_DESCRIPTOR_TYPE_SAMPLER,nullptr,sampler_info.data());
   write(4,2,0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,vertex_info.data(),nullptr);
+  write(5,0,3,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,nullptr,array_info.data());
   c_.f.vkUpdateDescriptorSets(c_.device,uint32_t(writes.size()),writes.data(),0,nullptr);
   pending_.Hold(serial,entry);
   if(complete && cacheable) {cache_[hash].push_back(entry);++cache_entries_;}

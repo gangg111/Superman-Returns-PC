@@ -93,6 +93,9 @@ bool BuildBindings(const guest::DrawPacket& draw,std::byte* block,DrawBindings& 
       uint32_t dim=(fetch[5]>>9)&3;
       dim=dim?dim-1:0;  // 1D and 2D share the 2D table, as in the requests above
       index[dim]=out.texture_indices[slot];
+      // A stacked 2D texture (fetch dword 1 bit 10) read by tfetch3D: the 3D
+      // table points at its array view (binding 3, same index as the 2D table).
+      if(dim==0 && (fetch[1]&(1u<<10))) index[1]=out.texture_indices[slot]|0x10000000u;
     }
     for(uint32_t dim=0;dim<3;++dim) std::memcpy(shared+dim*64+slot*4,&index[dim],4);
     std::memcpy(shared+192+slot*4,&out.sampler_indices[slot],4);

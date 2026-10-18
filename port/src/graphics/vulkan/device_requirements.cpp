@@ -85,6 +85,7 @@ std::vector<LayoutBinding> GameBindingLayout() {
           {1,0,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,32,both},
           {1,1,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,32,both},
           {1,2,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,32,both},
+          {1,3,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,32,both},  // 2D array views (stacked textures read by tfetch3D)
           {2,0,VK_DESCRIPTOR_TYPE_SAMPLER,32,both},
           {3,0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,32,VK_SHADER_STAGE_VERTEX_BIT}};
 }
