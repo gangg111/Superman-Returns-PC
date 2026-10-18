@@ -78,9 +78,30 @@ def jobs_for(data_dir, only=None):
     return jobs, banks, skipped
 
 
+def fnv1a(data):
+    h = 2166136261
+    for b in data:
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+def keys(body):
+    """Identity of a record as the engine sees it at run time: the game hands
+    SndPlayer a pointer to the SNR header inside the loaded record
+    (port/src/audio_api_log.cpp logs the same 16 bytes and FNV-1a of 256)."""
+    pos = ea_ast.parse_sabr(body).snr_pos
+    tail = body[pos:pos + 256]
+    return {"snr16": body[pos:pos + 16].hex(), "tail": len(body) - pos,
+            "fnv256": f"{fnv1a(tail):08X}" if len(tail) == 256 else None}
+
+
 def convert(job, out_dir):
     label, name, body, sns = job
     item = {"archive": label, "name": name}
+    try:
+        item.update(keys(body))
+    except Exception:
+        pass
     try:
         rec, pcm, block_samples = ea_ast.decode_sound(body, sns)
         snr = rec.snr
@@ -106,8 +127,23 @@ def main():
     ap.add_argument("out_dir")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument("--only")
+    ap.add_argument("--update-keys", action="store_true",
+                    help="only add run-time keys to an existing manifest, no decoding")
     args = ap.parse_args()
     jobs, banks, skipped = jobs_for(args.data_dir, args.only)
+    if args.update_keys:
+        path = os.path.join(args.out_dir, "manifest.json")
+        manifest = json.load(open(path, encoding="utf-8"))
+        by_id = {(label, name): body for label, name, body, _ in jobs}
+        for r in manifest["sounds"]:
+            body = by_id.get((r["archive"], r["name"]))
+            if body is not None:
+                r.update(keys(body))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=1)
+        have = sum(1 for r in manifest["sounds"] if r.get("fnv256"))
+        print(f"keys: {len(manifest['sounds'])} sounds, {have} with fnv256")
+        return 0
     print(f"sounds: {len(jobs)}, banks (no audio): {banks}, unreadable entries: {len(skipped)}",
           flush=True)
     os.makedirs(args.out_dir, exist_ok=True)

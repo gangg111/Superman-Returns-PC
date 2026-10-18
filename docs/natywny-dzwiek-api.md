@@ -18,8 +18,8 @@
 > `Dac0` index 3. Funkcje strumieni filmów nie były wołane w tym scenariuszu.
 >
 > Mapa API granicy gra / silnik dźwięku. Analiza statyczna asemblera z wygenerowanego kodu
-> (subagent, 2026-10-19), z poprawką własną po weryfikacji: rzekomy odczyt `sys+0` dotyczy
-> menedżera dźwięku gry. Każda pozycja ma oznaczenie VERIFIED (odczytane w asm) albo INFERRED.
+> (subagent, 2026-10-19). Poprawka z 2026-10-20: `System+0` JEST czytany przez grę (zegar
+> dźwięku, double), wcześniejsza „poprawka”, że to pole menedżera, była błędna. Każda pozycja ma oznaczenie VERIFIED (odczytane w asm) albo INFERRED.
 
 # Superman Returns: game and audio engine API map
 
@@ -100,6 +100,39 @@ Globals (VERIFIED): channel table 0x8299FED8 (+14 u8 = channel count, +136 = bas
 | sub_82656A40 | 2 (8235D050 with 0, 8235D090 with 4096) | `Stream::SetPitch(ch, q12)` → 0 / −8 | r3 ch, r4 value clamped to ≤ 16384 | ch+240 = value; sub_8265FF28(ch+8, value) writes u16 +128 of each voice and refreshes | VERIFIED; pause = 0 / resume = 4096 (1.0 in Q12) INFERRED |
 | sub_82658030 | 1 (8235FA18) | `Stream::SetRequestLoop(handle, n)` → 0 / −8 | r3 handle, r4 s16 | req+32 = n (queued with −1, game sets 0) | VERIFIED store, "loop count" INFERRED |
 
+### 4b. SndPlayer "SnP0" (2026-10-20)
+
+Class descriptors are in `.data`, not BSS: `{name*, FourCC, GetSize, Create, ?, fn20, Process, counts, ...}`,
+full list in `docs/natywny-dzwiek/deskryptory.txt` (VERIFIED with peek; the BSS getters such as
+sub_82653558 → 0x8292EED0 return a second, runtime copy). SndPlayer: descriptor 0x829370D0, GetSize
+0x82653EF8, Create 0x82654428, Process 0x82655610, vtable 0x82081D18 = {0x826542E0 destroy,
+**0x82654A98 Control**, 0x82655870}.
+
+`Control(player, 0, req)` (VERIFIED, sub_82654A98) is the start request. It runs on the game thread,
+bumps a float counter player+96 (wraps at the constant 0x82081D24) and writes it back to req+32 as the
+request id, then enqueues a variable-size command {0x82654620, player, ...} with a copy of:
+
+| req | type | goes to | meaning |
+|---|---|---|---|
+| +0 | double | request+8 | start time (compared with the audio clock in sub_82653880) INFERRED |
+| +8 | double | request+16 | byte offset added to the stream data position (file read at +16 + snr+44) VERIFIED use |
+| +16 | char* | copied string | stream file name (types 1 and 2), opened through sub_82607968 VERIFIED |
+| +20 | u8* | parsed by sub_82653738 | **SNR header in guest memory** (inside the loaded `sabr` record) VERIFIED |
+| +24 | u32 | sub_82655900 | tag of the buffer pool (BufferPool+32) for streamed data VERIFIED |
+| +28 | float | u8 request+75 | 1 = "stop after this request" flag in sub_82655170 INFERRED |
+| +32 | float out | | request id (player+96) VERIFIED |
+
+Any other index enqueues {0x82654328, player}: drains all pending requests, player+132 = 0,
+player+113 = 1, player+40 = 3 (stop). The mixer-side request (88 B, pool at player+72, pending list
+player+84) holds the SNR fields from sub_82653738: +72 codec, +73 channels, +32 rate, +74 type
+(0 RAM, 1 stream, 2 RAM head + stream), +36 samples, +40 loop start or −1, +44/+48 stream offsets,
++28 data pointer. Process works in 256-frame blocks, 20 decoder slots of 44 B at player+296,
+resampler object at player+124 (spec: `docs/natywny-dzwiek/spec-pitch-resampler.md`).
+
+Native mapping (tools/audio/convert_audio.py manifest): RAM sounds by FNV-1a of 256 bytes from the
+SNR header (`fnv256`, 1483 of 1484 unique up to 11 groups of identical audio), streamed sounds by file
+name + offset (to be confirmed by `SR_LOG_AUDIO_API`, which now logs the request).
+
 ### 5. Mixer buses / effects
 
 No dedicated boundary functions beyond the plug-in API: the game builds the master voice in 82326F98 as **SubMix(6 ch) → VuM0(6) → AiW0(6) → Dac0** with `Voice::Create(4, ...)` (VERIFIED entries on stack r1+96..+140), stores plug-ins at game+108 (master submix via sys+48), +120 (VU), +128 (AiW0), +116 (Dac), and sets Dac controls (1, 3.0f) and (3, NULL). Effects (Reverb, Delay, two more classes) are only registered (82325510). Per-sound effect chains are built by 823277E0 / 8232B4D8 / 8232E058 through `Voice::Create`.
@@ -115,7 +148,7 @@ No boundary function is clearly 3D. Candidates: CE18 with a float vector from 82
 ### (a) Struct offsets established
 
 System (228 B, global 0x8299FDC8):
-* +0: not read by the game. CORRECTED 2026-10-19: the `lfd f0,0(r11)` in 82327988 loads through the game sound manager global 0x82976060 (`lis r29,-32105; lwz r11,24672(r29)`), set in sub_82337020, so it is the game manager's own double, not the RW System's (VERIFIED by reading the asm).
+* +0: double **audio clock in seconds**. RE-VERIFIED 2026-10-20: written only in the Dac process (sub_82650798 / sub_82650B78: `lfd f0,0(sys); lfs f13,8(sys); fadd; stfd f0,0(sys)`, i.e. += block duration each mixer block). Read by the game: 82327988 (`manager(0x82976060)+132 -> System* -> lfd 0`, stored as sound+408 end time, plus Voice latency) and 82327EA0 (`GetInstance(); lfd f13,0(r3)` compared with sound+496 + constant). The 2026-10-19 note claiming this was the game manager's field was wrong: manager+132 is the System*.
 * +8 float dt passed to per-update callbacks (8264C540) (VERIFIED)
 * +12 float, divisor of plug-in latency (INFERRED sample rate); +16 = 90.0f at create
 * +20 update counter, ++ per queue drain, read directly by the game (82327988) (VERIFIED)
@@ -135,7 +168,7 @@ Stream channel / request: see section 4.
 
 ### (b) Functions whose result the game reads back (hard to replace natively)
 
-1. Direct struct read, no function: **sys+20 (update counter)**, read in 82327988 through `game manager (0x82976060) +132 -> System* -> +20` and stored to sound+444, then polled with sub_8264C528. VERIFIED: sub_82326F98 stores the result of System::Create (sub_8264C958) to manager+132. A native replacement must keep sys+20 alive in guest memory. (The earlier "sys+0 clock" read is the game manager's own field, see (a).)
+1. Direct struct read, no function: **sys+20 (update counter)**, read in 82327988 through `game manager (0x82976060) +132 -> System* -> +20` and stored to sound+444, then polled with sub_8264C528. VERIFIED: sub_82326F98 stores the result of System::Create (sub_8264C958) to manager+132. A native replacement must keep sys+20 alive in guest memory. **sys+0 (double audio clock, seconds)** is read the same way (82327988, 82327EA0) and must advance by 256/48000 per mixed block.
 2. `GetParamF` / `GetParamD` (8264CDE8, 8264CE00): read the mixer-written param table at plugin+12; 82327D90 uses param 1 of the player as the sound position, 823250C8 reads several params (6..) of a plug-in.
 3. `Voice::IsReleaseDone` (826500F8), `SndPlayer::IsDone` (82653E70), `Voice::GetLatencySeconds` (826500C8): the game's sound lifetime depends on them.
 4. Stream API: `GetStatus` (82656558) and `GetRequestInfo` (82656378) give the movie its audio clock (ms); errors −8/−13/−1 from Open/Queue/Close; `Stream::Open` and `Queue` return handles kept by the game.

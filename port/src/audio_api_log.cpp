@@ -141,7 +141,41 @@ REX_HOOK_RAW(sub_8264CE18) {
                     Load32(base, data), LoadF(base, data));
     else
       std::snprintf(buf, sizeof(buf), " index=%u data=0", ctx.r4.u32);
-    Write(log, ctx, "Plugin::Control " + Plugin(log, ctx.r3.u32) + buf);
+    std::string line = "Plugin::Control " + Plugin(log, ctx.r3.u32) + buf;
+    // SndPlayer start request (sub_82654A98 copies it into a command):
+    // +0 double, +8 double (stream byte offset), +16 char* file, +20 SNR header*,
+    // +24 buffer pool tag, +28 float (stored as u8), +32 float out (request id).
+    const std::string& name = line;
+    if (data && ctx.r4.u32 == 0 && name.find(":SnP0") != std::string::npos) {
+      auto load_d = [&](uint32_t a) {
+        const uint64_t v = (uint64_t(Load32(base, a)) << 32) | Load32(base, a + 4);
+        double d;
+        std::memcpy(&d, &v, 8);
+        return d;
+      };
+      const uint32_t file = Load32(base, data + 16), hdr = Load32(base, data + 20);
+      char req[160];
+      std::snprintf(req, sizeof(req), " req{t=%g off=%g pool=%08X prio=%g hdr=%08X", load_d(data),
+                    load_d(data + 8), Load32(base, data + 24), LoadF(base, data + 28), hdr);
+      line += req;
+      if (hdr) {
+        for (uint32_t i = 0; i < 16; i += 4) {
+          std::snprintf(req, sizeof(req), " %08X", Load32(base, hdr + i));
+          line += req;
+        }
+        // FNV-1a of 256 bytes from the header: identifies in-memory sounds
+        // (header + data) against tools/audio/convert_audio.py.
+        uint32_t h = 2166136261u;
+        for (uint32_t i = 0; i < 256; ++i) h = (h ^ base[hdr + i]) * 16777619u;
+        std::snprintf(req, sizeof(req), " fnv=%08X", h);
+        line += req;
+      }
+      line += " file=";
+      if (file)
+        for (uint32_t i = 0; i < 128 && base[file + i]; ++i) line += char(base[file + i]);
+      line += "}";
+    }
+    Write(log, ctx, line);
   }
   __imp__sub_8264CE18(ctx, base);
 }
