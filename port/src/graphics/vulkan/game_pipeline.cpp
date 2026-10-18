@@ -1,6 +1,7 @@
 #include "game_pipeline.h"
 #include "triangle.h"
 #include "device_requirements.h"
+#include <chrono>
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -251,7 +252,12 @@ std::shared_ptr<GamePipeline> GamePipelineStore::AcquireValidated(const guest::D
   VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};blend.attachmentCount=pass.color_count;blend.pAttachments=plan.colors.data();
   VkDynamicState dynamic[]{VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR,VK_DYNAMIC_STATE_BLEND_CONSTANTS,VK_DYNAMIC_STATE_STENCIL_REFERENCE};VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};dyn.dynamicStateCount=4;dyn.pDynamicStates=dynamic;
   VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};info.stageCount=stage_count;info.pStages=stages;info.pVertexInputState=&vertex;info.pInputAssemblyState=&assembly;info.pViewportState=&viewport;info.pRasterizationState=&plan.raster;info.pMultisampleState=&samples;info.pDepthStencilState=&plan.depth;info.pColorBlendState=&blend;info.pDynamicState=&dyn;info.layout=layout_;info.renderPass=pass.render_pass;
-  auto p=std::make_shared<GamePipeline>();p->context=&c_;p->bindings=plan.bindings;auto status=c_.f.vkCreateGraphicsPipelines(c_.device,driver_cache_,1,&info,nullptr,&p->handle);release();if(!Check(status,"Create game graphics pipeline",e)) return {};
+  auto p=std::make_shared<GamePipeline>();p->context=&c_;p->bindings=plan.bindings;
+  const auto create_started=std::chrono::steady_clock::now();
+  auto status=c_.f.vkCreateGraphicsPipelines(c_.device,driver_cache_,1,&info,nullptr,&p->handle);release();if(!Check(status,"Create game graphics pipeline",e)) return {};
+  // A slow creation is a driver compile the cache did not cover: a visible hitch.
+  if(const auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-create_started).count();ms>10)
+    c_.Log("Slow game pipeline creation: "+std::to_string(int(ms))+" ms (vs "+std::to_string(vs_digest)+", pipelines "+std::to_string(stats_.created+1)+")");
   pipelines_[plan.key]=p;cache_dirty_=true;++stats_.created;pending_.Hold(serial,p);e={};return p;
 }
 }

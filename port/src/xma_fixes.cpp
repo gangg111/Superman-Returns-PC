@@ -191,6 +191,24 @@ void XmaKickStarvedContext(PPCRegister& r26, PPCRegister& r31) {
   // The kick decoded synchronously. No change means no input left or no room
   // in the output buffer; spinning cannot fix either.
   if (ReadState(base, xma_context) == before) {
+    // SR_LOG_XMA=2: what the mixer had when it starved (once per stream). The
+    // stream entry holds the mixer's read offset in bytes (+8), the channel
+    // count (+12) and pending skip samples (+16); the buffer is 24 blocks.
+    static const bool detail = [] {
+      const char* v = std::getenv("SR_LOG_XMA");
+      return v && std::atoi(v) >= 2;
+    }();
+    static std::map<uint32_t, bool> logged;
+    if (detail && !logged[stream]) {
+      logged[stream] = true;
+      const ContextState s = ReadState(base, xma_context);
+      const uint32_t write_bytes = ((s.dword0 >> 27) & 31) * 256;
+      const uint32_t read_bytes = Load32(base, stream + 8);
+      REXAPU_INFO("XMA fix: stream {:08X} starved: mixer read {} bytes, decoder write {} bytes, "
+                  "available {} bytes, channels {}, skip {}, output valid {}",
+                  stream, read_bytes, write_bytes, (write_bytes + 6144 - read_bytes) % 6144,
+                  base[stream + 12], Load32(base, stream + 16), s.dword1 >> 31);
+    }
     give_up("no progress");
   }
 }

@@ -58,7 +58,7 @@ export function inspectSpirv(binary, stage) {
   }
   const descriptors = [], inputs = [], outputs = [];
   const allowed = new Map([['0:0', ['storage_buffer', 1]], ['0:1', ['storage_buffer', 1]], ['0:2', ['storage_buffer', 1]],
-    ['1:0', ['sampled_image_2d', 32]], ['1:1', ['sampled_image_3d', 32]], ['1:2', ['sampled_image_cube', 32]], ['2:0', ['sampler', 32]], ['3:0', ['storage_buffer', 32]]]);
+    ['1:0', ['sampled_image_2d', 32]], ['1:1', ['sampled_image_3d', 32]], ['1:2', ['sampled_image_cube', 32]], ['1:3', ['sampled_image_2d_array', 32]], ['2:0', ['sampler', 32]], ['3:0', ['storage_buffer', 32]]]);
   for (const [vid, v] of variables) {
     const deco = decorations.get(vid) || new Map(), pointer = types.get(v.type);
     if (!pointer || pointer[0] !== 32) throw new Error('Missing variable pointer type');
@@ -69,7 +69,7 @@ export function inspectSpirv(binary, stage) {
       if (!deco.get(33)?.length || !deco.get(34)?.length) throw new Error('Incomplete descriptor binding');
       let kind = 'unsupported';
       if (op === 26) kind = 'sampler';
-      else if (op === 25 && a[5] === 1) kind = { 1: 'sampled_image_2d', 2: 'sampled_image_3d', 3: 'sampled_image_cube' }[a[1]];
+      else if (op === 25 && a[5] === 1) kind = a[1] === 1 && a[3] === 1 ? 'sampled_image_2d_array' : { 1: 'sampled_image_2d', 2: 'sampled_image_3d', 3: 'sampled_image_cube' }[a[1]];
       else if (op === 30 && [2, 12].includes(v.storage)) kind = v.storage === 12 || decorations.get(tid)?.has(3) ? 'storage_buffer' : 'uniform_buffer';
       const set = deco.get(34)[0], binding = deco.get(33)[0], expected = allowed.get(`${set}:${binding}`);
       if (!expected || expected[0] !== kind || expected[1] !== count) throw new Error('Descriptor ABI mismatch');
