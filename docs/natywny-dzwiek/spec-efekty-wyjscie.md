@@ -607,6 +607,16 @@ the render driver, with at most 2 packets (2 x 5.333 ms) in flight.
 5. Clamp all 1536 samples to [-1.0, 1.0] (sub_8265A810: `x < -1 -> -1`, `x > 1 -> 1`, NaN passes
    through unchanged).
 
+**CORRECTION (measured 2026-10-20, main session):** at the kernel import the frame is
+**channel-sequential (planar)**, as the SDK assumes. Test on `--audio_dump_raw` (SDK
+`AudioSystem::SubmitFrame`, ref4.raw, 300 loudest blocks): median autocorrelation of 256-sample
+runs is 0.98 at lag 1 and 0.79 at lag 6, of the whole 1536 floats 0.988 / 0.883; interleaved data
+would peak at lag 6. So something between `sub_82650810` and the import (likely the XDK wrapper
+`sub_821164B8`, vtbl+28) puts the data back channel by channel. The finalize steps below
+(interleave, reorder, fade, clamp) are still what the samples go through; the native output must
+match the import's planar frame. To be checked: whether the reorder survives the wrapper
+(channel order at the import).
+
 No gain, no dither, no other scaling. **The frame handed to XAudioSubmitRenderDriverFrame is
 INTERLEAVED (frame-major, 6 floats per frame, XAudio channel order), not planar**, native
 big-endian float, 256 frames, 6144 bytes. VERIFIED (interleave loop and the 24-byte-stride reorder
@@ -641,3 +651,18 @@ must treat the packet as interleaved.
    are unresolved; not needed for audio output.
 6. Channel names (L C R Ls Rs LFE inside RW) are INFERRED from three consistent sources; confirm
    with a panned test sound if the native mixer relies on them.
+
+### 8. Corrections found by the differential self-test (2026-10-20)
+
+* **Del0 crossfade kernel sub_8264ED28 is NOT uniform across samples.** The loop is unrolled by 4
+  (while `i + 3 < count`, then a scalar remainder loop) and the original compiler reassociated the
+  third unrolled copy: lane 2 computes `c = (buf[ro] * r) * oldFbNeg`, lanes 0, 1, 3 and the
+  remainder compute `c = (buf[ro] * oldFbNeg) * r`. The lane is counted from the start of each
+  segment cut by sub_8264F140 (segments end where the write or either read position wraps; the
+  write position is reset to 0 at the START of a segment when `pos >= size`, so after a block it
+  can be left equal to `size`). Ignoring this gives 1 ulp errors in about a quarter of crossfade
+  samples, which the feedback then carries forward.
+* The steady kernel is uniform (its lanes differ only in operand order of a product).
+* Native implementation: `port/src/native_audio/effects.cpp`, verified bit for bit (40 random
+  cases per class, 4090 delay blocks, 2734 reverb blocks, line contents, positions, state, tail and
+  written-back parameters compared after every block).

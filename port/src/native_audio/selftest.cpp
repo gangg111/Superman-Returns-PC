@@ -19,13 +19,42 @@
 #include <string>
 #include <vector>
 
+#include <rex/hook.h>
 #include <rex/ppc.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
 #include "generated/default/superman_returns_init.h"
+#include "native_audio/effects.h"
 #include "native_audio/plugins.h"
 #include "native_audio/resampler.h"
+
+namespace native_audio {
+namespace {
+// While the self-test runs there is no System (and no allocator object at
+// System+28): the RW allocator hooks below serve the test from the guest heap.
+bool g_selftest_alloc = false;
+}  // namespace
+}  // namespace native_audio
+
+// rw::audio::core allocator: (sys, size, name, align, allocator or 0) -> ptr
+REX_HOOK_RAW(sub_8264CBB8) {
+  if (!native_audio::g_selftest_alloc) {
+    __imp__sub_8264CBB8(ctx, base);
+    return;
+  }
+  const uint32_t align = ctx.r6.u32 < 16 ? 16 : ctx.r6.u32;
+  ctx.r3.u64 = REX_KERNEL_MEMORY()->SystemHeapAlloc(ctx.r4.u32 ? ctx.r4.u32 : 16, align);
+}
+
+// rw::audio::core free: (sys, ptr, 0)
+REX_HOOK_RAW(sub_8264C8F0) {
+  if (!native_audio::g_selftest_alloc) {
+    __imp__sub_8264C8F0(ctx, base);
+    return;
+  }
+  if (ctx.r4.u32) REX_KERNEL_MEMORY()->SystemHeapFree(ctx.r4.u32);
+}
 
 namespace native_audio {
 
@@ -622,6 +651,133 @@ void RouteCase(Guest& g, Report& rep, int bus_ch, uint32_t seed) {
   }
 }
 
+bool CheckWord(Guest& g, uint32_t addr, uint32_t native, Report& rep, const char* what,
+               const char* field) {
+  if (g.R32(addr) == native) return true;
+  char buf[160];
+  std::snprintf(buf, sizeof(buf), "%s %s: guest %08X native %08X", what, field, g.R32(addr),
+                native);
+  rep.Fail(buf);
+  return false;
+}
+
+void ReverbCase(Guest& g, Report& rep, int ch, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> pick(0, 19);
+  GuestPlugin gp(g, 0x82936968, 1, ch, sub_8264DF18, sub_8264E668);
+  g.base[gp.voice + 8] = uint8_t(ch);
+  Reverb nat(ch);
+  Io& io = g_nio.io;
+  io.cur = 0;
+  std::uniform_real_distribution<float> t(0.0f, 6.0f), room(0.5f, 95.0f), damp(0.3f, 3.0f);
+  char what[96];
+  for (int block = 0; block < 80; ++block) {
+    const int k = pick(rng);
+    if (k == 0 || block == 2) {
+      const float v = pick(rng) < 3 ? 0.0f : t(rng);
+      g.WF(gp.obj + 32, v);
+      nat.p0 = v;
+    } else if (k == 1) {
+      const float v = room(rng);
+      g.WF(gp.obj + 40, v);
+      nat.p1 = v;
+    } else if (k == 2) {
+      const float v = damp(rng);
+      g.WF(gp.obj + 48, v);
+      nat.p2 = v;
+    }
+    FillInput(gp, io, ch, rng, pick(rng) == 0 ? 2 : 0);
+    const int gr = gp.Call(sub_8264E398);
+    const int nr = nat.Process(io, 48000.0f);
+    std::snprintf(what, sizeof(what), "RM10 %dch block %d", ch, block);
+    if (gr != nr) {
+      rep.Fail(std::string(what) + ": return differs");
+      return;
+    }
+    if (gr) {
+      if (!CompareOutput(gp, io, ch, rep, what)) return;
+      ++rep.processed;
+    } else {
+      ++rep.passthrough;
+    }
+    if (!CheckWord(g, gp.obj + 32, std::bit_cast<uint32_t>(nat.p0), rep, what, "P0") ||
+        !CheckWord(g, gp.obj + 40, std::bit_cast<uint32_t>(nat.p1), rep, what, "P1") ||
+        !CheckWord(g, gp.obj + 48, std::bit_cast<uint32_t>(nat.p2), rep, what, "P2") ||
+        (gr && !CheckWord(g, gp.obj + 24, std::bit_cast<uint32_t>(nat.tail), rep, what, "tail")))
+      return;
+    io.cur = gp.Cur();
+  }
+}
+
+void DelayCase(Guest& g, Report& rep, int ch, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> pick(0, 19);
+  GuestPlugin gp(g, 0x829369E0, ch, ch, sub_8264E980, sub_8264F848);
+  g.base[gp.voice + 8] = uint8_t(ch);
+  Delay nat(ch);
+  Io& io = g_nio.io;
+  io.cur = 0;
+  std::uniform_real_distribution<float> tm(0.0f, 0.4f), fb(-1.3f, 1.3f);
+  char what[96];
+  int prev_state = 0;
+  for (int block = 0; block < 120; ++block) {
+    const int k = pick(rng);
+    if (k < 2 || block == 1) {
+      const float v = pick(rng) < 3 ? 0.0f : pick(rng) < 3 ? tm(rng) * 0.01f : tm(rng);
+      g.WF(gp.obj + 32, v);
+      nat.p0 = v;
+    } else if (k == 2) {
+      const float v = fb(rng);
+      g.WF(gp.obj + 40, v);
+      nat.p1 = v;
+    }
+    FillInput(gp, io, ch, rng, 0);
+    const int gr = gp.Call(sub_8264F458);
+    const uint8_t before = io.cur;
+    const int nr = nat.Process(io, 48000.0f);
+    std::snprintf(what, sizeof(what), "Del0 %dch block %d state %d", ch, block, nat.state);
+    if (gr != nr) {
+      rep.Fail(std::string(what) + ": return differs");
+      return;
+    }
+    if (!CompareOutput(gp, io, ch, rep, what)) return;
+    if (io.cur != before) ++rep.processed; else ++rep.passthrough;
+    // The delay line itself (planar, +100 buffer, +104 frames per channel, +112 write pos).
+    if (!nat.ramp.empty() && g.R32(gp.obj + 108)) {
+      for (int q = 0; q < kBlock; ++q) {
+        char f[32];
+        std::snprintf(f, sizeof(f), "ramp[%d] cnt %d", q, nat.cnt);
+        if (!CheckWord(g, g.R32(gp.obj + 108) + uint32_t(q) * 4,
+                       std::bit_cast<uint32_t>(nat.ramp[q]), rep, what, f))
+          return;
+      }
+    }
+    if (!CheckWord(g, gp.obj + 68, uint32_t(nat.cur_n), rep, what, "cur_n") ||
+        !CheckWord(g, gp.obj + 72, std::bit_cast<uint32_t>(nat.cur_fb), rep, what, "cur_fb") ||
+        !CheckWord(g, gp.obj + 64, std::bit_cast<uint32_t>(nat.cur_t), rep, what, "cur_t") ||
+        !CheckWord(g, gp.obj + 60, uint32_t(nat.cnt), rep, what, "cnt") ||
+        !CheckWord(g, gp.obj + 104, uint32_t(nat.size), rep, what, "size") ||
+        !CheckWord(g, gp.obj + 112, uint32_t(nat.pos), rep, what, "pos"))
+      return;
+    if (!nat.buf.empty()) {
+      const uint32_t gb = g.R32(gp.obj + 100);
+      for (size_t i = 0; i < nat.buf.size(); ++i)
+        if (g.R32(gb + uint32_t(i) * 4) != std::bit_cast<uint32_t>(nat.buf[i])) {
+          char f[64];
+          std::snprintf(f, sizeof(f), "line[%zu of %d] (prev state %d)", i, nat.size, prev_state);
+          CheckWord(g, gb + uint32_t(i) * 4, std::bit_cast<uint32_t>(nat.buf[i]), rep, what, f);
+          return;
+        }
+    }
+    prev_state = nat.state;
+    if (!CheckWord(g, gp.obj + 48, uint32_t(nat.state), rep, what, "state") ||
+        !CheckWord(g, gp.obj + 40, std::bit_cast<uint32_t>(nat.p1), rep, what, "P1") ||
+        !CheckWord(g, gp.obj + 24, std::bit_cast<uint32_t>(nat.tail24), rep, what, "tail"))
+      return;
+    io.cur = gp.Cur();
+  }
+}
+
 }  // namespace
 
 // Returns true when the self-test ran (the caller then exits).
@@ -672,6 +828,10 @@ bool RunAudioSelfTest(uint8_t* base) {
   run("PnS0", [&](Report& r, int ch, uint32_t s) { PanCase(g, r, ch == 6 ? 1 : ch, s); });
   run("Sen0+Sub0", [&](Report& r, int ch, uint32_t s) { BusCase(g, r, ch, s); });
   run("Rou0+Sub0", [&](Report& r, int ch, uint32_t s) { RouteCase(g, r, ch, s); });
+  g_selftest_alloc = true;
+  run("RM10", [&](Report& r, int ch, uint32_t s) { ReverbCase(g, r, ch, s); });
+  run("Del0", [&](Report& r, int ch, uint32_t s) { DelayCase(g, r, ch, s); });
+  g_selftest_alloc = false;
   std::fclose(rep.f);
   return true;
 }

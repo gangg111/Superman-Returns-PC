@@ -543,3 +543,16 @@ stream into a bus (INFERRED: front pair and rear pair to different buses or chan
    (4.4); confirm term order if bit exactness matters for 1/2/4-channel sends.
 9. **Sub0 scheduling** (`voice+56` pass id, `+144/+146/+48`) is described at control-flow level;
    a native mixer can replace it with "process all sender voices of a bus before the bus voice".
+
+## 8. Corrections found by the differential self-test (2026-10-20)
+
+* The reference for bit exactness is the recompiled code, not Xenon. The recompiler lowers
+  `vmaddfp` to a multiply and a separate add (two roundings) with MXCSR flush-to-zero and
+  denormals-are-zero, `vrsqrtefp` to an exact `1/sqrt`, and `fmadds`/`fnmsubs` to
+  `float(std::fma(double, double, double))` (fma in double, then rounded to float). The native
+  kernels in `port/src/native_audio/dsp.cpp` reproduce exactly that.
+* Send ramp mappings (sub_82668400..sub_82668B68) mirror the set table; n -> n ramps call the ramp
+  kernel once per channel (sub_82668C70).
+* PnS0 angle scale confirmed: class descriptor +68 in `.data` (0x82936F74) = 0x40C90FDB (2*pi);
+  0x8292ED74 is its runtime copy.
+* All seven plug-ins verified bit for bit against the originals (`SR_AUDIO_SELFTEST`).
