@@ -14,7 +14,12 @@ Check(settings.BuildArgumentList().Contains("--sr_native_render_scale=1.5"), "Po
 settings.InputMode = "Controller";
 Check(settings.BuildArgumentList().Contains("--mnk_mode=false") && settings.BuildArgumentList().Contains("--mnk_mouse=false"), "controller overrides keyboard settings");
 var invalid = new LauncherSettings { Resolution = "0x0", RenderScale = "50", FpsLimit = "garbage", Msaa = "2" };
-Check(invalid.BuildArgumentList().Contains("--window_width=1280") && invalid.BuildArgumentList().Contains("--sr_native_render_scale=1") && invalid.BuildArgumentList().Contains("--sr_native_fps_limit=30") && invalid.BuildArgumentList().Contains("--sr_native_msaa_samples=1"), "invalid preferences fall back to supported defaults");
+Check(invalid.BuildArgumentList().Contains("--window_width=1280") && invalid.BuildArgumentList().Contains("--sr_native_render_scale=1") && invalid.BuildArgumentList().Contains("--sr_native_fps_limit=60") && invalid.BuildArgumentList().Contains("--sr_native_msaa_samples=8"), "invalid preferences fall back to supported defaults");
+// Defaults are the maximum of the D3D12 renderer (user decision 2026-10-19: a strong PC, not the console limits).
+var maxDefaults = new LauncherSettings().BuildArgumentList();
+Check(maxDefaults.Contains("--sr_native_api=d3d12") && maxDefaults.Contains("--sr_native_shadow_quality=4") && maxDefaults.Contains("--sr_native_msaa_samples=8") &&
+    maxDefaults.Contains("--sr_native_fxaa=true") && maxDefaults.Contains("--sr_native_fps_limit=60") && maxDefaults.Contains("--sr_native_anisotropic_filtering=16") &&
+    maxDefaults.Contains("--sr_native_render_scale=0"), "defaults are the maximum quality");
 var automatic = new LauncherSettings { GraphicsApi = "d3d12" }.BuildArgumentList();
 Check(!automatic.Any(a => a.EndsWith('=')) && !automatic.Any(a => a.StartsWith("--sr_native_gpu_luid")), "automatic GPU sends no empty argument (the engine would read the next argument as its value)");
 var fixture = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "fixture com espaço ç", Guid.NewGuid().ToString("N")));

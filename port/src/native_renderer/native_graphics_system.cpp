@@ -56,7 +56,7 @@
 #include "presenter_factory.h"
 #endif
 
-REXCVAR_DEFINE_INT32(sr_native_fps_limit, 30, "Superman Returns Native",
+REXCVAR_DEFINE_INT32(sr_native_fps_limit, 60, "Superman Returns Native",
                      "Native graphics system frame rate limit (30 = original, up to 120; 0 = "
                      "sr_native_unlocked_vblank_hz)")
     .range(0, 1000);

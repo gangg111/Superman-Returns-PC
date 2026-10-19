@@ -16,6 +16,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -264,6 +265,23 @@ void OnFrameStatsSwap(uint8_t* base, uint32_t dev, uint32_t front_buffer) {
 std::unique_ptr<rex::system::IGraphicsSystem> CreateNativeGraphicsSystem(
     GraphicsSystemFactory create_xenos, GraphicsSystemFactory create_xenos_ab) {
   graphics::NativeApi api;std::string api_error;
+  // The compiled-in defaults are the maximum quality of the D3D12 renderer;
+  // Vulkan does not support those options yet, so the ones nobody set (still
+  // at their default) take the values Vulkan accepts. Explicit values are
+  // left to ValidateNativeApi.
+  if(graphics::ParseNativeApi(rex::cvar::Query<std::string>("sr_native_api"),api,api_error) &&
+     api==graphics::NativeApi::kVulkan) {
+    static constexpr std::pair<const char*,const char*> kVulkanDefaults[]={
+        {"sr_native_fxaa","false"},{"sr_native_ambient_occlusion","false"},
+        {"sr_native_msaa_samples","1"},{"sr_native_shadow_quality","1"},
+        {"sr_native_bloom_quality","1"},{"sr_native_foliage_antialiasing","false"}};
+    for(const auto& [name,value]:kVulkanDefaults) {
+      if(rex::cvar::GetFlagSource(name)==rex::cvar::Source::kDefault && rex::cvar::GetFlagByName(name)!=value &&
+         rex::cvar::SetFlagByName(name,value)) {
+        REXLOG_INFO("sr_native_api=vulkan: {}={} (D3D12-only default)",name,value);
+      }
+    }
+  }
   graphics::NativeVulkanOptions options;
   options.fxaa=rex::cvar::Query<bool>("sr_native_fxaa");
   options.ssao=rex::cvar::Query<bool>("sr_native_ambient_occlusion");

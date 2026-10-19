@@ -225,10 +225,10 @@ REXCVAR_DEFINE_DOUBLE(sr_native_render_scale, 0.0, "Superman Returns Native",
                       "1.5 = 1080p, 2 = 1440p, 3 = 2160p, 4 = 2880p); 0 = automatic, the "
                       "primary display's physical height / 720")
     .range(0.0, 4.0);
-REXCVAR_DEFINE_INT32(sr_native_shadow_quality, 1, "Superman Returns Native",
+REXCVAR_DEFINE_INT32(sr_native_shadow_quality, 4, "Superman Returns Native",
                      "Shadow map resolution multiplier (1 = original 1024, 2 = 2048, 4 = 4096)")
     .range(1, 4);
-REXCVAR_DEFINE_INT32(sr_native_msaa_samples, 1, "Superman Returns Native",
+REXCVAR_DEFINE_INT32(sr_native_msaa_samples, 8, "Superman Returns Native",
                      "MSAA samples for the surfaces the game multisamples (0 = game's 4x, "
                      "1 = off, 2, 4, 8; launcher: Off / 4x / 8x). Only the 640x640 shadow map is "
                      "multisampled in the scene; at 4x it cost ~7 ms of a ~35 ms GPU frame, off it "
@@ -237,30 +237,30 @@ REXCVAR_DEFINE_INT32(sr_native_msaa_samples, 1, "Superman Returns Native",
 REXCVAR_DEFINE_BOOL(sr_native_full_scene_resolution, true, "Superman Returns Native",
                     "Scale scene surfaces by output width / game_profile kSceneWidth (Conan rendered "
                     "1024x576 stretched to 1280x720; SR renders 1280x720, so no effect)");
-REXCVAR_DEFINE_BOOL(sr_native_foliage_antialiasing, false, "Superman Returns Native",
+REXCVAR_DEFINE_BOOL(sr_native_foliage_antialiasing, true, "Superman Returns Native",
                     "Alpha-tested foliage/grilles use alpha-to-coverage with the game's MSAA "
                     "(antialiased, mip-corrected leaf edges) instead of a hard alpha test");
-REXCVAR_DEFINE_BOOL(sr_native_ambient_occlusion, false, "Superman Returns Native",
+REXCVAR_DEFINE_BOOL(sr_native_ambient_occlusion, true, "Superman Returns Native",
                     "Screen-space ambient occlusion on the 3D scene");
 REXCVAR_DEFINE_BOOL(sr_native_ssao_debug, false, "Superman Returns Native", "Debug: replace the scene with the SSAO term");
 REXCVAR_DEFINE_DOUBLE(sr_native_ssao_radius, 0.5, "Superman Returns Native", "SSAO sampling radius in world units");
 REXCVAR_DEFINE_DOUBLE(sr_native_ssao_intensity, 0.8, "Superman Returns Native", "SSAO strength (0-1)");
 REXCVAR_DEFINE_DOUBLE(sr_native_ssao_fade_distance, 40.0, "Superman Returns Native",
                       "SSAO fades out towards this distance from the camera (world units)");
-REXCVAR_DEFINE_BOOL(sr_native_soft_particles, false, "Superman Returns Native",
+REXCVAR_DEFINE_BOOL(sr_native_soft_particles, true, "Superman Returns Native",
                     "Soft particles: blended effects fade near the geometry behind them");
 REXCVAR_DEFINE_DOUBLE(sr_native_soft_particle_distance, 0.4, "Superman Returns Native",
                       "Soft particle fade distance in world units");
-REXCVAR_DEFINE_INT32(sr_native_shadow_smoothing, 0, "Superman Returns Native",
+REXCVAR_DEFINE_INT32(sr_native_shadow_smoothing, 1, "Superman Returns Native",
                      "Shadow edge smoothing: 0 = off (original), 1 = on (per-pixel rotated PCF), "
                      "2 = softer (wider kernel)")
     .range(0, 2);
 REXCVAR_DEFINE_BOOL(sr_native_smooth_effects, true, "Superman Returns Native",
                     "Above the original resolution, magnify small textures of blended effects "
                     "(particles, glows) with a smooth cubic filter instead of bilinear");
-REXCVAR_DEFINE_BOOL(sr_native_fxaa, false, "Superman Returns Native",
+REXCVAR_DEFINE_BOOL(sr_native_fxaa, true, "Superman Returns Native",
                     "FXAA post-process antialiasing on the 3D image (the HUD stays sharp)");
-REXCVAR_DEFINE_INT32(sr_native_bloom_quality, 1, "Superman Returns Native",
+REXCVAR_DEFINE_INT32(sr_native_bloom_quality, 4, "Superman Returns Native",
                      "Resolution multiplier of small post-process targets (bloom): 1 = original, 2, 4")
     .range(1, 4);
 REXCVAR_DEFINE_INT32(sr_native_anisotropic_filtering, 16, "Superman Returns Native",
@@ -1147,10 +1147,6 @@ bool Renderer::EnsureInitialized() {
   require_pass(fxaa_, kPassRenderHud, "sr_native_fxaa");
   require_pass(ssao_, kPassRenderOpaque, "sr_native_ambient_occlusion");
   require_pass(soft_particles_, kPassRenderSorted, "sr_native_soft_particles");
-  if (shadow_scale_ != 1.0f && kPassRenderShadowMaps < 0) {
-    shadow_scale_ = 1.0f;
-    REXLOG_WARN("native: sr_native_shadow_quality needs the shadow pass role; disabled");
-  }
   output_width_ = HostPx(kOutputWidth, render_scale_);
   output_height_ = HostPx(kOutputHeight, render_scale_);
   REXLOG_INFO("native: render scale {} ({}x{}), shadow scale {}, msaa {}, anisotropy {}",
@@ -2035,7 +2031,7 @@ Renderer::HostSurface* Renderer::GetSurface(uint8_t* base, uint32_t surface_obje
     // shadow_mul != 1): otherwise it took the render scale and, as an upscaled
     // color target, was read with a linear filter that averages the packed
     // depths and breaks the shadow test (seen at render scale 2).
-    s.scale = shadow_mul_;
+    s.scale = shadow_scale_ * shadow_mul_;
     s.shadow = true;
   } else {
     s.scale = render_scale_;

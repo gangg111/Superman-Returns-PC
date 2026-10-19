@@ -15,12 +15,12 @@ public sealed class LauncherSettings
     public int GpuIndex { get; set; } = -1;
     public string GpuLuid { get; set; } = "";
     public bool VSync { get; set; } = true;
-    public string FpsLimit { get; set; } = "30";
+    public string FpsLimit { get; set; } = "60";
     public string RenderScale { get; set; } = "auto";
     public string TextureFilter { get; set; } = "Anisotropic16x";
-    public string Antialiasing { get; set; } = "Off";
-    public string ShadowQuality { get; set; } = "1";
-    public string Msaa { get; set; } = "1";
+    public string Antialiasing { get; set; } = "FXAA";
+    public string ShadowQuality { get; set; } = "4";
+    public string Msaa { get; set; } = "8";
     public string InputMode { get; set; } = "KeyboardMouse";
     public string Renderer { get; set; } = "native";
     public string GraphicsApi { get; set; } = "d3d12";
@@ -120,12 +120,12 @@ public sealed class LauncherSettings
             $"--fullscreen={(DisplayMode != "Windowed").ToString().ToLowerInvariant()}",
             $"--vsync={VSync.ToString().ToLowerInvariant()}",
             "--d3d12_adapter=-1",
-            $"--sr_native_fps_limit={ValidChoice(FpsLimit, 30, 0, 30, 60, 120)}",
+            $"--sr_native_fps_limit={ValidChoice(FpsLimit, 60, 0, 30, 60, 120)}",
             $"--sr_native_render_scale={scale.ToString("0.##", CultureInfo.InvariantCulture)}",
             $"--sr_native_anisotropic_filtering={filter}",
             $"--sr_native_fxaa={(!vulkan && Antialiasing == "FXAA").ToString().ToLowerInvariant()}",
-            $"--sr_native_shadow_quality={(vulkan ? 1 : ValidChoice(ShadowQuality, 1, 1, 2, 4))}",
-            $"--sr_native_msaa_samples={(vulkan ? 1 : ValidChoice(Msaa, 1, 1, 4, 8))}"
+            $"--sr_native_shadow_quality={(vulkan ? 1 : ValidChoice(ShadowQuality, 4, 1, 2, 4))}",
+            $"--sr_native_msaa_samples={(vulkan ? 1 : ValidChoice(Msaa, 8, 1, 4, 8))}"
         };
         // An empty "--flag=" makes the engine's argument parser take the next argument
         // as its value, so the LUID is passed only when a GPU was chosen.
