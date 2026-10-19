@@ -12,6 +12,7 @@
 #include <rex/cvar.h>
 
 #include "frame_stats.h"
+#include "input/native_input.h"
 
 namespace native_audio {
 bool RunAudioSelfTest(uint8_t* base);  // native_audio/selftest.cpp
@@ -39,6 +40,8 @@ class SupermanReturnsApp : public rex::ReXApp {
   // sr_renderer=native (docs/native-port-plan.md) uses the native renderer
   // when the build and the game profile allow it, else xenos.
   void OnPreSetup(rex::RuntimeConfig& config) override {
+    // Native Windows input: GameInput controllers, Raw Input keyboard and mouse.
+    config.input_factory = REX_INPUT_BACKEND(superman_returns::input::CreateInputSystem);
     // Before anything reads the options a preset manages (sr_post_effects
     // below, sr_render_scale in render_scale.cpp).
     ApplySrPreset();

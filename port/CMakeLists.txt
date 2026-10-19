@@ -57,6 +57,9 @@ set(SUPERMANRETURNS_SOURCES
     src/frame_stats.cpp
     src/mem_stats.cpp
     src/xma_fixes.cpp
+    src/input/native_input.cpp
+    src/input/gameinput_driver.cpp
+    src/input/rawinput_kbm_driver.cpp
     src/sr_settings.cpp
     src/graphics/backend_selection.cpp
     src/sr_preset.cpp
@@ -73,6 +76,10 @@ else()
 endif()
 
 rexglue_setup_target(superman_returns GPU_PLUGINS xenos)
+if(WIN32)
+    # Native input: GameInput (Windows SDK gameinput.lib) for controllers.
+    target_link_libraries(superman_returns PRIVATE gameinput)
+endif()
 
 # Application icon (resources/superman_returns.ico, local and optional). It is the
 # first RT_GROUP_ICON of the executable, so Explorer shows it for the file and
