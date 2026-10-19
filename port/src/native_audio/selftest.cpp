@@ -778,6 +778,69 @@ void DelayCase(Guest& g, Report& rep, int ch, uint32_t seed) {
   }
 }
 
+void VuCase(Guest& g, Report& rep, int ch, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> pick(0, 9);
+  GuestPlugin gp(g, 0x82936C58, ch, ch, sub_8264F950, sub_8264FD88);
+  VuMeter nat(ch, 48000.0f);
+  Io& io = g_nio.io;
+  io.cur = 0;
+  char what[64];
+  for (int block = 0; block < 40; ++block) {
+    FillInput(gp, io, ch, rng, pick(rng) == 0 ? 2 : 0);
+    gp.Call(sub_8264FD20);
+    nat.Process(io);
+    std::snprintf(what, sizeof(what), "VuM0 %dch block %d", ch, block);
+    for (int k = 0; k < 18; ++k) {
+      char f[16];
+      std::snprintf(f, sizeof(f), "slot %d", k);
+      if (!CheckWord(g, gp.obj + 40 + 8 * k, std::bit_cast<uint32_t>(nat.params[k]), rep, what, f))
+        return;
+    }
+    ++rep.processed;
+  }
+}
+
+void DacCase(Guest& g, Report& rep, int ch, uint32_t seed) {
+  std::mt19937 rng(seed);
+  GuestPlugin gp(g, 0x82936C58, 6, 6, sub_8264F950, sub_8264FD88);  // only its io is used
+  const uint32_t dac = g.Alloc(256);
+  std::memset(g.base + dac, 0, 256);
+  g.W32(dac + 56, gp.io);
+  g.base[dac + 143] = 6;
+  std::uniform_real_distribution<float> u(-1.5f, 1.5f);
+  float out[6 * kBlock];
+  char what[64];
+  for (int block = 0; block < 10; ++block) {
+    const bool fade = (block % 3) == 0;
+    g.base[dac + 144] = fade ? 1 : 0;
+    bool nfade = fade;
+    float in[6 * kBlock];
+    g.base[gp.io + 28] = 0;
+    for (int i = 0; i < 6 * kBlock; ++i) {
+      in[i] = u(rng);
+      if (i == 77) in[i] = std::bit_cast<float>(0x7FC00000u);  // NaN passes the clamp
+      g.WF(gp.buf[0] + uint32_t(i) * 4, in[i]);
+    }
+    PPCContext c = g.Ctx();
+    c.r3.u64 = dac;
+    sub_82650810(c, g.base);
+    DacFinalize(in, out, 6, &nfade);
+    std::snprintf(what, sizeof(what), "Dac0 block %d fade %d", block, fade);
+    const uint32_t res = gp.buf[g.base[gp.io + 28]];
+    for (int i = 0; i < 6 * kBlock; ++i)
+      if (g.R32(res + uint32_t(i) * 4) != std::bit_cast<uint32_t>(out[i])) {
+        char f[24];
+        std::snprintf(f, sizeof(f), "out[%d]", i);
+        CheckWord(g, res + uint32_t(i) * 4, std::bit_cast<uint32_t>(out[i]), rep, what, f);
+        return;
+      }
+    if (g.base[dac + 144] != (nfade ? 1 : 0)) rep.Fail(std::string(what) + ": fade flag");
+    ++rep.processed;
+  }
+  (void)ch;
+}
+
 }  // namespace
 
 // Returns true when the self-test ran (the caller then exits).
@@ -831,6 +894,8 @@ bool RunAudioSelfTest(uint8_t* base) {
   g_selftest_alloc = true;
   run("RM10", [&](Report& r, int ch, uint32_t s) { ReverbCase(g, r, ch, s); });
   run("Del0", [&](Report& r, int ch, uint32_t s) { DelayCase(g, r, ch, s); });
+  run("VuM0", [&](Report& r, int ch, uint32_t s) { VuCase(g, r, ch, s); });
+  run("Dac0 finalize", [&](Report& r, int ch, uint32_t s) { DacCase(g, r, ch, s); });
   g_selftest_alloc = false;
   std::fclose(rep.f);
   return true;

@@ -81,4 +81,27 @@ class Delay {
   void UpdateTail();
 };
 
+// VuMeter "VuM0" (spec 3): no audible effect; publishes RMS, window peak and
+// peak hold into its 18 param slots, which the game may read back.
+class VuMeter {
+ public:
+  VuMeter(int channels, float mixer_rate) : channels(channels), window(mixer_rate * 0.01f) {}
+  int Process(const Io& io);
+  void Reset();  // Control (any index)
+
+  int channels;
+  float window;          // +32
+  float count = 0.0f;    // +36
+  float params[18] = {}; // slots at +40, 8 bytes apart
+  float sum_sq[6] = {}, rms[6] = {}, win_peak[6] = {}, last_peak[6] = {}, hold[6] = {};
+
+ private:
+  void Publish();
+};
+
+// Dac "Dac0" output stage (spec 5.4, sub_82650810): interleave, reorder to the
+// XAudio channel order, fade in 128 frames after Start, clamp to [-1, 1].
+// `out` receives 256 interleaved frames of `channels` floats.
+void DacFinalize(const float* planar, float* out, int channels, bool* fade_in);
+
 }  // namespace native_audio

@@ -485,4 +485,85 @@ int Delay::Process(Io& io, float rate) {
   return 1;
 }
 
+// ================================================================ VuMeter
+
+void VuMeter::Publish() {
+  // RW slot per channel: mono -> 1; stereo -> 0, 2; quad -> 0, 2, 3, 4; other -> 0..5.
+  static const int kMono[1] = {1}, kStereo[2] = {0, 2}, kQuad[4] = {0, 2, 3, 4},
+                   kAll[6] = {0, 1, 2, 3, 4, 5};
+  const int* map = channels == 1 ? kMono : channels == 2 ? kStereo : channels == 4 ? kQuad : kAll;
+  for (int c = 0; c < channels && c < 6; ++c) {
+    params[map[c]] = rms[c];
+    params[6 + map[c]] = last_peak[c];
+    params[12 + map[c]] = hold[c];
+  }
+}
+
+void VuMeter::Reset() {
+  for (float& p : params) p = 0.0f;
+  for (int c = 0; c < 6; ++c) rms[c] = last_peak[c] = hold[c] = 0.0f;
+}
+
+int VuMeter::Process(const Io& io) {
+  ScalarScope fpu;
+  const float* x = io.Cur();
+  for (int f = 0; f < kBlock; ++f) {
+    for (int c = 0; c < channels; ++c) {
+      const float s = x[c * kBlock + f];
+      float v = s;
+      if (v <= 0.0f) v = v * -1.0f;
+      if (win_peak[c] < v) win_peak[c] = v;
+      if (hold[c] < v) {
+        hold[c] = v;
+        Publish();
+      }
+      sum_sq[c] = Fmadds(s, s, sum_sq[c]);
+    }
+    count = count + 1.0f;
+    if (count >= window) {
+      for (int c = 0; c < channels; ++c) {
+        last_peak[c] = win_peak[c];
+        sum_sq[c] = sum_sq[c] / count;
+        rms[c] = std::sqrt(sum_sq[c]);
+      }
+      Publish();
+      count = 0.0f;
+      for (int c = 0; c < 6; ++c) sum_sq[c] = win_peak[c] = 0.0f;
+    }
+  }
+  return 1;
+}
+
+// ================================================================ Dac
+
+void DacFinalize(const float* planar, float* out, int channels, bool* fade_in) {
+  ScalarScope fpu;
+  for (int c = 0; c < channels; ++c)
+    for (int f = 0; f < kBlock; ++f) out[f * channels + c] = planar[c * kBlock + f];
+  if (channels == 6)
+    for (int f = 0; f < kBlock; ++f) {
+      float* o = out + f * 6;
+      const float o1 = o[1], o2 = o[2], o3 = o[3], o4 = o[4], o5 = o[5];
+      o[1] = o2;
+      o[2] = o1;
+      o[3] = o5;
+      o[4] = o3;
+      o[5] = o4;
+    }
+  if (*fade_in) {
+    const float step = 1.0f / float(128);
+    float k = 0.0f;
+    for (int f = 0; f < 128; ++f) {
+      const float gain = k * step;
+      for (int c = 0; c < channels; ++c) out[f * channels + c] = out[f * channels + c] * gain;
+      k = k + 1.0f;
+    }
+    *fade_in = false;
+  }
+  for (int i = 0; i < kBlock * channels; ++i) {
+    if (out[i] < -1.0f) out[i] = -1.0f;
+    else if (out[i] > 1.0f) out[i] = 1.0f;
+  }
+}
+
 }  // namespace native_audio
