@@ -26,6 +26,7 @@
 
 #include "generated/default/superman_returns_init.h"
 #include "native_audio/effects.h"
+#include "native_audio/engine.h"
 #include "native_audio/plugins.h"
 #include "native_audio/resampler.h"
 
@@ -34,6 +35,34 @@ namespace {
 // While the self-test runs there is no System (and no allocator object at
 // System+28): the RW allocator hooks below serve the test from the guest heap.
 bool g_selftest_alloc = false;
+
+// Bump allocator over one region of the guest's virtual heap: the self-test
+// allocates hundreds of megabytes over its cases, far more than the small
+// system heap holds, and never needs to free.
+struct Arena {
+  uint32_t next = 0, end = 0;
+  uint32_t Alloc(uint32_t size, uint32_t align) {
+    if (!next) {
+      constexpr uint32_t kSize = 512u << 20;
+      uint32_t base = 0;
+      auto* heap = REX_KERNEL_MEMORY()->LookupHeap(0x40000000);
+      if (!heap || !heap->Alloc(kSize, 64 * 1024,
+                                rex::memory::kMemoryAllocationReserve |
+                                    rex::memory::kMemoryAllocationCommit,
+                                rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite,
+                                false, &base))
+        return 0;
+      next = base;
+      end = base + kSize;
+    }
+    if (align < 16) align = 16;
+    const uint32_t p = (next + align - 1) & ~(align - 1);
+    if (p + size > end) return 0;
+    next = p + size;
+    return p;
+  }
+};
+Arena g_arena;
 }  // namespace
 }  // namespace native_audio
 
@@ -44,7 +73,7 @@ REX_HOOK_RAW(sub_8264CBB8) {
     return;
   }
   const uint32_t align = ctx.r6.u32 < 16 ? 16 : ctx.r6.u32;
-  ctx.r3.u64 = REX_KERNEL_MEMORY()->SystemHeapAlloc(ctx.r4.u32 ? ctx.r4.u32 : 16, align);
+  ctx.r3.u64 = native_audio::g_arena.Alloc(ctx.r4.u32 ? ctx.r4.u32 : 16, align);
 }
 
 // rw::audio::core free: (sys, ptr, 0)
@@ -53,7 +82,7 @@ REX_HOOK_RAW(sub_8264C8F0) {
     __imp__sub_8264C8F0(ctx, base);
     return;
   }
-  if (ctx.r4.u32) REX_KERNEL_MEMORY()->SystemHeapFree(ctx.r4.u32);
+  // The arena never frees.
 }
 
 namespace native_audio {
@@ -64,7 +93,7 @@ struct Guest {
   uint8_t* base;
   uint32_t stack_top;
 
-  uint32_t Alloc(uint32_t size) { return REX_KERNEL_MEMORY()->SystemHeapAlloc(size, 128); }
+  uint32_t Alloc(uint32_t size) { return g_arena.Alloc(size, 128); }
   void W32(uint32_t a, uint32_t v) { *reinterpret_cast<uint32_t*>(base + a) = __builtin_bswap32(v); }
   uint32_t R32(uint32_t a) const { return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + a)); }
   void WF(uint32_t a, float f) { W32(a, std::bit_cast<uint32_t>(f)); }
@@ -841,6 +870,291 @@ void DacCase(Guest& g, Report& rep, int ch, uint32_t seed) {
   (void)ch;
 }
 
+// ------------------------------------------------------------ whole graph
+
+// A guest System good enough for Voice::Create, Control/SetParamF (they queue
+// into +32/+40) and the drain sub_8264C540: lock/unlock callbacks (+76/+80)
+// point at the empty guest stub sub_8231C140, the update-callback gate +64 is 0.
+struct GuestSystem {
+  Guest& g;
+  uint32_t sys;
+  explicit GuestSystem(Guest& gg) : g(gg) {
+    sys = g.Alloc(512);
+    std::memset(g.base + sys, 0, 512);
+    g.WF(sys + 12, 48000.0f);
+    g.WF(sys + 8, 256.0f / 48000.0f);
+    g.W32(sys + 20, 1);
+    const uint32_t q = g.Alloc(256 * 1024);
+    g.W32(sys + 32, q);
+    g.W32(sys + 36, 256 * 1024);
+    g.W32(sys + 76, 0x8231C140);
+    g.W32(sys + 80, 0x8231C140);
+  }
+  void Drain() {
+    PPCContext c = g.Ctx();
+    c.r3.u64 = sys;
+    sub_8264C540(c, g.base);
+  }
+};
+
+struct GuestEntry {
+  uint32_t desc;
+  int channels;
+  uint32_t args = 0;  // entry+0
+};
+
+uint32_t GuestCreateVoice(Guest& g, GuestSystem& s, const std::vector<GuestEntry>& es,
+                          std::vector<uint32_t>* plugins) {
+  const uint32_t entries = g.Alloc(uint32_t(es.size()) * 12 + 16);
+  std::memset(g.base + entries, 0, es.size() * 12 + 16);
+  for (size_t i = 0; i < es.size(); ++i) {
+    g.W32(entries + uint32_t(i) * 12, es[i].args);
+    g.W32(entries + uint32_t(i) * 12 + 4, es[i].desc);
+    g.base[entries + uint32_t(i) * 12 + 8] = uint8_t(es[i].channels);
+  }
+  const uint32_t out = g.Alloc(64);
+  PPCContext c = g.Ctx();
+  c.r3.u64 = es.size();
+  c.r4.u64 = entries;
+  c.r5.u64 = out;
+  c.r6.u64 = s.sys;
+  sub_82650398(c, g.base);
+  const uint32_t voice = c.r3.u32;
+  plugins->clear();
+  for (size_t i = 0; i < es.size(); ++i) plugins->push_back(g.R32(voice + 72 + uint32_t(i) * 4));
+  return voice;
+}
+
+void GuestSetParam(Guest& g, uint32_t plugin, int idx, float v) {
+  PPCContext c = g.Ctx();
+  c.r3.u64 = plugin;
+  c.r4.u64 = uint32_t(idx);
+  c.f1.f64 = double(v);
+  sub_8264CE48(c, g.base);
+}
+
+void GuestControl(Guest& g, uint32_t plugin, int idx, uint32_t data) {
+  PPCContext c = g.Ctx();
+  c.r3.u64 = plugin;
+  c.r4.u64 = uint32_t(idx);
+  c.r5.u64 = data;
+  sub_8264CE18(c, g.base);
+}
+
+// The class descriptors in .data are still zero when the self-test runs (the
+// game's static initializers fill them later); Voice::Create and the executor
+// read +8 GetSize, +12 Create, +20 hook / bus flag, +24 Process. Values from
+// docs/natywny-dzwiek/deskryptory.txt (read from the image at run time).
+void InitDescriptors(Guest& g) {
+  struct D {
+    uint32_t at, id, get_size, create, p16, fn20, process, counts;
+  };
+  static const D kD[] = {
+      {0x82937630, 0x50697430, 0x826625F0, 0x82662620, 0x8292F40C, 0x82662608, 0, 0x10000},
+      {0x829377B0, 0x4C493230, 0x826633F8, 0x82663508, 0x8292F58C, 0x82663320, 0x82663420,
+       0x10000},
+      {0x82937808, 0x48493230, 0x826636E8, 0x826637F8, 0x8292F5E4, 0x82663610, 0x82663710,
+       0x10000},
+      {0x82937860, 0x47616930, 0x8266BE78, 0x826639D8, 0x8292F63C, 0, 0x82663900, 0x10000},
+      {0x82936F30, 0x506E5330, 0x82652028, 0x826529B0, 0x8292ECC4, 0, 0x82652690, 0x30000},
+      {0x829375D8, 0x53656E30, 0x82662058, 0x82662428, 0x8292F344, 0x826620D8, 0x82662100,
+       0x1010200},
+      {0x82936E28, 0x53756230, 0x826513A8, 0x826516C8, 0x8292EC04, 1, 0x826513E8, 0x1000000},
+      {0x82937510, 0x526F7530, 0x82661D30, 0x82661F28, 0x8292F284, 0, 0x82661D58, 0x100},
+      {0x82936968, 0x524D3130, 0x8264DF18, 0x8264E668, 0x8292E704, 0, 0x8264E398, 0x30000},
+      {0x829369E0, 0x44656C30, 0x8264E980, 0x8264F848, 0x8292E79C, 0, 0x8264F458, 0x20000},
+      {0x82936C58, 0x56754D30, 0x8264F950, 0x8264FD88, 0x8292E814, 0, 0x8264FD20, 0x120100},
+      {0x82936E90, 0x41695730, 0x82651880, 0x82651990, 0x8292EC5C, 0, 0x82651C98, 0x200},
+  };
+  for (const D& d : kD) {
+    g.W32(d.at + 4, d.id);
+    g.W32(d.at + 8, d.get_size);
+    g.W32(d.at + 12, d.create);
+    g.W32(d.at + 16, d.p16);
+    g.W32(d.at + 20, d.fn20);
+    g.W32(d.at + 24, d.process);
+    g.W32(d.at + 28, d.counts);
+  }
+}
+
+void GraphCase(Guest& g, Report& rep, int variant, uint32_t seed) {
+  InitDescriptors(g);
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> pick(0, 99);
+  std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+  g.W32(0x8292ED74, 0x40C90FDB);  // PnS0 angle scale (runtime copy of the descriptor)
+  g.base[0x8299FDE0] = 0;
+  GuestSystem gs(g);
+  Engine eng(48000.0f);
+  const uint32_t name = g.Alloc(16), nameptr = g.Alloc(16);
+  std::memcpy(g.base + name, "TESTBUS", 8);
+  g.W32(nameptr, name);
+  using PC = PluginClass;
+  struct Pair {
+    uint32_t gvoice;
+    std::vector<uint32_t> gp;
+    Voice* nv;
+  };
+  auto make = [&](const std::vector<std::pair<PC, int>>& chain) {
+    static const std::pair<PC, uint32_t> kDesc[] = {
+        {PC::kPitch, 0x82937630},    {PC::kLowPass, 0x829377B0}, {PC::kHighPass, 0x82937808},
+        {PC::kGain, 0x82937860},     {PC::kPanSurround, 0x82936F30},
+        {PC::kSend, 0x829375D8},     {PC::kSubMix, 0x82936E28},  {PC::kReverb, 0x82936968},
+        {PC::kVuMeter, 0x82936C58},  {PC::kAiffWriter, 0x82936E90}, {PC::kDelay, 0x829369E0}};
+    std::vector<GuestEntry> ge;
+    std::vector<Engine::Entry> ne;
+    for (auto& [cls, ch] : chain) {
+      uint32_t d = 0;
+      for (auto& [c2, a] : kDesc)
+        if (c2 == cls) d = a;
+      ge.push_back({d, ch, cls == PC::kSubMix ? nameptr : 0u});
+      ne.push_back({cls, ch, 0.0f});
+    }
+    Pair p;
+    p.gvoice = GuestCreateVoice(g, gs, ge, &p.gp);
+    p.nv = eng.CreateVoice(ne);
+    return p;
+  };
+  // master, two group buses, a reverb bus, three sources
+  const int src_ch[3] = {1 + (variant & 1), 4, variant & 2 ? 2 : 1};
+  Pair master = make({{PC::kSubMix, 6}, {PC::kVuMeter, 6}, {PC::kAiffWriter, 6}});
+  std::vector<Pair> groups, sources;
+  for (int k = 0; k < 2; ++k)
+    groups.push_back(make({{PC::kSubMix, 2}, {PC::kLowPass, 2}, {PC::kHighPass, 2},
+                           {PC::kGain, 2}, {PC::kPanSurround, 6}, {PC::kSend, 6}}));
+  Pair reverb = make({{PC::kSubMix, 1}, {PC::kReverb, 1}, {PC::kVuMeter, 1}, {PC::kLowPass, 1},
+                      {PC::kPanSurround, 6}, {PC::kSend, 6}});
+  for (int k = 0; k < 3; ++k)
+    sources.push_back(make({{PC::kSubMix, src_ch[k]}, {PC::kPitch, src_ch[k]},
+                            {PC::kLowPass, src_ch[k]}, {PC::kHighPass, src_ch[k]},
+                            {PC::kGain, src_ch[k]}, {PC::kPanSurround, 6}, {PC::kSend, 6}}));
+  if (!master.gvoice || !reverb.gvoice) {
+    rep.Fail("guest Voice::Create failed");
+    return;
+  }
+  auto bus_of = [](Pair& p) { return p.gp[0]; };
+  auto nbus_of = [](Pair& p) { return p.nv->plugins[0]->AsBus(); };
+  // Attach: each Send (last plug-in) to its bus through Control(0, &bus).
+  const uint32_t data = g.Alloc(16);
+  auto attach = [&](Pair& from, Pair* to) {
+    g.W32(data, to ? bus_of(*to) : 0);
+    GuestControl(g, from.gp.back(), 0, data);
+    eng.AttachToBus(from.nv->plugins.back().get(), to ? nbus_of(*to) : nullptr);
+  };
+  attach(groups[0], &master);
+  attach(groups[1], &master);
+  attach(reverb, &master);
+  attach(sources[0], &groups[0]);
+  attach(sources[1], &groups[1]);
+  attach(sources[2], variant & 1 ? &reverb : &groups[0]);
+  // Random parameter traffic like the game's (every plug-in with params).
+  auto param = [&](Pair& p, int k, int idx, float v) {
+    GuestSetParam(g, p.gp[k], idx, v);
+    eng.SetParam(p.nv->plugins[k].get(), idx, v);
+  };
+  std::uniform_real_distribution<float> hz(50.0f, 22000.0f), gain(0.0f, 1.2f),
+      az(-180.0f, 180.0f), dist(0.0f, 30.0f), pitch(0.5f, 2.0f);
+  param(reverb, 1, 0, 2.0f);  // reverb on
+  // io for the guest graph: two 6 x 4096-frame buffers, like the engine's.
+  const uint32_t gio = g.Alloc(64);
+  std::memset(g.base + gio, 0, 64);
+  for (int i = 0; i < 2; ++i) {
+    const uint32_t b = g.Alloc(6 * 4096 * 4);
+    std::memset(g.base + b, 0, 6 * 4096 * 4);
+    g.W32(gio + 4 + 4 * i, b);
+    g.W32(gio + 20 + 4 * i, 6 * 4096 * 4);
+  }
+  char what[96];
+  for (int block = 0; block < 120; ++block) {
+    // parameters
+    for (Pair* p : {&sources[0], &sources[1], &sources[2], &groups[0], &groups[1]}) {
+      const bool src = p->nv->plugins[1]->cls == PC::kPitch;
+      const int o = src ? 1 : 0;  // sources have Pitch at 1
+      if (src && pick(rng) < 10) param(*p, 1, 0, pitch(rng));
+      if (pick(rng) < 8) param(*p, 1 + o, 0, pick(rng) < 20 ? 1000000.0f : hz(rng));
+      if (pick(rng) < 8) param(*p, 2 + o, 0, pick(rng) < 20 ? 0.0f : hz(rng) * 0.05f);
+      if (pick(rng) < 30) param(*p, 3 + o, 0, gain(rng));
+      if (pick(rng) < 30) param(*p, 4 + o, 1, az(rng));
+      if (pick(rng) < 15) param(*p, 4 + o, 0, dist(rng));
+      if (pick(rng) < 5) param(*p, 5 + o, 0, gain(rng));
+    }
+    if (pick(rng) < 3) param(reverb, 1, 1, dist(rng) + 2.0f);
+    if (block == 70 && (variant & 2)) {  // graceful release of a source: tail mode
+      PPCContext c = g.Ctx();
+      c.r3.u64 = sources[1].gvoice;
+      sub_826505B8(c, g.base);
+      eng.ReleaseVoice(sources[1].nv);
+    }
+    // source signals straight into the sources' buses (contributions = 1)
+    for (Pair* p : {&sources[0], &sources[1], &sources[2]}) {
+      if (block >= 100 && p == &sources[2]) continue;  // silence: tail mode on a source
+      Bus* nb = nbus_of(*p);
+      const uint32_t gb = bus_of(*p);
+      const uint32_t gbuf = g.R32(gb + 32);
+      for (int i = 0; i < nb->channels * kBlock; ++i) {
+        const float v = u(rng) * 0.5f;
+        nb->buffer[i] = v;
+        g.WF(gbuf + uint32_t(i) * 4, v);
+      }
+      nb->contributions = 1;
+      *reinterpret_cast<uint16_t*>(g.base + gb + 148) = __builtin_bswap16(uint16_t(1));
+    }
+    // one block on both sides: drain, then the executor from the master voice
+    gs.Drain();
+    eng.Drain();
+    g.base[gio + 28] = 0;
+    g.WF(gio + 12, 1.0f);
+    eng.io.cur = 0;
+    PPCContext c = g.Ctx();
+    c.r3.u64 = master.gvoice;
+    c.r4.u64 = gio;
+    c.r5.u64 = g.R32(gs.sys + 20);
+    sub_8265A148(c, g.base);
+    const int gr = int32_t(c.r3.u32);
+    const int nr = eng.RenderGraph(master.nv, eng.io);
+    std::snprintf(what, sizeof(what), "graph v%d block %d", variant, block);
+    if (g.R32(gs.sys + 20) != eng.counter) {
+      rep.Fail(std::string(what) + ": System+20 differs");
+      return;
+    }
+    if (gr != nr) {
+      std::snprintf(what, sizeof(what), "graph v%d block %d: return guest %d native %d", variant,
+                    block, gr, nr);
+      rep.Fail(what);
+      return;
+    }
+    if (g.base[gio + 28] != eng.io.cur) {
+      rep.Fail(std::string(what) + ": io buffer index differs");
+      return;
+    }
+    if (gr == 1) {
+      const uint32_t gcur = g.R32(gio + 4 + 4 * g.base[gio + 28]);
+      for (int i = 0; i < 6 * kBlock; ++i)
+        if (g.R32(gcur + uint32_t(i) * 4) != std::bit_cast<uint32_t>(eng.io.Cur()[i])) {
+          char f[32];
+          std::snprintf(f, sizeof(f), "master out[%d]", i);
+          CheckWord(g, gcur + uint32_t(i) * 4, std::bit_cast<uint32_t>(eng.io.Cur()[i]), rep,
+                    what, f);
+          return;
+        }
+      ++rep.processed;
+    } else {
+      ++rep.passthrough;
+    }
+    // voice states (+70 state, +48 silent frames)
+    for (Pair* p : {&sources[0], &sources[1], &sources[2], &groups[0], &groups[1], &reverb}) {
+      if (g.base[p->gvoice + 70] != p->nv->state ||
+          g.R32(p->gvoice + 48) != std::bit_cast<uint32_t>(p->nv->silent)) {
+        std::snprintf(what, sizeof(what), "graph v%d block %d: voice state %d/%d silent %08X/%08X",
+                      variant, block, g.base[p->gvoice + 70], p->nv->state,
+                      g.R32(p->gvoice + 48), std::bit_cast<uint32_t>(p->nv->silent));
+        rep.Fail(what);
+        return;
+      }
+    }
+  }
+}
+
 }  // namespace
 
 // Returns true when the self-test ran (the caller then exits).
@@ -849,6 +1163,7 @@ bool RunAudioSelfTest(uint8_t* base) {
   if (!path || !*path) return false;
   Report rep{std::fopen(path, "w")};
   if (!rep.f) return true;
+  std::setvbuf(rep.f, nullptr, _IONBF, 0);  // a crash must not lose the lines before it
   Guest g{base, 0};
   const uint32_t stack = g.Alloc(256 * 1024);
   g.stack_top = stack + 256 * 1024 - 512;
@@ -896,6 +1211,7 @@ bool RunAudioSelfTest(uint8_t* base) {
   run("Del0", [&](Report& r, int ch, uint32_t s) { DelayCase(g, r, ch, s); });
   run("VuM0", [&](Report& r, int ch, uint32_t s) { VuCase(g, r, ch, s); });
   run("Dac0 finalize", [&](Report& r, int ch, uint32_t s) { DacCase(g, r, ch, s); });
+  run("graph", [&](Report& r, int ch, uint32_t s) { GraphCase(g, r, ch, s); });
   g_selftest_alloc = false;
   std::fclose(rep.f);
   return true;

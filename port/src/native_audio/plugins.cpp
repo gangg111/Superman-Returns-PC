@@ -374,6 +374,26 @@ Bus::Bus(int ch) : channels(ch) {
   buffer = reinterpret_cast<float*>((uintptr_t(storage) + 127) & ~uintptr_t(127));
 }
 
+void Bus::LinkSender(const void* sender, Voice* o, void (*clear)(const void*)) {
+  links.insert(links.begin(), Link{sender, o, clear});
+  ++attached;
+}
+
+void Bus::Release() {
+  for (const Link& l : links) l.clear(l.sender);
+  attached = uint16_t(attached - links.size());
+  links.clear();
+}
+
+void Bus::UnlinkSender(const void* sender) {
+  for (size_t i = 0; i < links.size(); ++i)
+    if (links[i].sender == sender) {
+      links.erase(links.begin() + i);
+      break;
+    }
+  --attached;
+}
+
 void Bus::AddResidual(const float* res) {
   residual_pending = true;
   ScalarScope fpu;
@@ -407,14 +427,23 @@ void Send::Hook(const Io& io) {
 
 void Send::Attach(Bus* b) {
   if (bus) {
-    --bus->attached;
+    bus->UnlinkSender(this);
     bus->AddResidual(last);
     bus = nullptr;
   }
   if (b) {
     bus = b;
-    ++b->attached;
+    b->LinkSender(this, owner, [](const void* p) { const_cast<Send*>(static_cast<const Send*>(p))->bus = nullptr; });
   }
+}
+
+void Send::Release() {
+  if (!bus) return;
+  float tmp[6] = {};
+  MapChannels(tmp, bus->channels, last, in_channels, 1, 1.0f, 0.0f, false, false);
+  bus->UnlinkSender(this);
+  bus->AddResidual(tmp);
+  bus = nullptr;
 }
 
 int Send::Process(Io& io, bool reset) {
@@ -448,17 +477,24 @@ int Send::Process(Io& io, bool reset) {
 
 void Route::Attach(Bus* b, int s, int d, int n) {
   if (bus) {
-    --bus->attached;
+    bus->UnlinkSender(this);
     bus->AddResidual(last);
     bus = nullptr;
   }
   if (b) {
     bus = b;
-    ++b->attached;
+    b->LinkSender(this, owner, [](const void* p) { const_cast<Route*>(static_cast<const Route*>(p))->bus = nullptr; });
     src = uint8_t(s);
     dst = uint8_t(d);
     count = uint8_t(n);
   }
+}
+
+void Route::Release() {
+  if (!bus) return;
+  bus->UnlinkSender(this);
+  bus->AddResidual(last);
+  bus = nullptr;
 }
 
 int Route::Process(Io& io) {

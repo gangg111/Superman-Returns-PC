@@ -5,10 +5,13 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "native_audio/dsp.h"
 
 namespace native_audio {
+
+class Voice;
 
 // Double-buffered planar block the plug-ins of one voice pass along
 // (the guest "io" object: +4/+8 buffers, +12 rate, +16 gain, +28 current).
@@ -97,6 +100,17 @@ class Bus {
   float* buffer;
   uint16_t contributions = 0;  // +148
   uint16_t attached = 0;       // +146
+  // Sender links (+36), head first: attach inserts at the head (sub_826514D8),
+  // the executor visits the owner voices in this order.
+  struct Link {
+    const void* sender;
+    Voice* owner;
+    void (*clear)(const void* sender);  // the sender forgets this bus (SubMix release)
+  };
+  std::vector<Link> links;
+  void LinkSender(const void* sender, Voice* owner, void (*clear)(const void*));
+  void Release();  // vtbl[0]: detach every sender, no residual
+  void UnlinkSender(const void* sender);
   float residual[6] = {};      // +52
   bool residual_pending = false;  // +151
 };
@@ -108,6 +122,8 @@ class Send {
   void Hook(const Io& io);
   int Process(Io& io, bool reset);
   void Attach(Bus* b);  // Control(0, bus) handler: detach with residual, then attach
+  void Release();       // vtbl[0] sub_82662378: residual mapped to the bus channels
+  Voice* owner = nullptr;  // plugin+8
 
   int in_channels;
   float level = 1.0f;   // +40, param 0
@@ -124,6 +140,8 @@ class Route {
  public:
   int Process(Io& io);
   void Attach(Bus* b, int src, int dst, int count);  // Control handler
+  void Release();  // vtbl[0] sub_82661E90: detach with residual
+  Voice* owner = nullptr;
 
   Bus* bus = nullptr;
   uint8_t src = 0, dst = 0, count = 0;  // +52..+54
