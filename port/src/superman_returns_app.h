@@ -12,6 +12,10 @@
 #include <rex/cvar.h>
 
 #include "frame_stats.h"
+
+namespace native_audio {
+bool RunAudioSelfTest(uint8_t* base);  // native_audio/selftest.cpp
+}
 #include "sr_settings.h"
 #include "graphics/backend_selection.h"
 #include "native_renderer/native_bridge.h"
@@ -121,7 +125,11 @@ class SupermanReturnsApp : public rex::ReXApp {
   }
 
   // Feed the F3 debug overlay with the guest frame rate.
-  void OnPostSetup() override { SetGuestFrameStats(SampleGuestFrameStats); }
+  void OnPostSetup() override {
+    SetGuestFrameStats(SampleGuestFrameStats);
+    // SR_AUDIO_SELFTEST=<report>: native audio DSP vs the recompiled originals, then exit.
+    if (native_audio::RunAudioSelfTest(runtime()->virtual_membase())) std::exit(0);
+  }
 
   // Override virtual hooks for customization:
   // void OnPostInitLogging() override {}

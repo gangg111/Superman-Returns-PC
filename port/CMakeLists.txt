@@ -43,6 +43,9 @@ endif()
 set(SUPERMANRETURNS_SOURCES
     src/main.cpp
     src/audio_api_log.cpp
+    src/native_audio/sample_bank.cpp
+    src/native_audio/resampler.cpp
+    src/native_audio/selftest.cpp
     src/frame_rate.cpp
     src/frame_stats.cpp
     src/mem_stats.cpp
