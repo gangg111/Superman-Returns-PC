@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -250,6 +251,15 @@ bool LoadReplacement(const std::string& name, DecodedTexture& out) {
   }
   if (b.size() < offset + pos) return fail("truncated data");
   t.data.assign(b.begin() + offset, b.begin() + offset + pos);
+  {
+    // Proof that a replacement is in use: the first upload of each name.
+    static std::mutex m;
+    static std::set<std::string> logged;
+    std::lock_guard<std::mutex> lock(m);
+    if (logged.insert(name).second)
+      REXLOG_INFO("textures: {} replaced by {} ({}x{}, {} mips, DXGI format {})", name,
+                  path.filename().string(), width, height, mips, uint32_t(format));
+  }
   out = std::move(t);
   return true;
 }
