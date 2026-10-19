@@ -11,7 +11,9 @@ set(SR_AUDIO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../port/src/native_audio")
 add_executable(sr_native_audio_tests
     main.cpp
     test_sample_bank.cpp
+    test_bank_source.cpp
     "${SR_AUDIO_DIR}/sample_bank.cpp"
+    "${SR_AUDIO_DIR}/bank_source.cpp"
 )
 target_include_directories(sr_native_audio_tests PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../native" "${SR_AUDIO_DIR}/..")

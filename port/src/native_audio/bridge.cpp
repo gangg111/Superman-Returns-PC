@@ -17,8 +17,15 @@
 #include <rex/ppc.h>
 
 #include "generated/default/superman_returns_init.h"
+#include "native_audio/bank_source.h"
 #include "native_audio/engine.h"
+#include "native_audio/sample_bank.h"
 #include "native_audio/snd_player.h"
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 
 namespace native_audio::bridge {
 
@@ -54,8 +61,12 @@ struct State {
   std::map<std::pair<uint32_t, int>, Capture> captures;
   // statistics
   uint64_t blocks = 0, exact = 0, ret_diff = 0, isdone_diff = 0, id_diff = 0, unmapped = 0;
+  uint64_t bank_hits = 0, bank_misses = 0;
+  SampleBank bank;
+  bool bank_open = false;
   double max_diff = 0.0;
   bool first_logged = false;
+  int last_native_ret = 0;  // of the master voice, for the Dac finalize hook
 };
 
 State& S() {
@@ -108,10 +119,73 @@ std::string ReadString(const uint8_t* base, uint32_t p) {
 
 }  // namespace
 
+namespace {
+std::string ModeName() {
+  const char* v = std::getenv("SR_NATIVE_AUDIO");
+  return v ? v : "";
+}
+
+// shadow-bank: the native SndPlayers play the converted sounds from the bank
+// (<exe dir>/native_audio or SR_NATIVE_AUDIO_DIR) instead of the captured
+// decoder output; unresolved sounds fall back to the capture.
+bool BankMode() {
+  static const bool on = ModeName() == "shadow-bank" || ModeName() == "native";
+  return on;
+}
+
+// native: what reaches the speakers is the native engine's mix (bank sounds);
+// the original engine still runs alongside for now (game-visible state).
+bool NativeOutput() {
+  static const bool on = ModeName() == "native";
+  return on;
+}
+
+std::string BankDir() {
+  if (const char* d = std::getenv("SR_NATIVE_AUDIO_DIR"); d && *d) return d;
+  char path[MAX_PATH] = {};
+  GetModuleFileNameA(nullptr, path, MAX_PATH);
+  std::string dir(path);
+  return dir.substr(0, dir.find_last_of("/\\")) + "/native_audio";
+}
+
+std::shared_ptr<SoundSource> FromBank(uint8_t* base, State& s, uint32_t req) {
+  if (!s.bank_open) {
+    s.bank_open = true;
+    const std::string dir = BankDir();
+    const bool ok = s.bank.Open(dir);
+    REXAPU_INFO("native audio: sample bank {} ({} sounds) from {}", ok ? "open" : "missing",
+                s.bank.size(), dir);
+  }
+  const uint32_t snr = R32(base, req + 20);
+  if (!snr) return nullptr;
+  const SoundInfo* info = nullptr;
+  const uint32_t type = R32(base, snr + 4) >> 30;
+  std::string file;
+  uint32_t off = 0;
+  if (type == 0) {
+    info = s.bank.FindByFnv(SampleBank::Fnv1a(base + snr, 256));
+  } else {
+    file = ReadString(base, R32(base, req + 16));
+    off = uint32_t(RD(base, req + 8));
+    info = s.bank.FindStream(file, off);
+  }
+  std::shared_ptr<const Pcm> pcm = info ? s.bank.Load(*info) : nullptr;
+  if (!pcm) {
+    if (++s.bank_misses <= 20)
+      REXAPU_INFO("native audio: no bank sound for type {} snr {:08X}{:08X} fnv {:08X} file '{}' "
+                  "offset {}", type, R32(base, snr), R32(base, snr + 4),
+                  SampleBank::Fnv1a(base + snr, 256), file, off);
+    return nullptr;
+  }
+  ++s.bank_hits;
+  return std::make_shared<BankSource>(pcm);
+}
+}  // namespace
+
 bool Active() {
   static const bool on = [] {
-    const char* v = std::getenv("SR_NATIVE_AUDIO");
-    return v && std::string(v) == "shadow";
+    const std::string m = ModeName();
+    return m == "shadow" || m == "shadow-bank" || m == "native";
   }();
   return on;
 }
@@ -193,7 +267,8 @@ void OnControl(uint8_t* base, uint32_t plugin, uint32_t index, uint32_t data) {
       if (snr) std::memcpy(r.snr, base + snr, 16);
       r.flag = RF(base, data + 28);
       const int sound_ch = int(((R32(base, snr) >> 18) & 0x3F) + 1);
-      r.source = std::make_shared<CaptureSource>(plugin, sound_ch);
+      if (BankMode()) r.source = FromBank(base, s, data);
+      if (!r.source) r.source = std::make_shared<CaptureSource>(plugin, sound_ch);
       const float id = player->Start(r);
       if (R32(base, data + 32) != std::bit_cast<uint32_t>(id)) ++s.id_diff;
       break;
@@ -296,6 +371,9 @@ REX_HOOK_RAW(sub_8265A148) {
   const int gret = int32_t(ctx.r3.u32);
   s.engine.clock = RD(base, s.system);
   const int nret = s.engine.RenderGraph(s.native_master, s.engine.io);
+  s.last_native_ret = nret;
+  // The Dac only finalizes and submits when the render returned 1.
+  if (NativeOutput()) ctx.r3.u64 = uint32_t(nret);
   ++s.blocks;
   if (gret != nret) {
     ++s.ret_diff;
@@ -326,6 +404,25 @@ REX_HOOK_RAW(sub_8265A148) {
   }
   if (s.blocks % 1000 == 0)
     REXAPU_INFO("native audio shadow: {} blocks, {} exact, {} return diffs, max abs diff {}, "
-                "IsDone diffs {}, id diffs {}, unmapped voices {}",
-                s.blocks, s.exact, s.ret_diff, s.max_diff, s.isdone_diff, s.id_diff, s.unmapped);
+                "IsDone diffs {}, id diffs {}, unmapped voices {}, bank {} hits {} misses",
+                s.blocks, s.exact, s.ret_diff, s.max_diff, s.isdone_diff, s.id_diff, s.unmapped,
+                s.bank_hits, s.bank_misses);
+}
+
+// Dac finalize (interleave, reorder, fade-in, clamp) of the block the Dac then
+// copies into its packet: in native mode the packet gets the native mix.
+REX_HOOK_RAW(sub_82650810) {
+  const uint32_t dac = ctx.r3.u32;
+  __imp__sub_82650810(ctx, base);
+  if (!Active() || !NativeOutput()) return;
+  auto& s = native_audio::bridge::S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (s.last_native_ret != 1) return;
+  float out[6 * 256];
+  native_audio::DacFinalize(s.engine.io.Cur(), out, 6, &s.engine.dac_fade);
+  const uint32_t io = R32(base, dac + 56);
+  const uint32_t buf = R32(base, io + 4 + 4 * base[io + 28]);
+  for (int i = 0; i < 6 * 256; ++i)
+    *reinterpret_cast<uint32_t*>(base + buf + uint32_t(i) * 4) =
+        __builtin_bswap32(std::bit_cast<uint32_t>(out[i]));
 }

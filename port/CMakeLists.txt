@@ -51,6 +51,7 @@ set(SUPERMANRETURNS_SOURCES
     src/native_audio/engine.cpp
     src/native_audio/snd_player.cpp
     src/native_audio/bridge.cpp
+    src/native_audio/bank_source.cpp
     src/native_audio/selftest.cpp
     src/frame_rate.cpp
     src/frame_stats.cpp

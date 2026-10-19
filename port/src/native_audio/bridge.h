@@ -7,6 +7,12 @@
 // native SndPlayers take the samples the game's own decoder produced
 // ("capture"), so any difference is the engine's, not the decoder's.
 // Statistics go to the log every 1000 blocks (about 5.3 s).
+//
+// SR_NATIVE_AUDIO=shadow-bank: the same, but the native players use the
+// converted sounds (sample bank) instead of the capture: measures how far the
+// offline-decoded PCM is from the game's XMA decoder.
+// SR_NATIVE_AUDIO=native: the speakers get the native mix (bank sounds); the
+// original engine still runs alongside for the state the game reads.
 #pragma once
 
 #include <cstdint>
