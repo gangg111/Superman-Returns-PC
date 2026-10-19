@@ -2065,6 +2065,11 @@ Renderer::HostSurface* Renderer::GetSurface(uint8_t* base, uint32_t surface_obje
     s.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
   } else {
     s.resource_format = MapColorRtFormat(format);
+    // The sun shadow map is a k_16_16 target the game fills with values in
+    // Xenos' fixed -32..32 range (its filter pass scales by 32) and reads back
+    // raw through k_16_16_EDRAM fetches. SNORM clamped 99.8% of the texels to
+    // -1 (measured 2026-10-19); a float target keeps the whole range.
+    if (s.shadow && format == 4) s.resource_format = DXGI_FORMAT_R32G32_FLOAT;
     s.view_format = s.resource_format;
     s.srv_format = s.resource_format;
     desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -4269,6 +4274,18 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
     // (shadow_range.cpp); the receivers' literal 750-unit cutoff follows it.
     static const float shadow_range = float(rex::cvar::Query<double>("sr_shadow_range"));
     std::memcpy(&s[121], &shadow_range, 4);
+    // g_ColorRange (c31): Xenos fixed-point targets (k_16_16, k_16_16_16_16)
+    // clamp every write to -32..32; the host float targets clamp in the shader.
+    for (uint32_t i = 0; i < 4; ++i) {
+      const HostSurface* rt = bound_rts_[i];
+      float range = 0.0f;
+      if (rt && !rt->depth && (rt->guest_format == 4 || rt->guest_format == 5) &&
+          (rt->view_format == DXGI_FORMAT_R32G32_FLOAT ||
+           rt->view_format == DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        range = 32.0f;
+      }
+      std::memcpy(&s[124 + i], &range, 4);
+    }
   }
   for (uint32_t i = 0; i < 16; ++i) {
     s[76 + i] = GpuConstant(base, dev, Pm4Mirror::kLoopConstantBase + i, kDevVsLoops + 4 * i);

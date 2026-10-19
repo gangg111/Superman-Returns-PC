@@ -1,0 +1,50 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 19fdfdf..7972efd 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -111,6 +111,7 @@ struct PushConstants
+ #define g_SoftParticleTexelScale SR_SHARED_FLOAT(476)
+ #define g_SoftParticleDepth SR_SHARED_UINT(480)
+ #define g_ShadowRange SR_SHARED_FLOAT(484)
++#define g_ColorRange SR_SHARED_FLOAT4(496)
+ #define g_SpecConstants() g_SpecConstantsRuntime
+ #else
+ [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
+@@ -142,7 +143,7 @@ struct PushConstants
+     float g_AlphaThreshold : packoffset(c18.w); \
+     uint4 g_VertexFetchArr[224] : packoffset(c32); \
+     uint4 g_LoopConstantsArr[8] : packoffset(c19); \
+-    float4 g_ScreenXform : packoffset(c27);     uint g_SpecConstantsRuntime : packoffset(c28.x); float g_PixelPosScale : packoffset(c28.y); float g_ShadowAtlasTexelScale : packoffset(c28.z); float g_ShadowSoftness : packoffset(c28.w); float2 g_SoftParticleW : packoffset(c29.x); float g_SoftParticleDistance : packoffset(c29.z); float g_SoftParticleTexelScale : packoffset(c29.w); uint g_SoftParticleDepth : packoffset(c30.x); float g_ShadowRange : packoffset(c30.y);
++    float4 g_ScreenXform : packoffset(c27);     uint g_SpecConstantsRuntime : packoffset(c28.x); float g_PixelPosScale : packoffset(c28.y); float g_ShadowAtlasTexelScale : packoffset(c28.z); float g_ShadowSoftness : packoffset(c28.w); float2 g_SoftParticleW : packoffset(c29.x); float g_SoftParticleDistance : packoffset(c29.z); float g_SoftParticleTexelScale : packoffset(c29.w); uint g_SoftParticleDepth : packoffset(c30.x); float g_ShadowRange : packoffset(c30.y); float4 g_ColorRange : packoffset(c31);
+ 
+ #define g_Booleans(i) (g_BooleansArr[(i) / 4][(i) % 4])
+ #define g_VertexFetch(i) (g_VertexFetchArr[i])
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 7a69f1d..2463f4e 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -2685,6 +2685,24 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     indent();
+                     out += '}';
+                 #endif
++                #ifdef CONAN_RECOMP
++                    // Xenos fixed-point render targets (k_16_16, k_16_16_16_16)
++                    // store -32..32: every write clamps there. The host keeps
++                    // them as float targets and clamps here (g_ColorRange,
++                    // SharedConstants c31, per target; 0 = no clamp).
++                    {
++                        auto pixelShaderOut = reinterpret_cast<const PixelShader*>(shader);
++                        const char* ranges = "xyzw";
++                        for (uint32_t i = 0; i < 4; i++)
++                        {
++                            if (!(pixelShaderOut->outputs & (PIXEL_SHADER_OUTPUT_COLOR0 << i)))
++                                continue;
++                            indent();
++                            out += fmt::format("if (g_ColorRange.{0} > 0.0) oC{1} = clamp(oC{1}, -g_ColorRange.{0}, g_ColorRange.{0});",
++                                ranges[i], i);
++                        }
++                    }
++                #endif
+                 }
+                 else
+                 {
