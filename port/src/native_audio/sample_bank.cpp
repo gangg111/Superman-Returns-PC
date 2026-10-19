@@ -1,6 +1,7 @@
 #include "native_audio/sample_bank.h"
 
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 
 namespace native_audio {
@@ -63,7 +64,7 @@ bool SampleBank::Open(const std::string& dir) {
     return false;
   Reader r{d, 4};
   const uint32_t version = r.Get<uint32_t>();
-  if (version != 1 && version != 2) return false;
+  if (version < 1 || version > 3) return false;
   const uint32_t count = r.Get<uint32_t>();
   sounds_.reserve(count);
   for (uint32_t i = 0; i < count && r.ok; ++i) {
@@ -83,6 +84,7 @@ bool SampleBank::Open(const std::string& dir) {
       const uint32_t n = r.Get<uint32_t>();
       for (uint32_t k = 0; k < n && r.ok; ++k) s.blocks.push_back(r.Get<uint32_t>());
     }
+    if (version >= 3) s.sns_offset = r.Get<uint32_t>();
     if (r.ok) sounds_.push_back(std::move(s));
   }
   if (!r.ok) {
@@ -105,6 +107,20 @@ std::vector<const SoundInfo*> SampleBank::FindBySnr(const uint8_t* snr, size_t l
   for (const SoundInfo& s : sounds_)
     if (std::memcmp(s.snr16.data(), snr, len) == 0) out.push_back(&s);
   return out;
+}
+
+const SoundInfo* SampleBank::FindStream(const std::string& archive_path, uint32_t offset) const {
+  // file name part of the path, lower case ("DATA\sound.AST" -> "sound.ast")
+  size_t cut = archive_path.find_last_of("/\\");
+  std::string file = archive_path.substr(cut == std::string::npos ? 0 : cut + 1);
+  for (char& c : file) c = char(std::tolower(static_cast<unsigned char>(c)));
+  for (const SoundInfo& s : sounds_) {
+    if (!s.streamed || s.sns_offset != offset) continue;
+    std::string arc = s.name.substr(0, s.name.find('/'));
+    for (char& c : arc) c = char(std::tolower(static_cast<unsigned char>(c)));
+    if (arc == file) return &s;
+  }
+  return nullptr;
 }
 
 std::shared_ptr<const Pcm> SampleBank::Load(const SoundInfo& info) {

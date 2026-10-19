@@ -4,13 +4,15 @@
 usage: build_index.py <native_audio dir>   (reads manifest.json, writes index.bin)
 
 Layout, little endian:
-  "SRAI" u32 version=2 u32 count
+  "SRAI" u32 version=3 u32 count
   per sound: u32 fnv256 (0 = none) u8 has_fnv u8 channels u8 streamed u8 loop
              u32 rate u32 samples u32 loop_start
              u8[16] snr16 (first 16 bytes of the SNR header, zero padded)
              u16 len + utf-8 file path (relative to the dir)
              u16 len + utf-8 "archive/NAME"
              u32 block count + u32 frames per block (EAAC data blocks)
+             u32 byte offset of the _SNS entry in its archive (0xFFFFFFFF = none):
+                 streamed sounds are opened by archive file + this offset
 """
 import json
 import os
@@ -22,7 +24,7 @@ def main():
     root = sys.argv[1]
     manifest = json.load(open(os.path.join(root, "manifest.json"), encoding="utf-8"))
     sounds = [s for s in manifest["sounds"] if s.get("file") and s.get("exact")]
-    out = bytearray(b"SRAI" + struct.pack("<II", 2, len(sounds)))
+    out = bytearray(b"SRAI" + struct.pack("<II", 3, len(sounds)))
     for s in sounds:
         fnv = s.get("fnv256")
         snr = bytes.fromhex(s.get("snr16", ""))[:16].ljust(16, b"\0")
@@ -35,6 +37,7 @@ def main():
             out += struct.pack("<H", len(b)) + b
         blocks = s.get("blocks", [])
         out += struct.pack("<I", len(blocks)) + struct.pack(f"<{len(blocks)}I", *blocks)
+        out += struct.pack("<I", s.get("sns_offset", 0xFFFFFFFF))
     with open(os.path.join(root, "index.bin"), "wb") as f:
         f.write(out)
     print(f"index.bin: {len(sounds)} sounds, {len(out)} bytes")

@@ -27,6 +27,7 @@ struct SoundInfo {
   std::string file;  // relative to the bank directory
   std::string name;  // "archive/NAME"
   std::vector<uint32_t> blocks;  // frames per EAAC data block (index v2)
+  uint32_t sns_offset = 0xFFFFFFFF;  // _SNS entry offset in its archive (index v3)
 };
 
 // Interleaved int16 frames, exactly SoundInfo::samples long.
@@ -47,6 +48,10 @@ class SampleBank {
   // All sounds whose SNR header starts with these bytes (streamed sounds have
   // no data after the header, so this narrows them before the file name does).
   std::vector<const SoundInfo*> FindBySnr(const uint8_t* snr, size_t len) const;
+
+  // A streamed sound by the archive file the game opens (any path; the file
+  // name is compared without case) and the byte offset of its _SNS entry.
+  const SoundInfo* FindStream(const std::string& archive_path, uint32_t offset) const;
 
   // Loads (or returns the cached) PCM; null when the file cannot be read.
   std::shared_ptr<const Pcm> Load(const SoundInfo& info);

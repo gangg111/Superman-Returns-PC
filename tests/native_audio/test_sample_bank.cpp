@@ -47,3 +47,21 @@ SR_TEST(EveryInMemorySoundResolvesAndLoadsExactly) {
   std::printf("  loaded %zu sounds, %zu failed\n", checked, failed);
   SR_CHECK_EQ(failed, size_t(0));
 }
+
+// Needs the converted sounds: streamed sounds found by archive file + _SNS offset.
+SR_TEST(StreamsResolveByArchiveAndOffset) {
+  const char* dir = std::getenv("SR_NATIVE_AUDIO_DIR");
+  if (!dir) {
+    std::printf("  skipped: SR_NATIVE_AUDIO_DIR not set\n");
+    return;
+  }
+  SampleBank bank;
+  SR_CHECK(bank.Open(dir));
+  // źródło: TOC archiwów odczytany tools/audio/ea_ast.Bgfa (8. wpis _SNS w każdym)
+  const auto* a = bank.FindStream("DATA\\voice.AST", 591824);
+  SR_CHECK(a && a->name == "voice.AST/HEARING_CITIZENS_02");
+  const auto* b = bank.FindStream("game:/DATA/SOUND.ast", 34574720);
+  SR_CHECK(b && b->name == "sound.AST/MARINA_02_LOOP");
+  SR_CHECK(bank.FindStream("voice.AST", 591825) == nullptr);   // offset of no entry
+  SR_CHECK(bank.FindStream("sound.AST", 591824) == nullptr);   // right offset, other archive
+}

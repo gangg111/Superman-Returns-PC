@@ -102,6 +102,21 @@ def keys(body):
             "fnv256": f"{fnv1a(tail):08X}" if len(tail) == 256 else None}
 
 
+def sns_offsets(data_dir):
+    """Byte offset of every _SNS entry in its top-level archive, keyed by
+    (archive label, sound name): the game opens a streamed sound by archive file
+    and this offset (SndPlayer request +16 / +8), so it identifies the sound."""
+    out = {}
+    for file in sorted(os.listdir(data_dir)):
+        if not file.upper().endswith(".AST"):
+            continue
+        arc = ea_ast.Bgfa(os.path.join(data_dir, file))
+        for e in arc.entries:
+            if e.name.endswith("_SNS") and not e.size:
+                out[(file, e.name[:-4])] = e.offset
+    return out
+
+
 def convert(job, out_dir):
     label, name, body, sns = job
     item = {"archive": label, "name": name}
@@ -143,11 +158,14 @@ def main():
         path = os.path.join(args.out_dir, "manifest.json")
         manifest = json.load(open(path, encoding="utf-8"))
         by_id = {(label, name): (body, sns) for label, name, body, sns in jobs}
+        offsets = sns_offsets(args.data_dir)
         for r in manifest["sounds"]:
             found = by_id.get((r["archive"], r["name"]))
             if found is not None:
                 r.update(keys(found[0]))
                 r["blocks"] = blocks_of(*found)
+            if (r["archive"], r["name"]) in offsets:
+                r["sns_offset"] = offsets[(r["archive"], r["name"])]
         with open(path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=1)
         have = sum(1 for r in manifest["sounds"] if r.get("fnv256"))
