@@ -4265,6 +4265,10 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
     static const float kSoftness[3] = {0.0f, 1.0f, 1.6f};
     float softness = kSoftness[std::clamp(shadow_smoothing_, 0, 2)];
     std::memcpy(&s[115], &softness, 4);
+    // g_ShadowRange (c30.y): sr_shadow_range widens the game's shadow cascades
+    // (shadow_range.cpp); the receivers' literal 750-unit cutoff follows it.
+    static const float shadow_range = float(rex::cvar::Query<double>("sr_shadow_range"));
+    std::memcpy(&s[121], &shadow_range, 4);
   }
   for (uint32_t i = 0; i < 16; ++i) {
     s[76 + i] = GpuConstant(base, dev, Pm4Mirror::kLoopConstantBase + i, kDevVsLoops + 4 * i);

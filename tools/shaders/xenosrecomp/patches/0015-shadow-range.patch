@@ -1,0 +1,65 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 745e27c..19fdfdf 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -110,6 +110,7 @@ struct PushConstants
+ #define g_SoftParticleDistance SR_SHARED_FLOAT(472)
+ #define g_SoftParticleTexelScale SR_SHARED_FLOAT(476)
+ #define g_SoftParticleDepth SR_SHARED_UINT(480)
++#define g_ShadowRange SR_SHARED_FLOAT(484)
+ #define g_SpecConstants() g_SpecConstantsRuntime
+ #else
+ [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
+@@ -141,7 +142,7 @@ struct PushConstants
+     float g_AlphaThreshold : packoffset(c18.w); \
+     uint4 g_VertexFetchArr[224] : packoffset(c32); \
+     uint4 g_LoopConstantsArr[8] : packoffset(c19); \
+-    float4 g_ScreenXform : packoffset(c27);     uint g_SpecConstantsRuntime : packoffset(c28.x); float g_PixelPosScale : packoffset(c28.y); float g_ShadowAtlasTexelScale : packoffset(c28.z); float g_ShadowSoftness : packoffset(c28.w); float2 g_SoftParticleW : packoffset(c29.x); float g_SoftParticleDistance : packoffset(c29.z); float g_SoftParticleTexelScale : packoffset(c29.w); uint g_SoftParticleDepth : packoffset(c30.x);
++    float4 g_ScreenXform : packoffset(c27);     uint g_SpecConstantsRuntime : packoffset(c28.x); float g_PixelPosScale : packoffset(c28.y); float g_ShadowAtlasTexelScale : packoffset(c28.z); float g_ShadowSoftness : packoffset(c28.w); float2 g_SoftParticleW : packoffset(c29.x); float g_SoftParticleDistance : packoffset(c29.z); float g_SoftParticleTexelScale : packoffset(c29.w); uint g_SoftParticleDepth : packoffset(c30.x); float g_ShadowRange : packoffset(c30.y);
+ 
+ #define g_Booleans(i) (g_BooleansArr[(i) / 4][(i) % 4])
+ #define g_VertexFetch(i) (g_VertexFetchArr[i])
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 8b71d9f..7a69f1d 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -1840,6 +1840,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     std::vector<uint32_t> atlasPcfRegs;  // literal registers holding PCF tap offsets
+     for (auto& [reg, name] : samplers)
+         hasShadowAtlas |= strcmp(name, "g_ShadowMapTextureAtlas") == 0;
++    // Superman Returns: the cascaded shadow receivers (constant
++    // shadowMapOffsetScales) skip the shadow test beyond a literal 750 units,
++    // the far edge of the game's cascades (30 * 5^2). The host widens the
++    // cascades (sr_shadow_range), so that literal follows g_ShadowRange
++    // (SharedConstants c30.y; 0 or 1 = original).
++    bool hasShadowCascades = false;
++    for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
++    {
++        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
++            constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
++        hasShadowCascades |= strcmp(reinterpret_cast<const char*>(constantTableData + constantInfo->name),
++                                    "shadowMapOffsetScales") == 0;
++    }
+ #endif
+     if (shaderContainer->definitionTableOffset != NULL)
+     {
+@@ -1910,6 +1923,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                 }
+                 if (atlasPcfOffsets)
+                     atlasPcfRegs.push_back(definition->registerIndex + i - 256);
++                auto rangeComponent = [&](uint32_t u) -> std::string
++                {
++                    if (u == 0x443B8000)  // 750.0
++                        return fmt::format("(asfloat(0x{:X}u) * max(g_ShadowRange, 1.0))", u);
++                    return fmt::format("asfloat(0x{:X}u)", u);
++                };
++                if (isPixelShader && hasShadowCascades && !atlasPcfOffsets &&
++                    (value[0].get() == 0x443B8000 || value[1].get() == 0x443B8000 ||
++                     value[2].get() == 0x443B8000 || value[3].get() == 0x443B8000))
++                    println("\tfloat4 c{} = float4({}, {}, {}, {});",
++                        definition->registerIndex + i - 256, rangeComponent(value[0].get()), rangeComponent(value[1].get()),
++                        rangeComponent(value[2].get()), rangeComponent(value[3].get()));
++                else
+                 println("\tfloat4 c{} = asfloat(uint4(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X})){};",
+                     definition->registerIndex + i - (isPixelShader ? 256 : 0), value[0].get(), value[1].get(), value[2].get(), value[3].get(),
+                     atlasPcfOffsets ? " * g_ShadowAtlasTexelScale" : "");
