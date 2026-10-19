@@ -398,6 +398,55 @@ void GainCase(Guest& g, Report& rep, int ch, uint32_t seed) {
   }
 }
 
+void PanCase(Guest& g, Report& rep, int in_ch, uint32_t seed) {
+  std::mt19937 rng(seed);
+  // The runtime copy of the class descriptor is not made yet at self-test
+  // time; put the angle scale (descriptor +68 = 2*pi) where Process reads it.
+  g.W32(0x8292ED74, 0x40C90FDB);
+  g.base[0x8299FDE0] = 0;  // debug orbit off
+  GuestPlugin gp(g, 0x82936F30, in_ch, 6, sub_82652028, sub_826529B0);
+  PanSurround nat(in_ch, 6);
+  char what[96];
+  for (int o = 0; o < 5; ++o)
+    for (int k = 0; k < 2; ++k)
+      if (g.R32(gp.obj + 176 + 80 * o + 64 + 4 * k) != std::bit_cast<uint32_t>(nat.spk[o][k])) {
+        std::snprintf(what, sizeof(what), "PnS0 speaker %d.%d: guest %08X native %08X", o, k,
+                      g.R32(gp.obj + 176 + 80 * o + 64 + 4 * k),
+                      std::bit_cast<uint32_t>(nat.spk[o][k]));
+        rep.Fail(what);
+        return;
+      }
+  Io& io = g_nio.io;
+  io.cur = 0;
+  std::uniform_int_distribution<int> pick(0, 9);
+  std::uniform_real_distribution<float> dist(0.0f, 40.0f), az(-360.0f, 360.0f), wid(0.0f, 10.0f);
+  for (int block = 0; block < 60; ++block) {
+    if (pick(rng) < 4) {
+      const int which = pick(rng) % 3;
+      const float v = which == 0 ? dist(rng) : which == 1 ? az(rng) : wid(rng);
+      g.WF(gp.obj + 32 + 8 * which, v);
+      (which == 0 ? nat.distance : which == 1 ? nat.azimuth : nat.half_width) = v;
+    }
+    FillInput(gp, io, in_ch, rng, pick(rng) == 0 ? 1 : 0);
+    const int gr = gp.Call(sub_82652690);
+    const int nr = nat.Process(io);
+    std::snprintf(what, sizeof(what), "PnS0 in=%d block %d", in_ch, block);
+    if (gr != nr) rep.Fail(std::string(what) + ": return differs");
+    if (!CompareOutput(gp, io, 6, rep, what)) return;
+    ++rep.processed;
+    for (int o = 0; o < 5; ++o)
+      for (int i = 0; i < 6; ++i)
+        if (g.R32(gp.obj + 176 + 80 * o + 4 + 4 * i) != std::bit_cast<uint32_t>(nat.cur[o][i])) {
+          std::snprintf(what, sizeof(what), "PnS0 in=%d block %d gain[%d][%d]: guest %08X native %08X",
+                        in_ch, block, o, i, g.R32(gp.obj + 176 + 80 * o + 4 + 4 * i),
+                        std::bit_cast<uint32_t>(nat.cur[o][i]));
+          rep.Fail(what);
+          return;
+        }
+    io.cur = gp.Cur();
+  }
+}
+
 }  // namespace
 
 // Returns true when the self-test ran (the caller then exits).
@@ -444,6 +493,8 @@ bool RunAudioSelfTest(uint8_t* base) {
   run("LI20", [&](Report& r, int ch, uint32_t s) { FilterCase(g, r, false, ch, s); });
   run("HI20", [&](Report& r, int ch, uint32_t s) { FilterCase(g, r, true, ch, s); });
   run("Gai0", [&](Report& r, int ch, uint32_t s) { GainCase(g, r, ch, s); });
+  // PnS0 takes 1, 2 or 4 input channels (6 maps to "1", 4 stays).
+  run("PnS0", [&](Report& r, int ch, uint32_t s) { PanCase(g, r, ch == 6 ? 1 : ch, s); });
   std::fclose(rep.f);
   return true;
 }

@@ -53,4 +53,25 @@ class Gain {
   float prev = 1.0f;  // +40
 };
 
+// PanSurroundPlugIn "PnS0" (spec 3): 1/2/4 input channels to 6 outputs in the
+// engine order L, C, R, Ls, Rs, LFE (LFE always zero).
+class PanSurround {
+ public:
+  PanSurround(int in_channels, int out_channels);
+  int Process(Io& io);
+
+  int in_channels, out_channels;
+  float distance = 0.0f;    // +32, param 0
+  float azimuth = 0.0f;     // +40, param 1 (degrees, 0 = front, + = left)
+  float half_width;         // +48, param 2
+  float prev_az = 0, prev_dist = 0, prev_width = 0;  // +56, +60, +64
+  float spk[5][2];          // speaker directions (R+64 of row o)
+  float cur[5][6] = {};     // R+4
+  float prev[5][6] = {};    // R+28
+  bool force = true;        // +576
+
+ private:
+  void Matrix();
+};
+
 }  // namespace native_audio

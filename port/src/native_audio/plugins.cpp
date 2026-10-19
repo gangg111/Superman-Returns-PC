@@ -138,4 +138,138 @@ int Gain::Process(Io& io, bool reset) {
   return 1;
 }
 
+// ---------------------------------------------------------------- pan
+
+namespace {
+
+// Angle scale: PnS0 class descriptor +68 (0x82936F74, copied at run time to
+// 0x8292ED74), 0x40C90FDB = 2*pi.
+const float kTwoPi = std::bit_cast<float>(0x40C90FDBu);
+const float kInv360 = std::bit_cast<float>(0x3B360B61u);  // 0x82021BD4, 1/360
+
+int VirtualInputs(int in_ch) { return (in_ch == 1 || in_ch == 4) ? 4 : (in_ch == 2) ? 2 : in_ch; }
+
+}  // namespace
+
+PanSurround::PanSurround(int in_ch, int out_ch)
+    : in_channels(in_ch), out_channels(out_ch), half_width(std::bit_cast<float>(0x40A3EF9Eu)) {
+  // Speaker vectors normalized at create (sub_82652130, VMX): len2 = x*x + y*y,
+  // e = 1/sqrt(len2) (the recompiled vrsqrtefp), two Newton steps, v *= e.
+  static const float raw[5][2] = {{-1, 1}, {0, 1}, {1, 1}, {-1, -1}, {1, -1}};
+  VmxScope vmx;
+  for (int o = 0; o < 5; ++o) {
+    const float x = raw[o][0], y = raw[o][1];
+    const float len2 = x * x + y * y;
+    float e = 1.0f / std::sqrt(len2);
+    for (int k = 0; k < 2; ++k) {
+      const float ee = e * e;
+      const float t = 1.0f - len2 * ee;
+      const float h = e * 0.5f;
+      e = h * t + e;
+    }
+    spk[o][0] = x * e;
+    spk[o][1] = y * e;
+  }
+}
+
+void PanSurround::Matrix() {
+  ScalarScope fpu;
+  const int n = VirtualInputs(in_channels);
+  for (int o = 0; o < 5; ++o)
+    for (int i = 0; i < n; ++i) cur[o][i] = 0.0f;
+  float v[6][2] = {};
+  const float a = kTwoPi * kInv360;
+  const float th = (azimuth + 90.0f) * a;
+  const float c = float(std::cos(double(th)));
+  const float s = float(std::sin(double(th)));
+  const float cx = c * distance, sy = s * distance;
+  const float p2 = half_width;
+  if (n == 2) {
+    v[0][0] = Fmadds(-s, p2, cx);
+    v[0][1] = Fmadds(c, p2, sy);
+    v[1][0] = Fmadds(-s, -p2, cx);
+    v[1][1] = Fmadds(c, -p2, sy);
+  } else if (n == 4) {
+    const float xl = Fmadds(-s, p2, cx), yl = Fmadds(c, p2, sy);
+    const float xr = Fmadds(-s, -p2, cx), yr = Fmadds(c, -p2, sy);
+    const float cp = c * p2, sp = s * p2;
+    v[0][0] = Fmadds(p2, c, xl);
+    v[0][1] = Fmadds(p2, s, yl);
+    v[1][0] = Fmadds(p2, c, xr);
+    v[1][1] = Fmadds(p2, s, yr);
+    v[2][0] = xl - cp;
+    v[2][1] = yl - sp;
+    v[3][0] = xr - cp;
+    v[3][1] = yr - sp;
+  }
+  for (int i = 0; i < n; ++i) {
+    float gv[5];
+    {
+      VmxScope vmx;
+      for (int o = 0; o < 5; ++o) gv[o] = spk[o][0] * v[i][0] + spk[o][1] * v[i][1];
+    }
+    gv[1] = gv[1] * 0.5f;
+    float sum = 0.0f;
+    for (int o = 0; o < 5; ++o) {
+      if (gv[o] < 0.0f) gv[o] = 0.0f;
+      sum = Fmadds(gv[o], gv[o], sum);
+    }
+    if (sum > 0.0f) {
+      float k = 1.0f / std::sqrt(sum);
+      k = k / float(n);
+      for (int o = 0; o < 5; ++o) gv[o] = gv[o] * k;
+    }
+    for (int o = 0; o < 5; ++o) cur[o][i] = gv[o];
+  }
+}
+
+int PanSurround::Process(Io& io) {
+  const float* in = io.Cur();
+  float* out = io.Next();
+  bool changed;
+  {
+    ScalarScope fpu;
+    changed = force || azimuth != prev_az || distance != prev_dist || half_width != prev_width;
+  }
+  if (changed) {
+    force = false;
+    std::memcpy(prev, cur, sizeof(cur));
+    Matrix();
+    prev_az = azimuth;
+    prev_dist = distance;
+    prev_width = half_width;
+  }
+  const float* src[4] = {};
+  int n = 0;
+  if (in_channels == 1) {
+    src[0] = src[1] = src[2] = src[3] = in;
+    n = 4;
+  } else if (in_channels == 2) {
+    src[0] = in;
+    src[1] = in + kBlock;
+    n = 2;
+  } else if (in_channels == 4) {
+    for (int i = 0; i < 4; ++i) src[i] = in + i * kBlock;
+    n = 4;
+  }
+  float* outp = out;
+  for (int o = 0; o < 5; ++o, outp += kBlock)
+    for (int i = 0; i < n; ++i) {
+      const float g0 = prev[o][i];
+      float s;
+      {
+        ScalarScope fpu;
+        s = (cur[o][i] - g0) * 0.015625f;
+      }
+      if (i == 0)
+        changed ? GainRampSet(outp, src[i], g0, s, kBlock, 64) : GainSet(outp, src[i], g0, kBlock);
+      else
+        changed ? GainRampAdd(outp, src[i], g0, s, kBlock, 64) : GainAdd(outp, src[i], g0, kBlock);
+    }
+  if (out_channels > 5) std::memset(outp, 0, size_t(out_channels - 5) * kBlock * 4);
+  std::memcpy(prev, cur, sizeof(cur));
+  io.Toggle();
+  return 1;
+}
+
 }  // namespace native_audio
