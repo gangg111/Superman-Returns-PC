@@ -267,6 +267,9 @@ REXCVAR_DEFINE_INT32(sr_native_anisotropic_filtering, 16, "Superman Returns Nati
                      "Anisotropic filtering for filtered textures (-1 = game, 1 = off, 2, 4, 8, 16); "
                      "the game asks for none, 16 is the remaster default")
     .range(-1, 16);
+REXCVAR_DEFINE_INT32(sr_native_aniso_from_swap, 0, "Superman Returns Native",
+                     "Debug A/B: the game's filtering until this guest swap, then "
+                     "sr_native_anisotropic_filtering (samplers recreated); 0 = from the start");
 REXCVAR_DEFINE_INT32(sr_native_debug_rs_salt, 0, "Superman Returns Native",
                      "Debug: add an unused root constant block of N dwords (1-32) so every "
                      "pipeline misses the driver's shader cache (cold-start stutter tests)");
@@ -1124,6 +1127,7 @@ bool Renderer::EnsureInitialized() {
     msaa_samples_ = m >= 8 ? 8u : m >= 4 ? 4u : m >= 2 ? 2u : m == 1 ? 1u : 0u;
   }
   anisotropy_ = REXCVAR_GET(sr_native_anisotropic_filtering);
+  if (REXCVAR_GET(sr_native_aniso_from_swap) > 0) anisotropy_ = -1;
   full_scene_resolution_ = REXCVAR_GET(sr_native_full_scene_resolution);
   foliage_aa_ = REXCVAR_GET(sr_native_foliage_antialiasing);
   fxaa_ = REXCVAR_GET(sr_native_fxaa);
@@ -2024,10 +2028,13 @@ Renderer::HostSurface* Renderer::GetSurface(uint8_t* base, uint32_t surface_obje
   } else if (g_current_pass == kPassRenderShadowMaps && width == height) {
     s.scale = shadow_scale_;
     s.shadow = true;
-  } else if (kPassRenderShadowMaps < 0 && shadow_mul_ != 1.0f && width == height && width >= 512 &&
+  } else if (kPassRenderShadowMaps < 0 && width == height && width >= 512 &&
              (depth || format == 4)) {
     // The profile has no shadow pass role: the square 640x640 16_16 target and
-    // its depth are the shadow map.
+    // its depth are the shadow map. Always recognised (not only with
+    // shadow_mul != 1): otherwise it took the render scale and, as an upscaled
+    // color target, was read with a linear filter that averages the packed
+    // depths and breaks the shadow test (seen at render scale 2).
     s.scale = shadow_mul_;
     s.shadow = true;
   } else {
@@ -3660,13 +3667,15 @@ uint32_t Renderer::CreateTexture(const uint32_t fetch[6], TextureEntry& entry) {
   return entry.srv_index;
 }
 
-uint32_t Renderer::GetSamplerIndex(const uint32_t fetch[6], bool force_linear, float lod_bias) {
+uint32_t Renderer::GetSamplerIndex(const uint32_t fetch[6], bool force_linear, float lod_bias,
+                                   bool render_target) {
   CpuTimer cpu_timer(cpu_timings.sampler_ns);
   xenos::xe_gpu_texture_fetch_t f;
   std::memcpy(&f, fetch, sizeof(f));
   uint32_t bias_q = uint32_t(std::clamp(lod_bias, 0.0f, 7.9f) * 16.0f);  // 1/16 steps
   uint64_t key = (uint64_t(fetch[0]) & 0x7FFC00) | (uint64_t(fetch[3] & 0x3FF80000) << 32) |
-                 (uint64_t(force_linear) << 63) | (uint64_t(bias_q) << 1);
+                 (uint64_t(force_linear) << 63) | (uint64_t(render_target) << 62) |
+                 (uint64_t(bias_q) << 1);
   auto it = samplers_.find(key);
   if (it != samplers_.end()) {
     return it->second;
@@ -3678,8 +3687,11 @@ uint32_t Renderer::GetSamplerIndex(const uint32_t fetch[6], bool force_linear, f
   uint32_t aniso = uint32_t(f.aniso_filter);
   uint32_t max_aniso = aniso > 1 ? std::min(16u, 1u << (aniso - 1)) : 1u;
   // anisotropic_filtering setting: overrides filtered (linear min/mag)
-  // textures; point-sampled lookups stay point-sampled.
-  if (anisotropy_ >= 1 && (min_linear || mag_linear || aniso > 1)) {
+  // textures; point-sampled lookups stay point-sampled. Never for render
+  // targets the game reads back (shadow map, depth, glow, bloom): those are
+  // screen- or light-space buffers, and the linear filter forced on upscaled
+  // ones (sc.smooth) must not turn into a wide anisotropic footprint.
+  if (anisotropy_ >= 1 && !render_target && (min_linear || mag_linear || aniso > 1)) {
     max_aniso = uint32_t(std::min(anisotropy_, 16));
   }
   if (max_aniso > 1) {
@@ -4045,6 +4057,19 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
         // 29-30 carry scale - 1 so the shader keeps texel offsets and filter
         // weights in guest texels (TEX_SCALE in the XenosRecomp patch).
         auto latest = resolve_latest_.find(GuestPhysical(fetch[1] & 0xFFFFF000u));
+        sc.render_target = srv > 2 && latest != resolve_latest_.end();
+        if (sc.render_target) {
+          static bool logged_shadow = false;
+          auto srt = resolve_textures_.find(latest->second);
+          if (!logged_shadow && srt != resolve_textures_.end() && srt->second.shadow) {
+            logged_shadow = true;
+            xenos::xe_gpu_texture_fetch_t sf;
+            std::memcpy(&sf, fetch, sizeof(sf));
+            REXLOG_INFO("native: shadow map fetch min {} mag {} mip {} aniso {} (scale {})",
+                        uint32_t(sf.min_filter), uint32_t(sf.mag_filter), uint32_t(sf.mip_filter),
+                        uint32_t(sf.aniso_filter), srt->second.scale);
+          }
+        }
         if (srv > 2 && latest != resolve_latest_.end()) {
           auto rt = resolve_textures_.find(latest->second);
           // Not for the shadow atlas: its receivers run the whole PCF kernel
@@ -4073,7 +4098,7 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
         sc.srv = srv;
         sc.frame = frame_count_;
       }
-      sampler = GetSamplerIndex(fetch, sc.smooth);
+      sampler = GetSamplerIndex(fetch, sc.smooth, 0.0f, sc.render_target);
       // Smooth effects: small textures of blended draws (particles, glows,
       // light halos) magnify with a cubic B-spline above the original
       // resolution (bit 28, tfetch2D in the XenosRecomp patch).
@@ -4085,7 +4110,7 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
         uint32_t blend = LoadReg(base, dev, rex::graphics::XE_GPU_REG_RB_BLENDCONTROL0);
         if ((blend & 0x1FFF) != 0x0001) {
           srv |= 0x10000000u;
-          sampler = GetSamplerIndex(fetch, sc.smooth, std::log2(bound_scale_));
+          sampler = GetSamplerIndex(fetch, sc.smooth, std::log2(bound_scale_), sc.render_target);
         }
       }
       // PWL gamma in the shader (XenosRecomp CONAN_RECOMP tfetch*).
@@ -6051,6 +6076,13 @@ void Renderer::EndFrameAndPresent(uint32_t front_buffer_address) {
     if (std::find(ab_swaps.begin(), ab_swaps.end(), swap_number_) != ab_swaps.end()) {
       DumpFrameResources(fmt::format("s{:06}_", swap_number_), false, true);
     }
+  }
+  // Filtering A/B: the configured anisotropy from this swap on.
+  if (REXCVAR_GET(sr_native_aniso_from_swap) > 0 &&
+      swap_number_ == uint64_t(REXCVAR_GET(sr_native_aniso_from_swap))) {
+    anisotropy_ = REXCVAR_GET(sr_native_anisotropic_filtering);
+    samplers_.clear();
+    REXLOG_INFO("native: anisotropy {} from swap {}", anisotropy_, swap_number_);
   }
   // Texture replacement A/B: from this swap on, recreate every texture with
   // the replacements (the frames before it use the game's textures).

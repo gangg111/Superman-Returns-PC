@@ -399,7 +399,7 @@ class Renderer : public NativeFrontend {
   // read by tfetch3D, space6); 0 when the fetch has no such view.
   uint32_t GetTextureSrvIndex(uint8_t* base, const uint32_t fetch[6], bool stacked_array = false);
   uint32_t GetSamplerIndex(const uint32_t fetch[6], bool force_linear = false,
-                           float lod_bias = 0.0f);
+                           float lod_bias = 0.0f, bool render_target = false);
   bool UploadConstants(uint8_t* base, uint32_t dev);
   void ApplyFixedFunctionState(uint8_t* base, uint32_t dev);
   bool ScreenSpaceDraw(uint8_t* base, uint32_t dev);
@@ -657,6 +657,7 @@ class Renderer : public NativeFrontend {
     uint32_t stacked_srv = 0;  // array view for tfetch3D of a stacked 2D fetch
     uint64_t frame = ~0ull;
     bool smooth = false;  // point fetch of an upscaled color target -> linear
+    bool render_target = false;  // a resolve texture: no forced anisotropy
   } slot_cache_[16];
   uint64_t edram_write_seq_ = 0;
   HostSurface* bind_set_[5] = {};

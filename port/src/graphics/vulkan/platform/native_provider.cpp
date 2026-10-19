@@ -47,9 +47,13 @@ struct Host {
     VkWin32SurfaceCreateInfoKHR surface_info{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};surface_info.hinstance=window.hinstance();surface_info.hwnd=window.hwnd();VkSurfaceKHR surface=VK_NULL_HANDLE;
     if(!Check(create(context.instance,&surface_info,nullptr,&surface),"Create SDK window surface",e)) return false;
     VkPhysicalDeviceFeatures features{};features.shaderSampledImageArrayDynamicIndexing=features.shaderStorageBufferArrayDynamicIndexing=features.independentBlend=features.shaderClipDistance=features.shaderCullDistance=features.robustBufferAccess=VK_TRUE;
-    features.samplerAnisotropy=config.anisotropy>1?VK_TRUE:VK_FALSE;
+    // Forced anisotropy must skip the render targets the game reads back (shadow
+    // map, depth, glow); the Vulkan descriptor path cannot tell them apart yet, so
+    // it keeps the game's filtering (D3D12: Renderer::GetSamplerIndex).
+    if(config.anisotropy>1) REXLOG_INFO("native Vulkan: forced anisotropy not applied yet (render targets), game filtering");
+    features.samplerAnisotropy=VK_FALSE;
     if(!context.OpenDevice(surface,config.gpu_uuid,e,&features,true,config.frame_generation.enabled)) return false;
-    context.sampler_anisotropy=config.anisotropy;
+    context.sampler_anisotropy=-1;
     if(!(context.selected.queues[context.graphics_family].flags&VK_QUEUE_COMPUTE_BIT)) {e={"Game queue",VK_ERROR_FEATURE_NOT_PRESENT,"Graphics queue must also support compute resolves"};return false;}
     config.shaders.compiler_workers=2;
     shaders=std::make_unique<shaders::VulkanShaderService>(config.shaders,WindowsShaderProcess());
