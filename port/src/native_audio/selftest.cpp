@@ -28,6 +28,7 @@
 #include <rex/system/xmemory.h>
 
 #include "generated/default/superman_returns_init.h"
+#include "native_audio/bridge.h"
 #include "native_audio/effects.h"
 #include "native_audio/engine.h"
 #include "native_audio/plugins.h"
@@ -130,7 +131,9 @@ REX_HOOK_RAW(sub_82659AF0) {
 // set input (dec, &slot{+0 data, +4 frames, +8 flag})
 REX_HOOK_RAW(sub_826592A8) {
   if (!native_audio::g_selftest_decoder) {
+    const uint32_t dec = ctx.r3.u32, slot = ctx.r4.u32;
     __imp__sub_826592A8(ctx, base);
+    native_audio::bridge::OnSetInput(base, dec, slot);
     return;
   }
   const uint32_t data = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + ctx.r4.u32));
@@ -144,7 +147,9 @@ REX_HOOK_RAW(sub_826592A8) {
 // decode (dec, float* planar dst, frames) -> frames written (channel stride = that)
 REX_HOOK_RAW(sub_826592F0) {
   if (!native_audio::g_selftest_decoder) {
+    const uint32_t dec = ctx.r3.u32, dst = ctx.r4.u32;
     __imp__sub_826592F0(ctx, base);
+    native_audio::bridge::OnDecode(base, dec, dst, int32_t(ctx.r3.u32));
     return;
   }
   const uint32_t dec = ctx.r3.u32, dst = ctx.r4.u32;

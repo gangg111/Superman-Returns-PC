@@ -132,6 +132,7 @@ void SndPlayer::Setup(const PlayRequest& req, float id) {
   while (i < 20 && decoder_used_[i]) ++i;
   if (i < 20) decoder_used_[i] = true;
   s->dec_slot = uint8_t(i);
+  if (s->src) s->src->Bind(i);
   pending_.push_back(s);
   error_ = false;
 }
@@ -174,7 +175,7 @@ int SndPlayer::OpenBlock(Sound* s, int block, bool first) {
   sl.state = 1;
   sl.pos = 0;
   sl.block = block;
-  sl.end = (s->src && block < s->src->BlockCount()) ? s->src->BlockFrames(block) : 0;
+  sl.end = (s->src && block < s->src->BlockCount()) ? s->src->OpenBlockFrames(block) : 0;
   sl.sound = s;
   return block + 1;
 }

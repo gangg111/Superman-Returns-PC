@@ -1,0 +1,331 @@
+#include "native_audio/bridge.h"
+
+#include <bit>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <rex/hook.h>
+#include <rex/logging.h>
+#include <rex/ppc.h>
+
+#include "generated/default/superman_returns_init.h"
+#include "native_audio/engine.h"
+#include "native_audio/snd_player.h"
+
+namespace native_audio::bridge {
+
+namespace {
+
+uint32_t R32(const uint8_t* base, uint32_t a) {
+  return __builtin_bswap32(*reinterpret_cast<const uint32_t*>(base + a));
+}
+float RF(const uint8_t* base, uint32_t a) { return std::bit_cast<float>(R32(base, a)); }
+double RD(const uint8_t* base, uint32_t a) {
+  return std::bit_cast<double>((uint64_t(R32(base, a)) << 32) | R32(base, a + 4));
+}
+
+// Samples the game's decoder produced, per (guest player, decoder slot).
+struct Capture {
+  std::deque<uint32_t> blocks;  // frames of each input, in set-input order
+  std::deque<float> frames;     // interleaved
+  int channels = 0;
+};
+
+class CaptureSource;
+
+struct State {
+  std::mutex mutex;
+  Engine engine{48000.0f};
+  uint32_t system = 0;        // guest System*
+  uint32_t master = 0;        // guest voice holding the Dac
+  Voice* native_master = nullptr;
+  std::unordered_map<uint32_t, Voice*> voices;    // guest Voice* -> native
+  std::unordered_map<uint32_t, Plugin*> plugins;  // guest plug-in -> native
+  std::map<std::string, Bus*> buses_by_name;
+  std::vector<uint32_t> players;                  // guest SnP0 plug-ins
+  std::map<std::pair<uint32_t, int>, Capture> captures;
+  // statistics
+  uint64_t blocks = 0, exact = 0, ret_diff = 0, isdone_diff = 0, id_diff = 0, unmapped = 0;
+  double max_diff = 0.0;
+  bool first_logged = false;
+};
+
+State& S() {
+  static State s;
+  return s;
+}
+
+class CaptureSource : public SoundSource {
+ public:
+  CaptureSource(uint32_t player, int channels) : player_(player), channels_(channels) {}
+  int Channels() const override { return channels_; }
+  int BlockCount() const override { return 1 << 30; }
+  int BlockFrames(int) const override { return 1 << 30; }
+  void Bind(int slot) override {
+    slot_ = slot;
+    Capture& c = S().captures[{player_, slot_}];
+    c = Capture{};
+    c.channels = channels_;
+  }
+  int OpenBlockFrames(int) override {
+    Capture& c = S().captures[{player_, slot_}];
+    if (c.blocks.empty()) return 0;
+    const int n = int(c.blocks.front());
+    c.blocks.pop_front();
+    return n;
+  }
+  int Decode(int, int, float* dst, int frames) override {
+    Capture& c = S().captures[{player_, slot_}];
+    const int have = int(c.frames.size()) / (channels_ ? channels_ : 1);
+    const int n = frames < have ? frames : have;
+    for (int i = 0; i < n; ++i)
+      for (int ch = 0; ch < channels_; ++ch) {
+        dst[ch * n + i] = c.frames.front();
+        c.frames.pop_front();
+      }
+    return n;
+  }
+
+ private:
+  uint32_t player_;
+  int channels_;
+  int slot_ = -1;
+};
+
+std::string ReadString(const uint8_t* base, uint32_t p) {
+  std::string s;
+  for (uint32_t i = 0; p && i < 64 && base[p + i]; ++i) s += char(base[p + i]);
+  return s;
+}
+
+}  // namespace
+
+bool Active() {
+  static const bool on = [] {
+    const char* v = std::getenv("SR_NATIVE_AUDIO");
+    return v && std::string(v) == "shadow";
+  }();
+  return on;
+}
+
+void OnVoiceCreate(uint8_t* base, uint32_t count, uint32_t entries, uint32_t gvoice) {
+  if (!Active() || !gvoice) return;
+  State& s = S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!s.system) s.system = R32(base, gvoice + 32);
+  std::vector<Engine::Entry> ne;
+  std::vector<uint32_t> fourcc;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t e = entries + i * 12;
+    const uint32_t desc = R32(base, e + 4);
+    const uint32_t id = desc ? R32(base, desc + 4) : 0;
+    const uint32_t args = R32(base, e);
+    Engine::Entry en{PluginClass(id), int(base[e + 8]), 0.0f};
+    if (args && (id == uint32_t(PluginClass::kSndPlayer) || id == uint32_t(PluginClass::kSend)))
+      en.arg = RF(base, args);
+    ne.push_back(en);
+    fourcc.push_back(id);
+  }
+  Voice* v = s.engine.CreateVoice(ne);
+  if (!v) {
+    ++s.unmapped;
+    return;
+  }
+  s.voices[gvoice] = v;
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t gp = R32(base, gvoice + 72 + i * 4);
+    s.plugins[gp] = v->plugins[i].get();
+    if (fourcc[i] == uint32_t(PluginClass::kDac)) {
+      s.master = gvoice;
+      s.native_master = v;
+    }
+    if (fourcc[i] == uint32_t(PluginClass::kSndPlayer)) s.players.push_back(gp);
+    if (fourcc[i] == uint32_t(PluginClass::kSubMix)) {
+      const uint32_t args = R32(base, entries + i * 12);
+      if (args) s.buses_by_name[ReadString(base, R32(base, args))] = v->plugins[i]->AsBus();
+    }
+  }
+}
+
+void OnVoiceRelease(uint8_t*, uint32_t gvoice) {
+  if (!Active()) return;
+  State& s = S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  auto it = s.voices.find(gvoice);
+  if (it == s.voices.end()) return;
+  s.engine.ReleaseVoice(it->second);
+}
+
+void OnSetParam(uint8_t*, uint32_t plugin, uint32_t index, float value) {
+  if (!Active()) return;
+  State& s = S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  auto it = s.plugins.find(plugin);
+  if (it != s.plugins.end()) s.engine.SetParam(it->second, int(index), value);
+}
+
+void OnControl(uint8_t* base, uint32_t plugin, uint32_t index, uint32_t data) {
+  if (!Active()) return;
+  State& s = S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  auto it = s.plugins.find(plugin);
+  if (it == s.plugins.end()) return;
+  Plugin* p = it->second;
+  switch (p->cls) {
+    case PluginClass::kSndPlayer: {
+      auto* player = static_cast<SndPlayer*>(p);
+      if (index != 0) {
+        player->Stop();
+        break;
+      }
+      PlayRequest r;
+      r.start_time = RD(base, data);
+      r.stream_offset = RD(base, data + 8);
+      const uint32_t snr = R32(base, data + 20);
+      if (snr) std::memcpy(r.snr, base + snr, 16);
+      r.flag = RF(base, data + 28);
+      const int sound_ch = int(((R32(base, snr) >> 18) & 0x3F) + 1);
+      r.source = std::make_shared<CaptureSource>(plugin, sound_ch);
+      const float id = player->Start(r);
+      if (R32(base, data + 32) != std::bit_cast<uint32_t>(id)) ++s.id_diff;
+      break;
+    }
+    case PluginClass::kSend:
+    case PluginClass::kRoute: {
+      if (p->cls == PluginClass::kSend && index != 0) {  // attach by bus name
+        auto b = s.buses_by_name.find(ReadString(base, data));
+        s.engine.AttachToBus(p, b == s.buses_by_name.end() ? nullptr : b->second);
+        break;
+      }
+      const uint32_t gbus = data ? R32(base, data) : 0;
+      Bus* bus = nullptr;
+      if (gbus) {
+        auto b = s.plugins.find(gbus);
+        if (b != s.plugins.end()) bus = b->second->AsBus();
+      }
+      if (p->cls == PluginClass::kRoute)
+        s.engine.AttachToBus(p, bus, int(RF(base, data + 4)), int(RF(base, data + 8)),
+                             int(RF(base, data + 12)));
+      else
+        s.engine.AttachToBus(p, bus);
+      break;
+    }
+    case PluginClass::kDac:
+      if (index == 3) s.engine.Enqueue([&s] { s.engine.dac_fade = true; });
+      break;
+    case PluginClass::kVuMeter:
+      s.engine.Enqueue([p] { p->Control(0); });
+      break;
+    default:
+      break;
+  }
+}
+
+void OnIsDone(uint8_t*, uint32_t plugin, bool guest) {
+  if (!Active()) return;
+  State& s = S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  auto it = s.plugins.find(plugin);
+  if (it == s.plugins.end()) return;
+  if (static_cast<SndPlayer*>(it->second)->IsDone() != guest) ++s.isdone_diff;
+}
+
+// --------------------------------------------------------------- capture
+
+namespace {
+std::pair<uint32_t, int> FindDecoder(const uint8_t* base, State& s, uint32_t dec) {
+  for (uint32_t p : s.players)
+    for (int i = 0; i < 20; ++i)
+      if (R32(base, p + 136 + 8 * i) == dec) return {p, i};
+  return {0, -1};
+}
+}  // namespace
+
+void OnSetInput(uint8_t* base, uint32_t dec, uint32_t slot) {
+  if (!Active()) return;
+  State& s = S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  const auto key = FindDecoder(base, s, dec);
+  if (key.second < 0) return;
+  s.captures[key].blocks.push_back(R32(base, slot + 4));
+}
+
+void OnDecode(uint8_t* base, uint32_t dec, uint32_t dst, int frames) {
+  if (!Active() || frames <= 0) return;
+  State& s = S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  const auto key = FindDecoder(base, s, dec);
+  if (key.second < 0) return;
+  Capture& c = s.captures[key];
+  const int ch = base[dec + 8];
+  for (int i = 0; i < frames; ++i)
+    for (int k = 0; k < ch; ++k) c.frames.push_back(RF(base, dst + uint32_t(k * frames + i) * 4));
+}
+
+}  // namespace native_audio::bridge
+
+using namespace native_audio::bridge;
+
+// System drain (once per mixed block on the Dac thread): the native queue too.
+REX_HOOK_RAW(sub_8264C540) {
+  const uint32_t sys = ctx.r3.u32;
+  __imp__sub_8264C540(ctx, base);
+  if (!Active()) return;
+  auto& s = native_audio::bridge::S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (s.system && sys == s.system) s.engine.Drain();
+}
+
+// Voice graph executor: after the original renders the master voice, render
+// the native graph for the same block and compare the master bus outputs.
+REX_HOOK_RAW(sub_8265A148) {
+  const uint32_t voice = ctx.r3.u32, io = ctx.r4.u32;
+  __imp__sub_8265A148(ctx, base);
+  if (!Active()) return;
+  auto& s = native_audio::bridge::S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (!s.native_master || voice != s.master) return;
+  const int gret = int32_t(ctx.r3.u32);
+  s.engine.clock = RD(base, s.system);
+  const int nret = s.engine.RenderGraph(s.native_master, s.engine.io);
+  ++s.blocks;
+  if (gret != nret) {
+    ++s.ret_diff;
+  } else if (gret == 1) {
+    const uint32_t cur = R32(base, io + 4 + 4 * base[io + 28]);
+    const float* n = s.engine.io.Cur();
+    size_t diff = 0;
+    double md = 0.0;
+    for (int i = 0; i < 6 * 256; ++i) {
+      const uint32_t gv = R32(base, cur + uint32_t(i) * 4);
+      if (gv != std::bit_cast<uint32_t>(n[i])) {
+        ++diff;
+        md = std::max(md, std::fabs(double(std::bit_cast<float>(gv)) - double(n[i])));
+      }
+    }
+    if (!diff) {
+      ++s.exact;
+    } else {
+      s.max_diff = std::max(s.max_diff, md);
+      if (!s.first_logged) {
+        s.first_logged = true;
+        REXAPU_INFO("native audio shadow: first difference at block {}: {} samples, max {}",
+                    s.blocks, diff, md);
+      }
+    }
+  } else {
+    ++s.exact;
+  }
+  if (s.blocks % 1000 == 0)
+    REXAPU_INFO("native audio shadow: {} blocks, {} exact, {} return diffs, max abs diff {}, "
+                "IsDone diffs {}, id diffs {}, unmapped voices {}",
+                s.blocks, s.exact, s.ret_diff, s.max_diff, s.isdone_diff, s.id_diff, s.unmapped);
+}

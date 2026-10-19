@@ -21,6 +21,7 @@
 #include <rex/hook.h>
 
 #include "generated/default/superman_returns_init.h"
+#include "native_audio/bridge.h"
 
 namespace {
 
@@ -85,6 +86,7 @@ REX_HOOK_RAW(sub_82650398) {
   Log& log = Get();
   const uint32_t count = ctx.r3.u32, entries = ctx.r4.u32;
   __imp__sub_82650398(ctx, base);
+  native_audio::bridge::OnVoiceCreate(base, count, entries, ctx.r3.u32);
   if (!log.file) return;
   const uint32_t voice = ctx.r3.u32;
   std::lock_guard<std::mutex> lock(log.mutex);
@@ -114,7 +116,9 @@ REX_HOOK_RAW(sub_826505B8) {
     std::snprintf(buf, sizeof(buf), "Voice::Release voice=%08X", ctx.r3.u32);
     Write(log, ctx, buf);
   }
+  const uint32_t voice = ctx.r3.u32;
   __imp__sub_826505B8(ctx, base);
+  native_audio::bridge::OnVoiceRelease(base, voice);
 }
 
 // Plugin::SetParamF(plugin, index, f1 value)
@@ -126,7 +130,10 @@ REX_HOOK_RAW(sub_8264CE48) {
     std::snprintf(buf, sizeof(buf), " param=%u value=%g", ctx.r4.u32, ctx.f1.f64);
     Write(log, ctx, "Plugin::SetParamF " + Plugin(log, ctx.r3.u32) + buf);
   }
+  const uint32_t plugin = ctx.r3.u32, index = ctx.r4.u32;
+  const float value = float(ctx.f1.f64);
   __imp__sub_8264CE48(ctx, base);
+  native_audio::bridge::OnSetParam(base, plugin, index, value);
 }
 
 // Plugin::Control(plugin, index, void* data)
@@ -177,7 +184,9 @@ REX_HOOK_RAW(sub_8264CE18) {
     }
     Write(log, ctx, line);
   }
+  const uint32_t plugin = ctx.r3.u32, index = ctx.r4.u32, data = ctx.r5.u32;
   __imp__sub_8264CE18(ctx, base);
+  native_audio::bridge::OnControl(base, plugin, index, data);
 }
 
 // Stream::QueueHandle(channel, loop, source) -> request handle
@@ -249,6 +258,7 @@ REX_HOOK_RAW(sub_82653E70) {
   Log& log = Get();
   const uint32_t player = ctx.r3.u32;
   __imp__sub_82653E70(ctx, base);
+  native_audio::bridge::OnIsDone(base, player, (ctx.r3.u32 & 0xFF) != 0);
   if (!log.file) return;
   static std::unordered_map<uint32_t, uint32_t> last;
   std::lock_guard<std::mutex> lock(log.mutex);

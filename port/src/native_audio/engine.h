@@ -57,6 +57,8 @@ class Plugin {
   virtual void AttachToBus(Bus* /*bus*/, int /*src*/, int /*dst*/, int /*count*/) {}
   // vtbl[0], called when the voice is destroyed (sub_826501D0).
   virtual void Release() {}
+  // Control(index) for the classes whose control carries no data (VuMeter reset).
+  virtual void Control(int /*index*/) {}
 
   PluginClass cls;
   int in_channels = 0;   // +28

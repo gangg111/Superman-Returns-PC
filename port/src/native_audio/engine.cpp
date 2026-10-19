@@ -138,6 +138,7 @@ class VuPlugin : public Plugin {
     if (i >= 0 && i < 18) v.params[i] = x;
   }
   double GetParam(int i) const override { return (i >= 0 && i < 18) ? v.params[i] : 0.0; }
+  void Control(int) override { v.Reset(); }
   VuMeter v;
 };
 

@@ -26,6 +26,11 @@ class SoundSource {
   // Writes `frames` planar frames (channel stride = frames) of block `block`
   // starting at `offset` into dst; returns the frames written.
   virtual int Decode(int block, int offset, float* dst, int frames) = 0;
+  // Frames of a block when the player opens it (one call per open, in the
+  // order the game's decoder receives its inputs).
+  virtual int OpenBlockFrames(int block) { return BlockFrames(block); }
+  // The player's decoder slot for this sound (+77), known at request setup.
+  virtual void Bind(int /*decoder_slot*/) {}
 };
 
 // The start request the game passes to Control(0) (sub_82654A98).
