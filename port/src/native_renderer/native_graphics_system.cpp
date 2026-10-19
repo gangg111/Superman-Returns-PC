@@ -215,6 +215,7 @@ rex::X_STATUS D3D12NativeGraphicsSystem::SetupPresentation(rex::ui::WindowedAppC
   config.shaders.library=exe_dir/"superman_returns_vulkan.srvk";
   config.gpu_uuid=rex::cvar::Query<std::string>("sr_native_vulkan_gpu_uuid");
   config.frame_generation.enabled=rex::cvar::Query<bool>("sr_lsfg");
+  config.anisotropy=rex::cvar::Query<int32_t>("sr_native_anisotropic_filtering");
   config.frame_generation.dll=std::filesystem::u8path(rex::cvar::Query<std::string>("sr_lsfg_dll"));
   config.frame_generation.performance=rex::cvar::Query<std::string>("sr_lsfg_mode")=="performance";
   provider_=graphics::vulkan::CreateNativeVulkanProvider(std::move(config));

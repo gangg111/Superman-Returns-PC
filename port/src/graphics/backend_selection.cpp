@@ -18,7 +18,6 @@ bool ValidateNativeApi(NativeApi api,bool compiled,const NativeVulkanOptions& op
   else if(options.msaa_samples!=1) error="Native Vulkan currently requires sr_native_msaa_samples=1";
   else if(options.shadow_quality!=1) error="Native Vulkan currently requires sr_native_shadow_quality=1";
   else if(options.bloom_quality!=1) error="Native Vulkan currently requires sr_native_bloom_quality=1";
-  else if(options.anisotropic_filtering!=-1) error="Native Vulkan currently requires guest anisotropic filtering (sr_native_anisotropic_filtering=-1)";
   else if(options.foliage_antialiasing) error="Native Vulkan does not yet support sr_native_foliage_antialiasing";
   return error.empty();
 }

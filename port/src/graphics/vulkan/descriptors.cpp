@@ -102,7 +102,7 @@ bool BuildBindings(const guest::DrawPacket& draw,std::byte* block,DrawBindings& 
   }
   error={};return true;
 }
-bool PlanSampler(std::span<const uint32_t,6> fetch,const VkPhysicalDeviceFeatures& features,
+bool PlanSampler(std::span<const uint32_t,6> fetch,int anisotropy_override,const VkPhysicalDeviceFeatures& features,
                  const VkPhysicalDeviceLimits& limits,bool mirror_clamp,VkSamplerCreateInfo& out,Error& e) {
   VkSamplerCreateInfo next{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
   auto address=[&](uint32_t mode,VkSamplerAddressMode& result) {
@@ -122,11 +122,19 @@ bool PlanSampler(std::span<const uint32_t,6> fetch,const VkPhysicalDeviceFeature
   next.minFilter=((fetch[3]>>21)&3)==1?VK_FILTER_LINEAR:VK_FILTER_NEAREST;
   next.mipmapMode=((fetch[3]>>23)&3)==1?VK_SAMPLER_MIPMAP_MODE_LINEAR:VK_SAMPLER_MIPMAP_MODE_NEAREST;
   uint32_t aniso=(fetch[3]>>25)&7;
-  if(aniso>1) {
+  uint32_t max_aniso=aniso>1?std::min(16u,1u<<(aniso-1)):1u;
+  // Same rule as the D3D12 path (Renderer::GetSamplerIndex): a forced level
+  // applies to filtered textures, point-sampled lookups stay point-sampled.
+  const bool filtered=next.magFilter==VK_FILTER_LINEAR||next.minFilter==VK_FILTER_LINEAR||aniso>1;
+  if(anisotropy_override>=1 && filtered) max_aniso=uint32_t(std::min(anisotropy_override,16));
+  if(max_aniso>1) {
     if(!features.samplerAnisotropy || limits.maxSamplerAnisotropy<1) {
       e={"Sampler",VK_ERROR_FEATURE_NOT_PRESENT,"Guest sampler needs enabled anisotropy"};return false;
     }
-    next.anisotropyEnable=VK_TRUE;next.maxAnisotropy=std::min(float(std::min(16u,1u<<(aniso-1))),limits.maxSamplerAnisotropy);
+    next.anisotropyEnable=VK_TRUE;next.maxAnisotropy=std::min(float(max_aniso),limits.maxSamplerAnisotropy);
+    next.magFilter=next.minFilter=VK_FILTER_LINEAR;next.mipmapMode=VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  } else if(aniso>1) {
+    // Guest asked for anisotropy, the setting turned it off: trilinear.
     next.magFilter=next.minFilter=VK_FILTER_LINEAR;next.mipmapMode=VK_SAMPLER_MIPMAP_MODE_LINEAR;
   }
   // Match the reference's original-scale sampler. Fetch LOD bias is emitted

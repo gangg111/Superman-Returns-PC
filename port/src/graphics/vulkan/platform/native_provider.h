@@ -9,6 +9,7 @@ struct NativeProviderConfig {
   std::string gpu_uuid;
   bool validation=false,vsync=true;
   FrameGenerationConfig frame_generation;
+  int anisotropy=-1;  // sr_native_anisotropic_filtering
 };
 std::unique_ptr<rex::ui::GraphicsProvider> CreateNativeVulkanProvider(NativeProviderConfig);
 }

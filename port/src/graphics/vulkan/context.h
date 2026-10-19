@@ -35,6 +35,8 @@ public:
   VkPhysicalDeviceMemoryProperties memory{};
   VkPhysicalDeviceFeatures enabled_features{};
   bool mirror_clamp_enabled=false;
+  // Filtered-texture anisotropy: -1 = what the guest asks for, 1 = off, 2..16 forced.
+  int sampler_anisotropy=-1;
   bool timeline_enabled=false;
   std::atomic<uint32_t> validation_errors{0};
   bool validation_active = false;

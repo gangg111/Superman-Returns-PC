@@ -35,7 +35,7 @@ bool RemapTextureBindings(std::span<const TextureBindingRequest>,DrawBindings&,E
 // copy_banks: bit 0 VS, bit 1 PS; omitted banks must be bound to a prior
 // immutable slice by the caller. Shared metadata is always rebuilt.
 bool BuildBindings(const guest::DrawPacket&,std::byte* block,DrawBindings& bindings,Error&,uint32_t copy_banks=3);
-bool PlanSampler(std::span<const uint32_t,6>,const VkPhysicalDeviceFeatures&,
+bool PlanSampler(std::span<const uint32_t,6>,int anisotropy_override,const VkPhysicalDeviceFeatures&,
                  const VkPhysicalDeviceLimits&,bool mirror_clamp,
                  VkSamplerCreateInfo&,Error&);
 } // namespace superman_returns::graphics::vulkan

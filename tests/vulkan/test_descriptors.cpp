@@ -231,21 +231,41 @@ SR_TEST(sampler_plan_preserves_fetch_filters_and_address_modes) {
   fetch[3]=(1u<<19)|(1u<<23);
   VkPhysicalDeviceFeatures features{};VkPhysicalDeviceLimits limits{};
   VkSamplerCreateInfo info{};Error e;
-  SR_CHECK(PlanSampler(fetch,features,limits,false,info,e));
+  SR_CHECK(PlanSampler(fetch,-1,features,limits,false,info,e));
   SR_CHECK(info.addressModeU==VK_SAMPLER_ADDRESS_MODE_REPEAT);
   SR_CHECK(info.addressModeV==VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT);
   SR_CHECK(info.addressModeW==VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
   SR_CHECK(info.magFilter==VK_FILTER_LINEAR);SR_CHECK(info.minFilter==VK_FILTER_NEAREST);
   SR_CHECK(info.mipmapMode==VK_SAMPLER_MIPMAP_MODE_LINEAR);
   fetch[0]=3u<<10;
-  SR_CHECK(!PlanSampler(fetch,features,limits,false,info,e));
-  SR_CHECK(PlanSampler(fetch,features,limits,true,info,e));
+  SR_CHECK(!PlanSampler(fetch,-1,features,limits,false,info,e));
+  SR_CHECK(PlanSampler(fetch,-1,features,limits,true,info,e));
   SR_CHECK(info.addressModeU==VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE);
   fetch[0]=0;fetch[3]=3u<<25;
-  SR_CHECK(!PlanSampler(fetch,features,limits,false,info,e));
+  SR_CHECK(!PlanSampler(fetch,-1,features,limits,false,info,e));
   features.samplerAnisotropy=true;limits.maxSamplerAnisotropy=16;
-  SR_CHECK(PlanSampler(fetch,features,limits,false,info,e));
+  SR_CHECK(PlanSampler(fetch,-1,features,limits,false,info,e));
   SR_CHECK(info.anisotropyEnable);SR_CHECK_EQ(info.maxAnisotropy,4u);
+}
+SR_TEST(sampler_plan_forced_anisotropy_applies_to_filtered_only) {
+  std::array<uint32_t,6> fetch{};
+  VkPhysicalDeviceFeatures features{};features.samplerAnisotropy=true;
+  VkPhysicalDeviceLimits limits{};limits.maxSamplerAnisotropy=16;
+  VkSamplerCreateInfo info{};Error e;
+  // Bilinear guest sampler (min and mag linear, no anisotropy requested), forced 16x:
+  // anisotropic, 16 (source: sr_native_anisotropic_filtering semantics, D3D12 GetSamplerIndex).
+  fetch[3]=(1u<<19)|(1u<<21);
+  SR_CHECK(PlanSampler(fetch,16,features,limits,false,info,e));
+  SR_CHECK(info.anisotropyEnable);SR_CHECK_EQ(info.maxAnisotropy,16u);
+  SR_CHECK(info.mipmapMode==VK_SAMPLER_MIPMAP_MODE_LINEAR);
+  // Point-sampled guest sampler stays point sampled, no anisotropy.
+  fetch[3]=0;
+  SR_CHECK(PlanSampler(fetch,16,features,limits,false,info,e));
+  SR_CHECK(!info.anisotropyEnable);SR_CHECK(info.magFilter==VK_FILTER_NEAREST);
+  // Guest asks for 4x, setting 1 (off): trilinear without anisotropy.
+  fetch[3]=3u<<25;
+  SR_CHECK(PlanSampler(fetch,1,features,limits,false,info,e));
+  SR_CHECK(!info.anisotropyEnable);SR_CHECK(info.minFilter==VK_FILTER_LINEAR);
 }
 SR_TEST(draw_bindings_gamma_matches_reference_rgb_sign_rule) {
   guest::DrawPacket packet;packet.texture_fetch[0][0]=2|(3<<2);packet.texture_fetch[0][5]=1<<9;

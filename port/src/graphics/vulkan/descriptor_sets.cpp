@@ -37,7 +37,7 @@ std::shared_ptr<SamplerResource> DescriptorStore::Sampler(std::span<const uint32
   std::array<uint32_t,2> key{fetch[0]&0x7fc00u,fetch[3]&0xff80000u};
   if(auto found=samplers_.find(key);found!=samplers_.end()) return found->second;
   VkSamplerCreateInfo info{};
-  if(!PlanSampler(fetch,c_.enabled_features,c_.properties.limits,c_.mirror_clamp_enabled,info,e)) return {};
+  if(!PlanSampler(fetch,c_.sampler_anisotropy,c_.enabled_features,c_.properties.limits,c_.mirror_clamp_enabled,info,e)) return {};
   if(samplers_.size()>=c_.properties.limits.maxSamplerAllocationCount) {
     e={"Sampler cache",VK_ERROR_TOO_MANY_OBJECTS,"Sampler allocation limit exhausted"};return {};
   }
