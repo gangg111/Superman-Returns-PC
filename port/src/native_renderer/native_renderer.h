@@ -436,6 +436,11 @@ class Renderer : public NativeFrontend {
   static constexpr uint32_t kOutputHeight = profile::kOutputHeight;
   static constexpr size_t kUploadBytesPerFrame = 128u << 20;
   static constexpr uint32_t kSrvHeapSize = 32768;
+  // Ray-traced sun shadows (docs/cienie-rt-projekt.md): fixed descriptors the
+  // receivers address directly (SR_RT_FRAME_INDEX in XenosRecomp patch 0017).
+  static constexpr uint32_t kRtFrameSrv = kSrvHeapSize - 2;
+  static constexpr uint32_t kRtTlasSrv = kSrvHeapSize - 1;
+  static constexpr uint32_t kSrvAllocLimit = kSrvHeapSize - 2;
   static constexpr uint32_t kSamplerHeapSize = 2048;
   static constexpr uint32_t kRtvHeapSize = 256;
   static constexpr uint32_t kDsvHeapSize = 64;
@@ -485,6 +490,11 @@ class Renderer : public NativeFrontend {
   // SSAO graphics option (EXP-045): after the opaque scene, before End Tiling.
   void CaptureCamera();
   void ApplySsao();
+  // Ray-traced shadows: per-frame data (inverse cascade-0 light matrix).
+  void UpdateRtFrame(uint8_t* base);
+  Microsoft::WRL::ComPtr<ID3D12Resource> rt_frame_buffer_;
+  D3D12_RESOURCE_STATES rt_frame_state_ = D3D12_RESOURCE_STATE_COMMON;
+  uint64_t rt_frame_swap_ = ~0ull;
   bool ssao_ = false;
   HostSurface* scene_rt_ = nullptr;  // HDR scene target of the Opaque pass
   HostSurface* scene_ds_ = nullptr;

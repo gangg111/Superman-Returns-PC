@@ -225,6 +225,10 @@ REXCVAR_DEFINE_DOUBLE(sr_native_render_scale, 0.0, "Superman Returns Native",
                       "1.5 = 1080p, 2 = 1440p, 3 = 2160p, 4 = 2880p); 0 = automatic, the "
                       "primary display's physical height / 720")
     .range(0.0, 4.0);
+REXCVAR_DEFINE_INT32(sr_rt_shadow_debug, 0, "Superman Returns Native",
+                     "Ray-traced shadows debug view: 0 = off, 1 = the sun shadow receivers paint "
+                     "their world position as a 10-unit grid (docs/cienie-rt-projekt.md)")
+    .range(0, 1);
 REXCVAR_DEFINE_INT32(sr_native_shadow_quality, 4, "Superman Returns Native",
                      "Shadow map resolution multiplier (1 = original 1024, 2 = 2048, 4 = 4096)")
     .range(1, 4);
@@ -1262,7 +1266,7 @@ bool Renderer::EnsureInitialized() {
 
 bool Renderer::CreateDrawResources() {
   // --- Main root signature: 3 root CBVs + bindless SRV/sampler tables. ---
-  D3D12_DESCRIPTOR_RANGE srv_ranges[5] = {};
+  D3D12_DESCRIPTOR_RANGE srv_ranges[6] = {};
   for (uint32_t i = 0; i < 3; ++i) {
     srv_ranges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     srv_ranges[i].NumDescriptors = kSrvHeapSize;
@@ -1299,8 +1303,13 @@ bool Renderer::CreateDrawResources() {
   srv_ranges[4].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
   srv_ranges[4].NumDescriptors = kSrvHeapSize;
   srv_ranges[4].RegisterSpace = 6;
+  // space9: raw buffers (ray-traced shadow frame data at kRtFrameSrv), same heap.
+  srv_ranges[5].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  srv_ranges[5].NumDescriptors = kSrvHeapSize;
+  srv_ranges[5].RegisterSpace = 9;
+  srv_ranges[5].OffsetInDescriptorsFromTableStart = 0;
   params[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  params[8].DescriptorTable.NumDescriptorRanges = 1;
+  params[8].DescriptorTable.NumDescriptorRanges = 2;
   params[8].DescriptorTable.pDescriptorRanges = &srv_ranges[4];
   params[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   rs_desc.NumParameters = 9;
@@ -1615,7 +1624,7 @@ uint32_t Renderer::AllocSrvIndex() {
     retired_srvs_.erase(retired_srvs_.begin());
     return index;
   }
-  return srv_heap_next_ < kSrvHeapSize ? srv_heap_next_++ : 0;
+  return srv_heap_next_ < kSrvAllocLimit ? srv_heap_next_++ : 0;
 }
 
 bool Renderer::Upload(size_t size, size_t alignment, UploadAlloc& out) {
@@ -2204,6 +2213,82 @@ void Renderer::CaptureCamera() {
   }
   std::memcpy(inv_view_proj_, c, sizeof(inv_view_proj_));
   camera_valid_ = true;
+}
+
+namespace {
+struct ShadowRegs {
+  uint64_t hash;
+  uint32_t u, v, z;
+};
+constexpr ShadowRegs kShadowRegs[] = {
+#include "shadow_regs.inc"
+};
+}  // namespace
+
+// Ray-traced shadows: once per frame, from the first draw whose vertex shader
+// carries the sun light matrix rows (shadowMapU/V/Z; oTexCoord7 = M * world),
+// upload the inverse so the receivers map iTexCoord7 back to world space.
+void Renderer::UpdateRtFrame(uint8_t* base) {
+  (void)base;
+  const ShadowRegs* end = std::end(kShadowRegs);
+  const ShadowRegs* it = std::lower_bound(std::begin(kShadowRegs), end, current_vs_hash_,
+                                          [](const ShadowRegs& e, uint64_t h) { return e.hash < h; });
+  if (it == end || it->hash != current_vs_hash_) return;
+  if (rt_frame_swap_ == swap_number_) return;
+  if (!rt_frame_buffer_) {
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 256;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rt_frame_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
+    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, rt_frame_state_,
+                                                nullptr, IID_PPV_ARGS(&rt_frame_buffer_)))) {
+      return;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.NumElements = 64;
+    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    device_->CreateShaderResourceView(
+        rt_frame_buffer_.Get(), &srv,
+        provider_->OffsetViewDescriptor(srv_heap_->GetCPUDescriptorHandleForHeapStart(), kRtFrameSrv));
+  }
+  const float* c = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase);
+  float m[16] = {};
+  for (int k = 0; k < 4; ++k) {
+    m[k] = c[it->u * 4 + k];
+    m[4 + k] = c[it->v * 4 + k];
+    m[8 + k] = c[it->z * 4 + k];
+  }
+  m[15] = 1.0f;
+  float inv[16];
+  if (!Invert4x4(m, inv)) return;
+  UploadAlloc up;
+  if (!Upload(256, 256, up)) return;
+  uint32_t* data = reinterpret_cast<uint32_t*>(up.cpu);
+  std::memset(data, 0, 256);
+  std::memcpy(data, inv, 48);
+  data[16] = uint32_t(REXCVAR_GET(sr_rt_shadow_debug));
+  data[17] = 1;
+  Transition(rt_frame_buffer_.Get(), rt_frame_state_, D3D12_RESOURCE_STATE_COPY_DEST);
+  command_list_->CopyBufferRegion(rt_frame_buffer_.Get(), 0, up.resource, up.offset, 256);
+  Transition(rt_frame_buffer_.Get(), rt_frame_state_,
+             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  rt_frame_swap_ = swap_number_;
+  static int logged = 0;
+  if (logged++ < 3) {
+    REXLOG_INFO("native: rt frame light rows ({:.4f} {:.4f} {:.4f} {:.4f}) ({:.4f} {:.4f} {:.4f} {:.4f}) "
+                "({:.4f} {:.4f} {:.4f} {:.4f}) from vs {:016X}", m[0], m[1], m[2], m[3], m[4], m[5],
+                m[6], m[7], m[8], m[9], m[10], m[11], current_vs_hash_);
+  }
 }
 
 void Renderer::ApplySsao() {
@@ -3937,6 +4022,7 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
   CpuTimer float_timer(cpu_timings.constant_float_ns);
   if(CpuProfiling()) ++cpu_timings.constant_draws;
   FlushRingConstants(base, dev);
+  UpdateRtFrame(base);
   const bool cache_shared = SharedConstantsCaching();
   UploadAlloc shared;
   if (!cache_shared && !Upload(4096, 256, shared)) return false;
