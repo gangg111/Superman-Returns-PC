@@ -17,6 +17,7 @@
 #include "texture_write_audit.h"
 #include "texture_content.h"
 #include "texture_hash_replay.h"
+#include "texture_replace.h"
 #include "texture_source_probe.h"
 #include "../graphics/guest/render_state.h"
 #include "../graphics/guest/edram_alias.h"
@@ -261,8 +262,9 @@ REXCVAR_DEFINE_BOOL(sr_native_fxaa, false, "Superman Returns Native",
 REXCVAR_DEFINE_INT32(sr_native_bloom_quality, 1, "Superman Returns Native",
                      "Resolution multiplier of small post-process targets (bloom): 1 = original, 2, 4")
     .range(1, 4);
-REXCVAR_DEFINE_INT32(sr_native_anisotropic_filtering, -1, "Superman Returns Native",
-                     "Anisotropic filtering for filtered textures (-1 = game, 1 = off, 2, 4, 8, 16)")
+REXCVAR_DEFINE_INT32(sr_native_anisotropic_filtering, 16, "Superman Returns Native",
+                     "Anisotropic filtering for filtered textures (-1 = game, 1 = off, 2, 4, 8, 16); "
+                     "the game asks for none, 16 is the remaster default")
     .range(-1, 16);
 REXCVAR_DEFINE_INT32(sr_native_debug_rs_salt, 0, "Superman Returns Native",
                      "Debug: add an unused root constant block of N dwords (1-32) so every "
@@ -3472,12 +3474,30 @@ uint32_t Renderer::CreateTexture(const uint32_t fetch[6], TextureEntry& entry) {
     }
     return 0;
   }
+  // Remaster textures (texture_replace.h): dump by content name, and upload a
+  // replacement of the same name instead of the game's texture.
+  if (!cube && !volume) {
+    const std::string tex_name = TextureName(pre_hash, decoded);
+    DumpTextureOnce(tex_name, decoded,
+                    IsGammaFetch(fetch) && REXCVAR_GET(sr_native_texture_gamma) == 1);
+    DecodedTexture replacement;
+    if (LoadReplacement(tex_name, replacement)) {
+      static uint32_t replaced = 0;
+      if (++replaced <= 64)
+        REXLOG_INFO("textures: {} replaced ({}x{} -> {}x{}, dxgi {})", tex_name, decoded.width,
+                    decoded.height, replacement.width, replacement.height, int(replacement.format));
+      // Authored after the fetch swizzle: identity mapping.
+      replacement.guest_format = decoded.guest_format;
+      replacement.base_address = decoded.base_address;
+      replacement.base_size = decoded.base_size;
+      decoded = std::move(replacement);
+    }
+  }
   D3D12_HEAP_PROPERTIES heap{};
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC desc{};
   desc.Dimension = volume ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  bool block_compressed = decoded.format >= DXGI_FORMAT_BC1_TYPELESS &&
-                          decoded.format <= DXGI_FORMAT_BC5_SNORM;
+  bool block_compressed = IsBlockCompressed(decoded.format);
   desc.Width = block_compressed ? (decoded.width + 3) & ~3u : decoded.width;
   desc.Height = block_compressed ? (decoded.height + 3) & ~3u : decoded.height;
   desc.DepthOrArraySize = uint16_t(decoded.depth);
@@ -3508,6 +3528,10 @@ uint32_t Renderer::CreateTexture(const uint32_t fetch[6], TextureEntry& entry) {
       case DXGI_FORMAT_BC3_UNORM:
         resource_format = DXGI_FORMAT_BC3_TYPELESS;
         srv_format = DXGI_FORMAT_BC3_UNORM_SRGB;
+        break;
+      case DXGI_FORMAT_BC7_UNORM:  // replacement textures
+        resource_format = DXGI_FORMAT_BC7_TYPELESS;
+        srv_format = DXGI_FORMAT_BC7_UNORM_SRGB;
         break;
       default:
         break;
@@ -6011,6 +6035,17 @@ void Renderer::EndFrameAndPresent(uint32_t front_buffer_address) {
     if (std::find(ab_swaps.begin(), ab_swaps.end(), swap_number_) != ab_swaps.end()) {
       DumpFrameResources(fmt::format("s{:06}_", swap_number_), false, true);
     }
+  }
+  // Texture replacement A/B: from this swap on, recreate every texture with
+  // the replacements (the frames before it use the game's textures).
+  if (ReplaceFromSwap() && swap_number_ == ReplaceFromSwap()) {
+    for (auto& [key, entry] : textures_) {
+      Retire(entry.resource);
+      RetireSrvIndex(entry.srv_index);
+    }
+    textures_.clear();
+    SetReplacementsEnabled(true);
+    REXLOG_INFO("textures: replacements on from swap {}", swap_number_);
   }
   std::memset(pass_draw_index_, 0, sizeof(pass_draw_index_));
   if (trace_state_ == 1) {
