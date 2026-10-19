@@ -259,6 +259,7 @@ REX_HOOK_RAW(sub_82653E70) {
   const uint32_t player = ctx.r3.u32;
   __imp__sub_82653E70(ctx, base);
   native_audio::bridge::OnIsDone(base, player, (ctx.r3.u32 & 0xFF) != 0);
+  if (const int v = native_audio::bridge::IsDoneOverride(player); v >= 0) ctx.r3.u64 = uint32_t(v);
   if (!log.file) return;
   static std::unordered_map<uint32_t, uint32_t> last;
   std::lock_guard<std::mutex> lock(log.mutex);

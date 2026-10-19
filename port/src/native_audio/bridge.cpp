@@ -15,6 +15,8 @@
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/ppc.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xmemory.h>
 
 #include "generated/default/superman_returns_init.h"
 #include "native_audio/bank_source.h"
@@ -129,14 +131,23 @@ std::string ModeName() {
 // (<exe dir>/native_audio or SR_NATIVE_AUDIO_DIR) instead of the captured
 // decoder output; unresolved sounds fall back to the capture.
 bool BankMode() {
-  static const bool on = ModeName() == "shadow-bank" || ModeName() == "native";
+  static const bool on =
+      ModeName() == "shadow-bank" || ModeName() == "native" || ModeName() == "full";
+  return on;
+}
+
+// full: the original engine no longer renders (no executor, DSP or XMA); the
+// game reads its audio state (IsDone, positions, voice release) from the
+// native engine. The guest command queue is still drained (System+20).
+bool FullMode() {
+  static const bool on = ModeName() == "full";
   return on;
 }
 
 // native: what reaches the speakers is the native engine's mix (bank sounds);
 // the original engine still runs alongside for now (game-visible state).
 bool NativeOutput() {
-  static const bool on = ModeName() == "native";
+  static const bool on = ModeName() == "native" || ModeName() == "full";
   return on;
 }
 
@@ -254,7 +265,7 @@ std::shared_ptr<SoundSource> FromBank(uint8_t* base, State& s, uint32_t req, uin
 bool Active() {
   static const bool on = [] {
     const std::string m = ModeName();
-    return m == "shadow" || m == "shadow-bank" || m == "native";
+    return m == "shadow" || m == "shadow-bank" || m == "native" || m == "full";
   }();
   return on;
 }
@@ -373,6 +384,15 @@ void OnControl(uint8_t* base, uint32_t plugin, uint32_t index, uint32_t data) {
   }
 }
 
+int IsDoneOverride(uint32_t plugin) {
+  if (!Active() || !FullMode()) return -1;
+  State& s = S();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  auto it = s.plugins.find(plugin);
+  if (it == s.plugins.end() || it->second->cls != PluginClass::kSndPlayer) return -1;
+  return static_cast<SndPlayer*>(it->second)->IsDone() ? 1 : 0;
+}
+
 void OnIsDone(uint8_t*, uint32_t plugin, bool guest) {
   if (!Active()) return;
   State& s = S();
@@ -432,6 +452,20 @@ REX_HOOK_RAW(sub_8264C540) {
 // the native graph for the same block and compare the master bus outputs.
 REX_HOOK_RAW(sub_8265A148) {
   const uint32_t voice = ctx.r3.u32, io = ctx.r4.u32;
+  if (Active() && FullMode()) {
+    auto& s = native_audio::bridge::S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (s.native_master && voice == s.master) {
+      s.engine.clock = RD(base, s.system);
+      const int nret = s.engine.RenderGraph(s.native_master, s.engine.io);
+      s.last_native_ret = nret;
+      ctx.r3.u64 = uint32_t(nret);
+      if (++s.blocks % 1000 == 0)
+        REXAPU_INFO("native audio full: {} blocks, voices {}, bank {} hits {} misses", s.blocks,
+                    s.voices.size(), s.bank_hits, s.bank_misses);
+      return;
+    }
+  }
   __imp__sub_8265A148(ctx, base);
   if (!Active()) return;
   auto& s = native_audio::bridge::S();
@@ -482,7 +516,9 @@ REX_HOOK_RAW(sub_8265A148) {
 // copies into its packet: in native mode the packet gets the native mix.
 REX_HOOK_RAW(sub_82650810) {
   const uint32_t dac = ctx.r3.u32;
-  __imp__sub_82650810(ctx, base);
+  // In full mode the guest graph never ran, so its io buffers may not even be
+  // allocated: skip the original finalize and give the Dac a valid buffer.
+  if (!(Active() && FullMode())) __imp__sub_82650810(ctx, base);
   if (!Active() || !NativeOutput()) return;
   auto& s = native_audio::bridge::S();
   std::lock_guard<std::mutex> lock(s.mutex);
@@ -490,8 +526,82 @@ REX_HOOK_RAW(sub_82650810) {
   float out[6 * 256];
   native_audio::DacFinalize(s.engine.io.Cur(), out, 6, &s.engine.dac_fade);
   const uint32_t io = R32(base, dac + 56);
-  const uint32_t buf = R32(base, io + 4 + 4 * base[io + 28]);
+  const uint32_t cur = base[io + 28];
+  uint32_t buf = R32(base, io + 4 + 4 * cur);
+  if (!buf || R32(base, io + 20 + 4 * cur) < 6 * 256 * 4) {
+    buf = REX_KERNEL_MEMORY()->SystemHeapAlloc(6 * 256 * 4, 128);
+    *reinterpret_cast<uint32_t*>(base + io + 4 + 4 * cur) = __builtin_bswap32(buf);
+    *reinterpret_cast<uint32_t*>(base + io + 20 + 4 * cur) = __builtin_bswap32(6u * 256 * 4);
+  }
   for (int i = 0; i < 6 * 256; ++i)
     *reinterpret_cast<uint32_t*>(base + buf + uint32_t(i) * 4) =
         __builtin_bswap32(std::bit_cast<uint32_t>(out[i]));
+}
+
+// full mode: the game's queries of voice and plug-in state answered natively.
+namespace {
+native_audio::Voice* MappedVoice(uint32_t v) {
+  auto& s = native_audio::bridge::S();
+  auto it = s.voices.find(v);
+  return it == s.voices.end() ? nullptr : it->second;
+}
+native_audio::Plugin* MappedPlugin(uint32_t p) {
+  auto& s = native_audio::bridge::S();
+  auto it = s.plugins.find(p);
+  return it == s.plugins.end() ? nullptr : it->second;
+}
+}  // namespace
+
+// Voice::IsReleaseDone(voice) -> u8
+REX_HOOK_RAW(sub_826500F8) {
+  if (Active() && FullMode()) {
+    auto& s = native_audio::bridge::S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (native_audio::Voice* v = MappedVoice(ctx.r3.u32)) {
+      ctx.r3.u64 = v->IsStopped() ? 1 : 0;
+      return;
+    }
+  }
+  __imp__sub_826500F8(ctx, base);
+}
+
+// Voice::GetLatencySeconds(voice) -> f1 = tail / System+12
+REX_HOOK_RAW(sub_826500C8) {
+  if (Active() && FullMode()) {
+    auto& s = native_audio::bridge::S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (native_audio::Voice* v = MappedVoice(ctx.r3.u32)) {
+      ctx.f1.f64 = double(v->TailNow() / s.engine.rate);
+      return;
+    }
+  }
+  __imp__sub_826500C8(ctx, base);
+}
+
+// Plugin::GetParamD(plugin, index, double* out)
+REX_HOOK_RAW(sub_8264CE00) {
+  if (Active() && FullMode()) {
+    auto& s = native_audio::bridge::S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (native_audio::Plugin* p = MappedPlugin(ctx.r3.u32)) {
+      const uint64_t b = std::bit_cast<uint64_t>(p->GetParam(int(ctx.r4.u32)));
+      *reinterpret_cast<uint64_t*>(base + ctx.r5.u32) = __builtin_bswap64(b);
+      return;
+    }
+  }
+  __imp__sub_8264CE00(ctx, base);
+}
+
+// Plugin::GetParamF(plugin, index, float* out)
+REX_HOOK_RAW(sub_8264CDE8) {
+  if (Active() && FullMode()) {
+    auto& s = native_audio::bridge::S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (native_audio::Plugin* p = MappedPlugin(ctx.r3.u32)) {
+      const uint32_t b = std::bit_cast<uint32_t>(float(p->GetParam(int(ctx.r4.u32))));
+      *reinterpret_cast<uint32_t*>(base + ctx.r5.u32) = __builtin_bswap32(b);
+      return;
+    }
+  }
+  __imp__sub_8264CDE8(ctx, base);
 }

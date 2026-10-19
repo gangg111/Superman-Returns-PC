@@ -13,6 +13,9 @@
 // offline-decoded PCM is from the game's XMA decoder.
 // SR_NATIVE_AUDIO=native: the speakers get the native mix (bank sounds); the
 // original engine still runs alongside for the state the game reads.
+// SR_NATIVE_AUDIO=full: the original engine no longer renders or decodes; the
+// game's state queries (IsDone, GetParam, IsReleaseDone, latency) are answered
+// by the native engine.
 #pragma once
 
 #include <cstdint>
@@ -27,6 +30,8 @@ void OnVoiceRelease(uint8_t* base, uint32_t guest_voice);
 void OnSetParam(uint8_t* base, uint32_t plugin, uint32_t index, float value);
 void OnControl(uint8_t* base, uint32_t plugin, uint32_t index, uint32_t data);
 void OnIsDone(uint8_t* base, uint32_t plugin, bool guest_answer);
+// full mode: the native SndPlayer's IsDone for a mapped player, else -1.
+int IsDoneOverride(uint32_t plugin);
 
 // From the EXm0 decoder hooks (native_audio/selftest.cpp), after the original.
 void OnSetInput(uint8_t* base, uint32_t decoder, uint32_t slot);
