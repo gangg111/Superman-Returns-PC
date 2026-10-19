@@ -101,6 +101,18 @@ więc tylko zgrubne: nowy silnik ma mieścić się w tym rozrzucie. O 1:1 rozstr
   pętle strumieni zaczynają się na granicy bloku). Dźwięk filmów przekonwertowany (34 filmy).
   Dalej: most hooków gra -> silnik natywny, tryb cienia w grze, warstwa EA SND filmów.
 
+- **Pierwsze przebiegi w grze (2026-10-20, sterowanie bez obrazu, okno zapory Windows zasłaniało
+  grę):** `SR_NATIVE_AUDIO=shadow`: 25 000 bloków (133 s, 1870 startów dźwięków) **bit w bit
+  zgodnych** z oryginałem, 0 różnic zwracanych wartości, IsDone i identyfikatorów żądań.
+  `shadow-bank`: bank rozpoznaje **1699/1699** (potem 1844/1844) dźwięków, w tym strumienie po
+  pliku archiwum i przesunięciu `_SNS`. Po wyrównaniu bank zgadza się z dekoderem gry co do
+  0,00003-0,00015 (pojedyncze LSB), ale **emulowany dekoder XMA opóźnia każdy dźwięk o 1536 klatek**
+  (3 ramki XMA, 32 ms; strumienie 4-kanałowe 1773): na początku daje ciszę, a ponieważ odtwarzacz
+  gra dokładnie tyle próbek, ile mówi nagłówek, w obecnym porcie każdy dźwięk startuje 32 ms za
+  późno i traci ostatnie 32 ms. Bank (FFmpeg z pominięciem opóźnienia kodera) zaczyna od pierwszej
+  prawdziwej próbki. Do rozstrzygnięcia, jak robi to sprzęt konsoli. `native`: 146 s bez awarii,
+  dźwięk ciągły, poziom -24..-12 dBFS, 0 przesterowań.
+
 #### Metoda weryfikacji DSP (po red-teamie agy, 2026-10-20)
 
 1. **Test różnicowy wtyczki przeciw oryginałowi w tym samym procesie.** Oryginalny DSP RenderWare

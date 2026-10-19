@@ -148,7 +148,76 @@ std::string BankDir() {
   return dir.substr(0, dir.find_last_of("/\\")) + "/native_audio";
 }
 
-std::shared_ptr<SoundSource> FromBank(uint8_t* base, State& s, uint32_t req) {
+// shadow-bank diagnostics: the first chunk of each sound from the bank against
+// what the game's decoder produced for it, with the best time shift (lag in
+// frames, bank relative to the game) and the mean absolute residual.
+class DiagSource : public BankSource {
+ public:
+  DiagSource(std::shared_ptr<const Pcm> pcm, uint32_t player, std::string name)
+      : BankSource(std::move(pcm)), player_(player), name_(std::move(name)) {}
+  void Bind(int slot) override {
+    slot_ = slot;
+    S().captures[{player_, slot_}] = Capture{};
+  }
+  int Decode(int block, int offset, float* dst, int frames) override {
+    const int n = BankSource::Decode(block, offset, dst, frames);
+    Capture& c = S().captures[{player_, slot_}];
+    const int ch = Channels();
+    // Channel 0 of what both sides produced for this sound, in decode order.
+    for (int i = 0; i < n; ++i) {
+      bank_.push_back(dst[i]);
+      game_.push_back(size_t(i * ch) < c.frames.size() ? c.frames[size_t(i * ch)] : 0.0f);
+    }
+    for (int i = 0; i < n * ch && !c.frames.empty(); ++i) c.frames.pop_front();
+    static int logged = 0;
+    constexpr size_t kWant = 8192;
+    if (!checked_ && bank_.size() >= kWant && logged < 40) {
+      checked_ = true;
+      ++logged;
+      auto first_nz = [](const std::vector<float>& v) {
+        for (size_t i = 0; i < v.size(); ++i)
+          if (std::fabs(v[i]) > 1e-4f) return long(i);
+        return -1L;
+      };
+      // window with sound on the game side, lag = bank index - game index
+      const long g0 = first_nz(game_), b0 = first_nz(bank_);
+      double best_r = 1e9;
+      long best = 0;
+      const long w0 = g0 < 0 ? 0 : g0 + 64, wn = 1024;
+      auto residual = [&](long lag) {
+        double sum = 0.0;
+        long cnt = 0;
+        for (long i = w0; i < w0 + wn && i < long(game_.size()); ++i) {
+          const long j = i + lag;
+          if (j < 0 || j >= long(bank_.size())) continue;
+          sum += std::fabs(double(bank_[size_t(j)]) - game_[size_t(i)]);
+          ++cnt;
+        }
+        return cnt > wn / 2 ? sum / cnt : 1e9;
+      };
+      for (long lag = -3000; lag <= 3000; ++lag) {
+        const double r = residual(lag);
+        if (r < best_r) { best_r = r; best = lag; }
+      }
+      double level = 0.0;
+      for (long i = w0; i < w0 + wn && i < long(game_.size()); ++i) level += std::fabs(game_[size_t(i)]);
+      level /= wn;
+      REXAPU_INFO("native audio bank check: {}: first sound game frame {} bank frame {}; level {:.4f}, "
+                  "residual at 0 {:.5f}, best lag {} residual {:.5f}", name_, g0, b0, level,
+                  residual(0), best, best_r);
+    }
+    return n;
+  }
+
+ private:
+  std::vector<float> bank_, game_;
+  uint32_t player_;
+  std::string name_;
+  int slot_ = -1;
+  bool checked_ = false;
+};
+
+std::shared_ptr<SoundSource> FromBank(uint8_t* base, State& s, uint32_t req, uint32_t player) {
   if (!s.bank_open) {
     s.bank_open = true;
     const std::string dir = BankDir();
@@ -178,7 +247,7 @@ std::shared_ptr<SoundSource> FromBank(uint8_t* base, State& s, uint32_t req) {
     return nullptr;
   }
   ++s.bank_hits;
-  return std::make_shared<BankSource>(pcm);
+  return std::make_shared<DiagSource>(pcm, player, info->name);
 }
 }  // namespace
 
@@ -267,7 +336,7 @@ void OnControl(uint8_t* base, uint32_t plugin, uint32_t index, uint32_t data) {
       if (snr) std::memcpy(r.snr, base + snr, 16);
       r.flag = RF(base, data + 28);
       const int sound_ch = int(((R32(base, snr) >> 18) & 0x3F) + 1);
-      if (BankMode()) r.source = FromBank(base, s, data);
+      if (BankMode()) r.source = FromBank(base, s, data, plugin);
       if (!r.source) r.source = std::make_shared<CaptureSource>(plugin, sound_ch);
       const float id = player->Start(r);
       if (R32(base, data + 32) != std::bit_cast<uint32_t>(id)) ++s.id_diff;

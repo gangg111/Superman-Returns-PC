@@ -19,7 +19,7 @@ class BankSource : public SoundSource {
   int BlockFrames(int i) const override;
   int Decode(int block, int offset, float* dst, int frames) override;
 
- private:
+ protected:
   std::shared_ptr<const Pcm> pcm_;
   std::vector<uint32_t> start_;  // first frame of each block, plus the end
 };
