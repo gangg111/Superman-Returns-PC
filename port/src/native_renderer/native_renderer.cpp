@@ -5697,6 +5697,24 @@ void Renderer::ExecResolve(uint8_t* base, uint32_t flags, uint32_t src_rect,
     uint32_t dest_base = GuestPhysical(fetch[1] & 0xFFFFF000u);
     uint32_t dest_w = (fetch[2] & 0x1FFF) + 1;
     uint32_t dest_h = ((fetch[2] >> 13) & 0x1FFF) + 1;
+    // Stacked destinations (fetch dword 1 bit 10, read by tfetch3D, e.g. the
+    // cascaded shadow maps): the XDK resolves layer k by writing
+    // RB_COPY_DEST_BASE = texture base + k * layer size, so the layer comes
+    // from the copy address, not from the texture's base.
+    uint32_t layers = 1, layer = 0;
+    if (!depth && ((fetch[1] >> 10) & 1)) {
+      layers = ((fetch[2] >> 26) & 0x3F) + 1;
+      std::vector<graphics::guest::TextureRange> ranges;
+      std::string error;
+      const uint32_t copy_base = GuestPhysical(mirror_.last_copy_dest_base & 0xFFFFF000u);
+      if (layers > 1 && mirror_.copy_draws != copies_before && copy_base > dest_base &&
+          graphics::guest::DescribeTextureRanges(std::span<const uint32_t, 6>(fetch, 6), ranges,
+                                                 error)) {
+        const uint64_t layer_bytes = TextureContentBytes(ranges) / layers;
+        if (layer_bytes) layer = uint32_t(std::min<uint64_t>((copy_base - dest_base) / layer_bytes,
+                                                             layers - 1));
+      }
+    }
     // Depth resolves become R32_FLOAT textures written by a shader copy (depth
     // formats only allow whole-subresource copies; the shadow atlas needs
     // region copies at a destination point).
@@ -5709,7 +5727,7 @@ void Renderer::ExecResolve(uint8_t* base, uint32_t flags, uint32_t src_rect,
     ResolveTexture& dst = resolve_textures_[resolve_key];
     std::memcpy(dst.guest_fetch, fetch, sizeof(fetch));
     if (!dst.resource || dst.width != dest_w || dst.height != dest_h ||
-        dst.scale != src->scale) {
+        dst.scale != src->scale || dst.layers != layers) {
       Retire(dst.resource);
       for (auto& [mapping, index] : dst.srv_by_mapping) RetireSrvIndex(index);
       D3D12_CPU_DESCRIPTOR_HANDLE rtv = dst.rtv, raw_rtv = dst.raw_rtv;
@@ -5721,6 +5739,7 @@ void Renderer::ExecResolve(uint8_t* base, uint32_t flags, uint32_t src_rect,
       dst.raw_rtv = raw_rtv;
       dst.width = dest_w;
       dst.height = dest_h;
+      dst.layers = layers;
       dst.scale = src->scale;
       dst.shadow = src->shadow;
       ++stats_.resolve_textures_created;
@@ -5730,7 +5749,7 @@ void Renderer::ExecResolve(uint8_t* base, uint32_t flags, uint32_t src_rect,
       desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
       desc.Width = HostPx(dest_w, dst.scale);
       desc.Height = HostPx(dest_h, dst.scale);
-      desc.DepthOrArraySize = 1;
+      desc.DepthOrArraySize = uint16_t(layers);
       desc.MipLevels = 1;
       desc.Format = dst.format;
       desc.SampleDesc.Count = 1;
@@ -5818,6 +5837,7 @@ void Renderer::ExecResolve(uint8_t* base, uint32_t flags, uint32_t src_rect,
       s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
       d.pResource = dst.resource.Get();
       d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      d.SubresourceIndex = layer;  // MipLevels = 1: subresource = array slice
       D3D12_BOX box{x1, y1, 0, x2, y2, 1};
       if (depth) {
         CopyDepthRegion(*src, dst, x1, y1, x2, y2, dx, dy);
@@ -5829,7 +5849,7 @@ void Renderer::ExecResolve(uint8_t* base, uint32_t flags, uint32_t src_rect,
         Transition(dst.resource.Get(), dst.state, D3D12_RESOURCE_STATE_RESOLVE_DEST);
         if (!resolve_list_) command_list_.As(&resolve_list_);
         D3D12_RECT rect{LONG(x1), LONG(y1), LONG(x2), LONG(y2)};
-        resolve_list_->ResolveSubresourceRegion(dst.resource.Get(), 0, dx, dy,
+        resolve_list_->ResolveSubresourceRegion(dst.resource.Get(), layer, dx, dy,
                                                 src->resource.Get(), 0, &rect,
                                                 src->resource_format, D3D12_RESOLVE_MODE_AVERAGE);
         Breadcrumb("msaa resolve");

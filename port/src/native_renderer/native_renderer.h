@@ -374,6 +374,7 @@ class Renderer : public NativeFrontend {
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT srv_format = DXGI_FORMAT_UNKNOWN;
     uint32_t width = 0, height = 0;  // guest pixels
+    uint32_t layers = 1;             // stacked destinations: one array slice per layer
     float scale = 1.0f;              // host pixels per guest pixel (source surface)
     bool shadow = false;             // resolved from a shadow map target
     uint32_t plain_srv = 0;          // default-mapped SRV (soft particles' scene depth)
