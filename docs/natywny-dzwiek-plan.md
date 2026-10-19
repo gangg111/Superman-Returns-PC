@@ -83,6 +83,32 @@ więc tylko zgrubne: nowy silnik ma mieścić się w tym rozrzucie. O 1:1 rozstr
   zawierają wyłącznie banki wariantów (781), które wskazują te dźwięki po nazwie.
   Otwarte: pełny układ nagłówka banku (lista właściwości całego banku przed wariantami).
 
+- **Etap 4, początek (2026-10-20):** `SnP0` rozpoznany (żądanie startu, deskryptory wszystkich 14 klas
+  w `.data`, `docs/natywny-dzwiek/deskryptory.txt`), bank próbek `port/src/native_audio/sample_bank`
+  z indeksem `index.bin` i testami (`tests/native_audio`). Specyfikacje DSP wtyczek:
+  `docs/natywny-dzwiek/spec-*.md`.
+
+#### Metoda weryfikacji DSP (po red-teamie agy, 2026-10-20)
+
+1. **Test różnicowy wtyczki przeciw oryginałowi w tym samym procesie.** Oryginalny DSP RenderWare
+   istnieje u nas jako zrekompilowany kod x86 (`sub_XXXXXXXX`), więc da się go wywołać na tych samych
+   danych wejściowych w pamięci gościa co natywną wersję i porównać bloki 256 próbek. Zastrzeżenie
+   agy, że bit w bit odpada przez różnice FPU PPC i x86, tu nie obowiązuje: obie strony liczą na
+   x86. Rozbieżność, jeśli wystąpi, wynika z kolejności działań albo z emulacji `fmadd`/VMX128
+   w kodzie wygenerowanym, i to trzeba odwzorować.
+2. **Tryb cienia liczony wewnątrz wywołania `Dac` gościa** (te same granice bloków i ten sam stan
+   kolejki poleceń po opróżnieniu), nie na osobnym wątku: bez dryfu zegarów.
+3. **Wyrównanie próbek:** zanim przyjmiemy WAV z konwertera za wzorzec, porównać korelacją jeden
+   dźwięk w nagraniu wyjścia oryginału z plikiem (ryzyko przesunięcia startu dekodera XMA).
+4. **Strumienie filmów** (0x82656-0x8265F) korzystają z miksera rdzenia z pominięciem
+   `Voice::Create` (wywołania alokatora i `sub_826502A8`, `sub_826505E8`). Rozpracować przed
+   przełączeniem, inaczej filmy zostaną bez dźwięku. To osobny silnik EA SND (0x82655FC8..0x8266CA20,
+   ponad 60 funkcji na globalach 0x8299FED8/0x8299FDF0, rekordy głosów po 132 B). Filmy:
+   `fmv.AST` (28) i `fmvlegal.AST` (5 logo) to kontenery ASF, obraz WMV3 1280x720 30 kl./s, dźwięk
+   **WMA Pro 5.1 (28), WMA Pro stereo (2), WMA v2 stereo (4), 44,1 kHz**. FFmpeg dekoduje
+   oba, `tools/audio/convert_movies.py` daje 34/34 filmów (23,8 min, 613 MB). Tor natywny: PCM plus zegar z
+   `Stream::GetRequestInfo` (ms odtworzone), który moduł filmów odpytuje.
+
 #### Pierwszy eksperyment (najtańszy, najwięcej rozstrzyga)
 
 Surowe nagranie ramek miksu, które gra wysyła przez `XAudioSubmitRenderDriverFrame`
