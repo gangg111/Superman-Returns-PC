@@ -293,6 +293,22 @@ def parse_bank(d: bytes):
     return variants
 
 
+def block_list(buf: bytes, pos: int):
+    """Sample count of every EAAC block (same walk as deblock): the native
+    SndPlayer consumes the converted PCM in these blocks, like the game."""
+    blocks = []
+    while pos + 8 <= len(buf):
+        flag = buf[pos]
+        size = struct.unpack_from(">I", buf, pos)[0] & 0xFFFFFF
+        if size == 0:
+            break
+        blocks.append(struct.unpack_from(">I", buf, pos + 4)[0])
+        pos += size
+        if flag == 0x80:
+            break
+    return blocks
+
+
 def deblock(buf: bytes, pos: int, stream_no: int):
     """XMA packet data of one stream from EAAC blocks (layout per vgmstream
     ea_eaac_streamfile.h): u8 flag (0x80 = last) + u24 BE block size, u32 BE

@@ -26,6 +26,7 @@ struct SoundInfo {
   std::array<uint8_t, 16> snr16{};
   std::string file;  // relative to the bank directory
   std::string name;  // "archive/NAME"
+  std::vector<uint32_t> blocks;  // frames per EAAC data block (index v2)
 };
 
 // Interleaved int16 frames, exactly SoundInfo::samples long.

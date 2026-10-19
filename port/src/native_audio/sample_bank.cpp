@@ -62,7 +62,8 @@ bool SampleBank::Open(const std::string& dir) {
   if (!ReadFile(dir + "/index.bin", d) || d.size() < 12 || std::memcmp(d.data(), "SRAI", 4))
     return false;
   Reader r{d, 4};
-  if (r.Get<uint32_t>() != 1) return false;
+  const uint32_t version = r.Get<uint32_t>();
+  if (version != 1 && version != 2) return false;
   const uint32_t count = r.Get<uint32_t>();
   sounds_.reserve(count);
   for (uint32_t i = 0; i < count && r.ok; ++i) {
@@ -78,6 +79,10 @@ bool SampleBank::Open(const std::string& dir) {
     for (auto& b : s.snr16) b = r.Get<uint8_t>();
     s.file = r.Str();
     s.name = r.Str();
+    if (version >= 2) {
+      const uint32_t n = r.Get<uint32_t>();
+      for (uint32_t k = 0; k < n && r.ok; ++k) s.blocks.push_back(r.Get<uint32_t>());
+    }
     if (r.ok) sounds_.push_back(std::move(s));
   }
   if (!r.ok) {

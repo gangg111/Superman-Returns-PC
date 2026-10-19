@@ -77,6 +77,7 @@ class Voice {
   bool destroyed = false;
 
   float TailNow() const;  // sub_82650018: 0 + lat[1] + ... + lat[n-1]
+  void Stop(bool graceful);  // sub_826502A8 applied directly (mixer thread)
   bool IsStopped();       // sub_826500F8
 };
 
@@ -94,7 +95,7 @@ class Engine {
   struct Entry {
     PluginClass cls;
     int channels;
-    float arg = 0.0f;  // Sen0: ignore voice gain (args[0]); unused otherwise
+    float arg = 0.0f;  // args[0]: Sen0 ignore voice gain, SnP0 request count
   };
   Voice* CreateVoice(const std::vector<Entry>& entries);
   // Voice::Release (sub_826505B8): queued destroy, every plug-in's release.

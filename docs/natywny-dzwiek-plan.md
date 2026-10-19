@@ -88,6 +88,19 @@ więc tylko zgrubne: nowy silnik ma mieścić się w tym rozrzucie. O 1:1 rozstr
   z indeksem `index.bin` i testami (`tests/native_audio`). Specyfikacje DSP wtyczek:
   `docs/natywny-dzwiek/spec-*.md`.
 
+- **Etap 4, rdzeń gotowy (2026-10-20):** natywny silnik w `port/src/native_audio` jest **bit w bit
+  zgodny z oryginałem** w samoteście `SR_AUDIO_SELFTEST=<raport>` (proces startuje bez rozgrywki,
+  oryginały wywoływane jako zrekompilowane funkcje na tych samych danych, 0 rozbieżności):
+  resampler (100 przypadków, 30 tys. wywołań), filtry LP/HP, Gain, PanSurround, Send/SubMix/Route,
+  pogłos, opóźnienie, VuMeter, finalizacja Dac, cały graf (Voice::Create, kolejka poleceń,
+  wykonawca, zniszczenie głosu z wygaszeniem resztki, tryb ogona; 4800 bloków) i SndPlayer
+  (planer, polecenia, pętle, starty z opóźnieniem, zatrzymania, wysokość, IsDone, pozycja; 5089
+  bloków). Wzorcem jest kod zrekompilowany: `vmaddfp` = mnożenie i dodawanie w FTZ/DAZ,
+  `fmadds` = fma w double; przenikanie opóźnienia ma przestawione mnożenie w jednej kopii pętli.
+  Bank próbek: indeks v2 z liczbą próbek w blokach EAAC (wszystkie dźwięki w pamięci mają 1 blok,
+  pętle strumieni zaczynają się na granicy bloku). Dźwięk filmów przekonwertowany (34 filmy).
+  Dalej: most hooków gra -> silnik natywny, tryb cienia w grze, warstwa EA SND filmów.
+
 #### Metoda weryfikacji DSP (po red-teamie agy, 2026-10-20)
 
 1. **Test różnicowy wtyczki przeciw oryginałowi w tym samym procesie.** Oryginalny DSP RenderWare

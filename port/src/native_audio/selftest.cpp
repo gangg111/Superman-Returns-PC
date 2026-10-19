@@ -13,7 +13,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <array>
 #include <cstring>
+#include <deque>
+#include <unordered_map>
 #include <memory>
 #include <random>
 #include <string>
@@ -29,6 +32,7 @@
 #include "native_audio/engine.h"
 #include "native_audio/plugins.h"
 #include "native_audio/resampler.h"
+#include "native_audio/snd_player.h"
 
 namespace native_audio {
 namespace {
@@ -83,6 +87,103 @@ REX_HOOK_RAW(sub_8264C8F0) {
     return;
   }
   // The arena never frees.
+}
+
+// ---- test decoder: the EXm0 decoder's create / set input / decode / destroy,
+// replaced while the self-test runs by a deterministic generator (no XMA).
+namespace native_audio {
+namespace {
+bool g_selftest_decoder = false;
+std::FILE* g_trace = nullptr;  // SR_AUDIO_SELFTEST_TRACE: the report file
+
+// int16 / 32768 like the real decoder output, from a hash of the block key,
+// the frame and the channel.
+float TestSample(uint32_t key, uint32_t frame, uint32_t ch) {
+  uint32_t h = key * 2654435761u ^ (frame + 0x9E3779B9u) * 40503u ^ ch * 2246822519u;
+  h ^= h >> 15;
+  h *= 2246822519u;
+  h ^= h >> 13;
+  return float(int16_t(h & 0xFFFF)) * (1.0f / 32768.0f);
+}
+
+struct TestDecoderInput {
+  uint32_t key, frames, pos, slot;  // slot = &stream slot +12 (the set-input argument)
+};
+std::unordered_map<uint32_t, std::deque<TestDecoderInput>> g_test_inputs;  // by decoder
+}  // namespace
+}  // namespace native_audio
+
+// EXm0 create(channels, sys) -> decoder (the real vtable, hooked methods below)
+REX_HOOK_RAW(sub_82659AF0) {
+  if (!native_audio::g_selftest_decoder) {
+    __imp__sub_82659AF0(ctx, base);
+    return;
+  }
+  const uint32_t dec = native_audio::g_arena.Alloc(64, 16);
+  std::memset(base + dec, 0, 64);
+  *reinterpret_cast<uint32_t*>(base + dec) = __builtin_bswap32(0x82081FACu);
+  native_audio::g_test_inputs[dec].clear();
+  if (native_audio::g_trace) std::fprintf(native_audio::g_trace, "    create dec %08X\n", dec);
+  ctx.r3.u64 = dec;
+}
+
+// set input (dec, &slot{+0 data, +4 frames, +8 flag})
+REX_HOOK_RAW(sub_826592A8) {
+  if (!native_audio::g_selftest_decoder) {
+    __imp__sub_826592A8(ctx, base);
+    return;
+  }
+  const uint32_t data = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + ctx.r4.u32));
+  const uint32_t frames = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + ctx.r4.u32 + 4));
+  native_audio::g_test_inputs[ctx.r3.u32].push_back({data, frames, 0, ctx.r4.u32});
+  if (native_audio::g_trace)
+    std::fprintf(native_audio::g_trace, "    set input dec %08X slot %08X data %08X frames %u\n",
+                 ctx.r3.u32, ctx.r4.u32, data, frames);
+}
+
+// decode (dec, float* planar dst, frames) -> frames written (channel stride = that)
+REX_HOOK_RAW(sub_826592F0) {
+  if (!native_audio::g_selftest_decoder) {
+    __imp__sub_826592F0(ctx, base);
+    return;
+  }
+  const uint32_t dec = ctx.r3.u32, dst = ctx.r4.u32;
+  const int want = int32_t(ctx.r5.u32);
+  if (native_audio::g_trace)
+    std::fprintf(native_audio::g_trace, "    decode dec %08X dst %08X want %d\n", dec, dst, want);
+  const int ch = base[dec + 8];
+  auto& q = native_audio::g_test_inputs[dec];
+  // gather up to `want` frames across the queued inputs, then write planar
+  std::vector<std::pair<uint32_t, uint32_t>> src;  // (key, frame)
+  while (int(src.size()) < want && !q.empty()) {
+    auto& in = q.front();
+    while (int(src.size()) < want && in.pos < in.frames) src.push_back({in.key, in.pos++});
+    if (in.pos >= in.frames) {
+      // buffer fully consumed: the real decoder marks the stream slot (+28),
+      // which lets sub_82653600 free it at the next Process
+      *reinterpret_cast<uint32_t*>(base + in.slot + 16) = __builtin_bswap32(1u);
+      q.pop_front();
+    }
+  }
+  const int n = int(src.size());
+  for (int c = 0; c < ch; ++c)
+    for (int i = 0; i < n; ++i) {
+      const float v = native_audio::TestSample(src[i].first, src[i].second, uint32_t(c));
+      *reinterpret_cast<uint32_t*>(base + dst + uint32_t(c * n + i) * 4) =
+          __builtin_bswap32(std::bit_cast<uint32_t>(v));
+    }
+  ctx.r3.u64 = uint32_t(n);
+}
+
+
+
+// destroy
+REX_HOOK_RAW(sub_82658448) {
+  if (!native_audio::g_selftest_decoder) {
+    __imp__sub_82658448(ctx, base);
+    return;
+  }
+  if (native_audio::g_trace) std::fprintf(native_audio::g_trace, "    destroy dec %08X\n", ctx.r3.u32);
 }
 
 namespace native_audio {
@@ -870,6 +971,29 @@ void DacCase(Guest& g, Report& rep, int ch, uint32_t seed) {
   (void)ch;
 }
 
+// ------------------------------------------------------------ SndPlayer
+
+// The test decoder's data as a native SoundSource: one block (RAM sounds).
+class TestSource : public SoundSource {
+ public:
+  TestSource(uint32_t key, int ch, int frames) : key_(key), ch_(ch), frames_(frames) {}
+  int Channels() const override { return ch_; }
+  int BlockCount() const override { return 1; }
+  int BlockFrames(int) const override { return frames_; }
+  int Decode(int, int offset, float* dst, int frames) override {
+    const int n = frames < frames_ - offset ? frames : frames_ - offset;
+    for (int c = 0; c < ch_; ++c)
+      for (int i = 0; i < n; ++i) dst[c * n + i] = TestSample(key_, uint32_t(offset + i), uint32_t(c));
+    return n;
+  }
+
+ private:
+  uint32_t key_;
+  int ch_, frames_;
+};
+
+void SndCase(Guest& g, Report& rep, int player_ch, uint32_t seed);
+
 // ------------------------------------------------------------ whole graph
 
 // A guest System good enough for Voice::Create, Control/SetParamF (they queue
@@ -1155,6 +1279,210 @@ void GraphCase(Guest& g, Report& rep, int variant, uint32_t seed) {
   }
 }
 
+// A voice SnP0(player_ch) > Pit0 on both sides; random requests (looped and
+// one-shot RAM sounds of 1, 2 or 4 channels, delayed starts, stop-after flags),
+// pitch changes and stops. Compared: the voice output, return value, IsDone,
+// the position the game reads (GetParamD 1) and param 0.
+void SndCase(Guest& g, Report& rep, int player_ch, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> pick(0, 99);
+  InitDescriptors(g);
+  // SnP0 descriptor (also zero at self-test time) and the EXm0 codec entry.
+  g.W32(0x829370D0 + 4, 0x536E5030);
+  g.W32(0x829370D0 + 8, 0x82653EF8);
+  g.W32(0x829370D0 + 12, 0x82654428);
+  g.W32(0x829370D0 + 16, 0x8292EEBC);
+  g.W32(0x829370D0 + 20, 0);
+  g.W32(0x829370D0 + 24, 0x82655610);
+  g.W32(0x829370D0 + 28, 0x01030200);
+  GuestSystem gs(g);
+  {
+    PPCContext c = g.Ctx();
+    c.r3.u64 = gs.sys;
+    sub_8265C0A8(c, g.base);
+    const uint32_t reg = c.r3.u32;
+    g.W32(0x8292F0C4, 0x45586D30);  // 'EXm0'
+    g.W32(0x8292F0C8, 0x82659AF0);
+    g.W32(0x8292F0CC, 0);
+    c = g.Ctx();
+    c.r3.u64 = reg;
+    c.r4.u64 = 0x8292F0C4;
+    sub_8265C1E8(c, g.base);
+  }
+  Engine eng(48000.0f);
+  const uint32_t args = g.Alloc(16);
+  g.WF(args, 4.0f);  // 4 request objects
+  // As in the game: the sound voice is a child of a bus voice (the executor
+  // writes to the parent when a voice stops, so a stopped root would crash).
+  const uint32_t name = g.Alloc(16), nameptr = g.Alloc(16);
+  std::memcpy(g.base + name, "SNDBUS", 7);
+  g.W32(nameptr, name);
+  std::vector<uint32_t> gbp;
+  const uint32_t gbusv = GuestCreateVoice(g, gs, {{0x82936E28, player_ch, nameptr}}, &gbp);
+  Voice* nbusv = eng.CreateVoice({{PluginClass::kSubMix, player_ch, 0.0f}});
+  std::vector<GuestEntry> ge = {
+      {0x829370D0, player_ch, args}, {0x82937630, player_ch, 0}, {0x829375D8, player_ch, 0}};
+  std::vector<uint32_t> gp;
+  const uint32_t gvoice = GuestCreateVoice(g, gs, ge, &gp);
+  Voice* nv = eng.CreateVoice({{PluginClass::kSndPlayer, player_ch, 4.0f},
+                               {PluginClass::kPitch, player_ch, 0.0f},
+                               {PluginClass::kSend, player_ch, 0.0f}});
+  {
+    const uint32_t d = g.Alloc(16);
+    g.W32(d, gbp[0]);
+    GuestControl(g, gp[2], 0, d);
+    eng.AttachToBus(nv->plugins[2].get(), nbusv->plugins[0]->AsBus());
+  }
+  (void)gvoice;
+  auto* nplayer = static_cast<SndPlayer*>(nv->plugins[0].get());
+  const uint32_t gio = g.Alloc(64);
+  std::memset(g.base + gio, 0, 64);
+  for (int i = 0; i < 2; ++i) {
+    const uint32_t b = g.Alloc(6 * 4096 * 4);
+    std::memset(g.base + b, 0, 6 * 4096 * 4);
+    g.W32(gio + 4 + 4 * i, b);
+    g.W32(gio + 20 + 4 * i, 6 * 4096 * 4);
+  }
+  const uint32_t req = g.Alloc(64);
+  std::uniform_real_distribution<float> pitch(0.5f, 2.5f);
+  static const int kRates[4] = {44100, 22050, 32000, 48000};
+  char what[128];
+  double clock = 0.0;
+  std::vector<std::string> history;  // printed when the case fails
+  for (int block = 0; block < 200; ++block) {
+    const int k = pick(rng);
+    if (k < 6 || block == 0) {  // a start request
+      const int sch = std::array<int, 3>{1, 2, 4}[pick(rng) % 3];
+      const int rate = kRates[pick(rng) % 4];
+      const int frames = 50 + pick(rng) * 120;
+      const bool loop = pick(rng) < 30;
+      // SNR header + one data block in guest memory (the block key = its address)
+      const uint32_t snr = g.Alloc(64);
+      std::memset(g.base + snr, 0, 64);
+      const uint32_t h1 = (3u << 24) | (uint32_t(sch - 1) << 18) | uint32_t(rate);
+      const uint32_t h2 = (0u << 30) | (uint32_t(loop) << 29) | uint32_t(frames);
+      g.W32(snr, h1);
+      g.W32(snr + 4, h2);
+      const uint32_t hdr = loop ? 12 : 8;
+      if (loop) g.W32(snr + 8, 0);  // loop start 0 (all RAM loops in the game)
+      g.W32(snr + hdr, 0x80000000u | 64u);
+      g.W32(snr + hdr + 4, uint32_t(frames));
+      const double start = (pick(rng) < 25) ? clock + (pick(rng) % 8) * 0.002 : 0.0;
+      const float flag = pick(rng) < 10 ? 1.0f : 0.0f;
+      std::memset(g.base + req, 0, 64);
+      auto wd = [&](uint32_t a, double v) {
+        const uint64_t b = std::bit_cast<uint64_t>(v);
+        g.W32(a, uint32_t(b >> 32));
+        g.W32(a + 4, uint32_t(b));
+      };
+      wd(req, start);
+      wd(req + 8, 0.0);
+      g.W32(req + 20, snr);
+      g.WF(req + 28, flag);
+      GuestControl(g, gp[0], 0, req);
+      PlayRequest pr;
+      pr.start_time = start;
+      std::memcpy(pr.snr, g.base + snr, 16);
+      pr.flag = flag;
+      pr.source = std::make_shared<TestSource>(snr + hdr + 8, sch, frames);
+      const float nid = nplayer->Start(pr);
+      char hb[160];
+      std::snprintf(hb, sizeof(hb), "block %d: start ch %d rate %d frames %d loop %d start %.4f "
+                    "(clock %.4f) flag %g", block, sch, rate, frames, loop, start, clock, flag);
+      history.push_back(hb);
+      if (g.R32(req + 32) != std::bit_cast<uint32_t>(nid)) {
+        rep.Fail("SnP0 request id differs");
+        return;
+      }
+    } else if (k < 8) {  // stop everything
+      GuestControl(g, gp[0], 1, 0);
+      nplayer->Stop();
+      history.push_back("block " + std::to_string(block) + ": stop");
+    }
+    if (pick(rng) < 10) {
+      const float p = pitch(rng);
+      GuestSetParam(g, gp[1], 0, p);
+      eng.SetParam(nv->plugins[1].get(), 0, p);
+    }
+    if (std::getenv("SR_AUDIO_SELFTEST_TRACE"))
+      std::fprintf(rep.f, "  trace SnP0 %dch seed %u block %d: %s\n", player_ch, seed, block,
+                   history.empty() ? "-" : history.back().c_str());
+    gs.Drain();
+    if (g_trace) std::fprintf(g_trace, "    guest drain done\n");
+    eng.Drain();
+    if (g_trace) std::fprintf(g_trace, "    native drain done\n");
+    // the guest clock is advanced by the Dac; do it here on both sides
+    const uint64_t cb = std::bit_cast<uint64_t>(clock);
+    g.W32(gs.sys, uint32_t(cb >> 32));
+    g.W32(gs.sys + 4, uint32_t(cb));
+    eng.clock = clock;
+    g.base[gio + 28] = 0;
+    eng.io.cur = 0;
+    PPCContext c = g.Ctx();
+    c.r3.u64 = gbusv;
+    c.r4.u64 = gio;
+    c.r5.u64 = g.R32(gs.sys + 20);
+    sub_8265A148(c, g.base);
+    if (g_trace) std::fprintf(g_trace, "    guest render done\n");
+    const int gr = int32_t(c.r3.u32);
+    const int nr = eng.RenderGraph(nbusv, eng.io);
+    if (g_trace) std::fprintf(g_trace, "    native render done\n");
+    clock += 256.0 / 48000.0;
+    std::snprintf(what, sizeof(what), "SnP0 %dch block %d", player_ch, block);
+    {
+      const SndPlayer::State st = nplayer->Debug();
+      const uint32_t gpend = g.R32(gp[0] + 84);
+      if (!CheckWord(g, gp[0] + 100, uint32_t(st.pos), rep, what, "pos") ||
+          !CheckWord(g, gp[0] + 40, uint32_t(st.planner), rep, what, "planner") ||
+          !CheckWord(g, gp[0] + 1176, uint32_t(st.planned), rep, what, "planned") ||
+          !CheckWord(g, gp[0] + 104, uint32_t(st.cur_slot), rep, what, "cur slot") ||
+          (gpend != 0) != (st.pending != 0)) {
+        if ((gpend != 0) != (st.pending != 0)) rep.Fail(std::string(what) + ": pending differs");
+        return;
+      }
+    }
+    if (gr != nr) {
+      std::snprintf(what, sizeof(what), "SnP0 %dch block %d: return guest %d native %d",
+                    player_ch, block, gr, nr);
+      rep.Fail(what);
+      return;
+    }
+    if (gr == 1) {
+      if (g.base[gio + 28] != eng.io.cur) {
+        rep.Fail(std::string(what) + ": io index");
+        const size_t from = history.size() > 6 ? history.size() - 6 : 0;
+        for (size_t h = from; h < history.size(); ++h)
+          std::fprintf(rep.f, "    %s\n", history[h].c_str());
+        return;
+      }
+      const uint32_t gcur = g.R32(gio + 4 + 4 * g.base[gio + 28]);
+      for (int i = 0; i < player_ch * kBlock; ++i)
+        if (g.R32(gcur + uint32_t(i) * 4) != std::bit_cast<uint32_t>(eng.io.Cur()[i])) {
+          char f[32];
+          std::snprintf(f, sizeof(f), "out[%d]", i);
+          CheckWord(g, gcur + uint32_t(i) * 4, std::bit_cast<uint32_t>(eng.io.Cur()[i]), rep, what,
+                    f);
+          return;
+        }
+      ++rep.processed;
+    } else {
+      ++rep.passthrough;
+    }
+    c = g.Ctx();
+    c.r3.u64 = gp[0];
+    sub_82653E70(c, g.base);
+    const bool gdone = (c.r3.u32 & 0xFF) != 0;
+    const uint64_t gpos = (uint64_t(g.R32(gp[0] + 56)) << 32) | g.R32(gp[0] + 60);
+    if (gdone != nplayer->IsDone() || gpos != std::bit_cast<uint64_t>(nplayer->GetParam(1)) ||
+        g.R32(gp[0] + 48) != std::bit_cast<uint32_t>(float(nplayer->GetParam(0)))) {
+      std::snprintf(what, sizeof(what), "SnP0 %dch block %d: IsDone %d/%d or position/param0",
+                    player_ch, block, gdone, nplayer->IsDone());
+      rep.Fail(what);
+      return;
+    }
+  }
+}
+
 }  // namespace
 
 // Returns true when the self-test ran (the caller then exits).
@@ -1164,6 +1492,7 @@ bool RunAudioSelfTest(uint8_t* base) {
   Report rep{std::fopen(path, "w")};
   if (!rep.f) return true;
   std::setvbuf(rep.f, nullptr, _IONBF, 0);  // a crash must not lose the lines before it
+  if (std::getenv("SR_AUDIO_SELFTEST_TRACE")) g_trace = rep.f;
   Guest g{base, 0};
   const uint32_t stack = g.Alloc(256 * 1024);
   g.stack_top = stack + 256 * 1024 - 512;
@@ -1212,6 +1541,9 @@ bool RunAudioSelfTest(uint8_t* base) {
   run("VuM0", [&](Report& r, int ch, uint32_t s) { VuCase(g, r, ch, s); });
   run("Dac0 finalize", [&](Report& r, int ch, uint32_t s) { DacCase(g, r, ch, s); });
   run("graph", [&](Report& r, int ch, uint32_t s) { GraphCase(g, r, ch, s); });
+  g_selftest_decoder = true;
+  run("SnP0", [&](Report& r, int ch, uint32_t s) { SndCase(g, r, ch, s); });
+  g_selftest_decoder = false;
   g_selftest_alloc = false;
   std::fclose(rep.f);
   return true;

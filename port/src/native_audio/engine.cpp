@@ -1,5 +1,7 @@
 #include "native_audio/engine.h"
 
+#include "native_audio/snd_player.h"
+
 #include <cstring>
 
 namespace native_audio {
@@ -247,7 +249,9 @@ Voice* Engine::CreateVoice(const std::vector<Entry>& entries) {
       case PluginClass::kVuMeter: p = std::make_unique<VuPlugin>(e.channels, rate); break;
       case PluginClass::kAiffWriter: p = std::make_unique<AiffPlugin>(); break;
       case PluginClass::kDac: p = std::make_unique<DacPlugin>(); break;
-      case PluginClass::kSndPlayer: return nullptr;  // native SndPlayer: separate step
+      case PluginClass::kSndPlayer:
+        p = std::make_unique<SndPlayer>(e.channels, e.arg > 0.0f ? int(e.arg) : 1, this);
+        break;
     }
     p->cls = e.cls;
     p->in_channels = prev;
@@ -271,16 +275,18 @@ void Engine::ReleaseVoice(Voice* v) {
   });
 }
 
+void Voice::Stop(bool graceful) {
+  if (state == 2) return;
+  if (!graceful) {
+    state = 2;
+  } else if (state == 0) {
+    state = 1;
+    tail = TailNow();
+  }
+}
+
 void Engine::StopVoice(Voice* v, bool graceful) {
-  Enqueue([v, graceful] {
-    if (v->state == 2) return;
-    if (!graceful) {
-      v->state = 2;
-    } else if (v->state == 0) {
-      v->state = 1;
-      v->tail = v->TailNow();
-    }
-  });
+  Enqueue([v, graceful] { v->Stop(graceful); });
 }
 
 void Engine::SetParam(Plugin* p, int index, float value) {

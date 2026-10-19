@@ -85,6 +85,13 @@ def fnv1a(data):
     return h
 
 
+def blocks_of(body, sns):
+    rec = ea_ast.parse_sabr(body)
+    if rec.snr.kind == 1:
+        return ea_ast.block_list(sns, 0) if sns else []
+    return ea_ast.block_list(body, rec.snr_pos + rec.snr.header_size)
+
+
 def keys(body):
     """Identity of a record as the engine sees it at run time: the game hands
     SndPlayer a pointer to the SNR header inside the loaded record
@@ -100,6 +107,7 @@ def convert(job, out_dir):
     item = {"archive": label, "name": name}
     try:
         item.update(keys(body))
+        item["blocks"] = blocks_of(body, sns)
     except Exception:
         pass
     try:
@@ -134,11 +142,12 @@ def main():
     if args.update_keys:
         path = os.path.join(args.out_dir, "manifest.json")
         manifest = json.load(open(path, encoding="utf-8"))
-        by_id = {(label, name): body for label, name, body, _ in jobs}
+        by_id = {(label, name): (body, sns) for label, name, body, sns in jobs}
         for r in manifest["sounds"]:
-            body = by_id.get((r["archive"], r["name"]))
-            if body is not None:
-                r.update(keys(body))
+            found = by_id.get((r["archive"], r["name"]))
+            if found is not None:
+                r.update(keys(found[0]))
+                r["blocks"] = blocks_of(*found)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=1)
         have = sum(1 for r in manifest["sounds"] if r.get("fnv256"))
