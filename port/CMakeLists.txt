@@ -60,6 +60,7 @@ set(SUPERMANRETURNS_SOURCES
     src/input/native_input.cpp
     src/input/gameinput_driver.cpp
     src/input/rawinput_kbm_driver.cpp
+    src/audio_out/xaudio2_output.cpp
     src/sr_settings.cpp
     src/graphics/backend_selection.cpp
     src/sr_preset.cpp
@@ -78,7 +79,7 @@ endif()
 rexglue_setup_target(superman_returns GPU_PLUGINS xenos)
 if(WIN32)
     # Native input: GameInput (Windows SDK gameinput.lib) for controllers.
-    target_link_libraries(superman_returns PRIVATE gameinput)
+    target_link_libraries(superman_returns PRIVATE gameinput xaudio2)
 endif()
 
 # Application icon (resources/superman_returns.ico, local and optional). It is the

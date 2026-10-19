@@ -13,6 +13,7 @@
 
 #include "frame_stats.h"
 #include "input/native_input.h"
+#include "audio_out/xaudio2_output.h"
 
 namespace native_audio {
 bool RunAudioSelfTest(uint8_t* base);  // native_audio/selftest.cpp
@@ -42,6 +43,9 @@ class SupermanReturnsApp : public rex::ReXApp {
   void OnPreSetup(rex::RuntimeConfig& config) override {
     // Native Windows input: GameInput controllers, Raw Input keyboard and mouse.
     config.input_factory = REX_INPUT_BACKEND(superman_returns::input::CreateInputSystem);
+    // Native Windows audio output (XAudio2) unless sr_audio_output=sdl.
+    if (superman_returns::audio_out::XAudio2Selected())
+      config.audio_factory = REX_AUDIO_BACKEND(superman_returns::audio_out::XAudio2AudioSystem);
     // Before anything reads the options a preset manages (sr_post_effects
     // below, sr_render_scale in render_scale.cpp).
     ApplySrPreset();
