@@ -495,6 +495,15 @@ class Renderer : public NativeFrontend {
   Microsoft::WRL::ComPtr<ID3D12Resource> rt_frame_buffer_;
   D3D12_RESOURCE_STATES rt_frame_state_ = D3D12_RESOURCE_STATE_COMMON;
   uint64_t rt_frame_swap_ = ~0ull;
+  // DXR scene (rt_shadows.cpp): step 2 holds one test cube.
+  bool EnsureRtScene(const float inv_light[16]);
+  Microsoft::WRL::ComPtr<ID3D12Device5> rt_device_;
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> rt_list_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> rt_cube_vb_, rt_cube_ib_, rt_blas_, rt_tlas_,
+      rt_instances_, rt_scratch_;
+  bool rt_scene_ready_ = false;
+  float rt_cube_center_[3] = {};
+  bool rt_scene_failed_ = false;
   bool ssao_ = false;
   HostSurface* scene_rt_ = nullptr;  // HDR scene target of the Opaque pass
   HostSurface* scene_ds_ = nullptr;

@@ -210,6 +210,7 @@ if(WIN32 AND EXISTS "${SR_REXGPU_SOURCE_DIR}/src/graphics/d3d12/command_processo
             ${SR_NATIVE_ROOT}/guest_cpu_profile.cpp
             ${SR_NATIVE_ROOT}/native_graphics_system.cpp
             ${SR_NATIVE_ROOT}/native_renderer.cpp
+            ${SR_NATIVE_ROOT}/rt_shadows.cpp
             ${SR_NATIVE_ROOT}/pm4_mirror.cpp
             ${SR_NATIVE_ROOT}/../graphics/guest/draw_state.cpp
             ${SR_NATIVE_ROOT}/../graphics/guest/captured_batch.cpp

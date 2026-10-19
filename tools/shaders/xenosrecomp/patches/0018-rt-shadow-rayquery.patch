@@ -1,0 +1,52 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index b25e8ac..0d7fec9 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -247,9 +247,33 @@ float3 srRtWorldPos(float3 lightCoord)
+     float4 p = float4(lightCoord, 1.0);
+     return float3(dot(asfloat(b.Load4(0)), p), dot(asfloat(b.Load4(16)), p), dot(asfloat(b.Load4(32)), p));
+ }
++// TLAS at the last heap entry (bytes 48-59 of the frame data: direction towards
++// the sun; 72: scene valid). 1 = sun visible, 0 = an occluder is hit.
++#if __SHADER_TARGET_MAJOR > 6 || (__SHADER_TARGET_MAJOR == 6 && __SHADER_TARGET_MINOR >= 5)
++RaytracingAccelerationStructure g_RtTlas : register(t32767, space8);
++float srRtVisibility(float3 worldPos)
++{
++    ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
++    if (b.Load(72) == 0)
++        return 1.0;
++    float3 sun = asfloat(b.Load3(48));
++    RayDesc ray;
++    ray.Origin = worldPos + sun * 0.05;
++    ray.TMin = 0.02;
++    ray.Direction = sun;
++    ray.TMax = 20000.0;
++    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
++    q.TraceRayInline(g_RtTlas, RAY_FLAG_NONE, 0xFF, ray);
++    q.Proceed();
++    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
++}
++#else
++float srRtVisibility(float3 worldPos) { return 1.0; }
++#endif
+ #else
+ uint srRtDebug() { return 0; }
+ float3 srRtWorldPos(float3 lightCoord) { return lightCoord; }
++float srRtVisibility(float3 worldPos) { return 1.0; }
+ #endif
+ #ifdef SR_VULKAN_BUFFERS
+ [[vk::binding(0,2)]] SamplerState g_SamplerDescriptorHeap[32];
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index aa90a3f..23026f4 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -2719,7 +2719,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     if (srShadowReceiver && (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_COLOR0))
+                     {
+                         indent();
+-                        out += "[branch] if (srRtDebug() == 1) { oC0 = float4(frac(srRtWorldPos(iSrLight.xyz) / 10.0), 1.0); }";
++                        out += "[branch] if (srRtDebug() == 1) { oC0 = float4(frac(srRtWorldPos(iSrLight.xyz) / 10.0), 1.0); } "
++                               "else if (srRtDebug() == 2) { oC0 = float4(srRtVisibility(srRtWorldPos(iSrLight.xyz)).xxx, 1.0); }";
+                     }
+                     // Xenos fixed-point render targets (k_16_16, k_16_16_16_16)
+                     // store -32..32: every write clamps there. The host keeps

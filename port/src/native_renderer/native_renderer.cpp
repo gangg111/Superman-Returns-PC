@@ -227,8 +227,9 @@ REXCVAR_DEFINE_DOUBLE(sr_native_render_scale, 0.0, "Superman Returns Native",
     .range(0.0, 4.0);
 REXCVAR_DEFINE_INT32(sr_rt_shadow_debug, 0, "Superman Returns Native",
                      "Ray-traced shadows debug view: 0 = off, 1 = the sun shadow receivers paint "
-                     "their world position as a 10-unit grid (docs/cienie-rt-projekt.md)")
-    .range(0, 1);
+                     "their world position as a 10-unit grid, 2 = their ray-traced sun visibility "
+                     "(white lit, black shadowed; docs/cienie-rt-projekt.md)")
+    .range(0, 2);
 REXCVAR_DEFINE_INT32(sr_native_shadow_quality, 4, "Superman Returns Native",
                      "Shadow map resolution multiplier (1 = original 1024, 2 = 2048, 4 = 4096)")
     .range(1, 4);
@@ -1266,7 +1267,7 @@ bool Renderer::EnsureInitialized() {
 
 bool Renderer::CreateDrawResources() {
   // --- Main root signature: 3 root CBVs + bindless SRV/sampler tables. ---
-  D3D12_DESCRIPTOR_RANGE srv_ranges[6] = {};
+  D3D12_DESCRIPTOR_RANGE srv_ranges[7] = {};
   for (uint32_t i = 0; i < 3; ++i) {
     srv_ranges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     srv_ranges[i].NumDescriptors = kSrvHeapSize;
@@ -1308,8 +1309,13 @@ bool Renderer::CreateDrawResources() {
   srv_ranges[5].NumDescriptors = kSrvHeapSize;
   srv_ranges[5].RegisterSpace = 9;
   srv_ranges[5].OffsetInDescriptorsFromTableStart = 0;
+  // space8: ray-tracing acceleration structures (TLAS at kRtTlasSrv), same heap.
+  srv_ranges[6].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  srv_ranges[6].NumDescriptors = kSrvHeapSize;
+  srv_ranges[6].RegisterSpace = 8;
+  srv_ranges[6].OffsetInDescriptorsFromTableStart = 0;
   params[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  params[8].DescriptorTable.NumDescriptorRanges = 2;
+  params[8].DescriptorTable.NumDescriptorRanges = 3;
   params[8].DescriptorTable.pDescriptorRanges = &srv_ranges[4];
   params[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   rs_desc.NumParameters = 9;
@@ -2271,13 +2277,21 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   m[15] = 1.0f;
   float inv[16];
   if (!Invert4x4(m, inv)) return;
+  // Towards the sun: light-space depth grows away from the light (row Z).
+  float sun[3] = {-m[8], -m[9], -m[10]};
+  const float len = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+  if (len <= 0.0f) return;
+  for (float& v : sun) v /= len;
+  EnsureRtScene(inv);
   UploadAlloc up;
   if (!Upload(256, 256, up)) return;
   uint32_t* data = reinterpret_cast<uint32_t*>(up.cpu);
   std::memset(data, 0, 256);
   std::memcpy(data, inv, 48);
+  std::memcpy(&data[12], sun, 12);
   data[16] = uint32_t(REXCVAR_GET(sr_rt_shadow_debug));
   data[17] = 1;
+  data[18] = rt_scene_ready_ ? 1u : 0u;
   Transition(rt_frame_buffer_.Get(), rt_frame_state_, D3D12_RESOURCE_STATE_COPY_DEST);
   command_list_->CopyBufferRegion(rt_frame_buffer_.Get(), 0, up.resource, up.offset, 256);
   Transition(rt_frame_buffer_.Get(), rt_frame_state_,

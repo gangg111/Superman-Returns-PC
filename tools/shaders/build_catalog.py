@@ -203,7 +203,8 @@ def process(s, a, dirs):
     res["dxil_size"] = dx.stat().st_size
     if spec:
         lib = dirs["dxil"] / f"{stem}.lib.dxil"
-        rc, out, err = run([a.dxc, "-T", "lib_6_3", *base, "-Qstrip_debug", "-Qstrip_reflect", str(hlsl), "-Fo", str(lib)])
+        lib_prof = "lib_6_5" if prof == "ps_6_5" else "lib_6_3"  # RayQuery receivers
+        rc, out, err = run([a.dxc, "-T", lib_prof, *base, "-Qstrip_debug", "-Qstrip_reflect", str(hlsl), "-Fo", str(lib)])
         if rc != 0:
             (dirs["logs"] / f"{stem}.lib.log").write_text(err + out)
             res["failure"] = "dxc lib_6_3: " + first_error(err + out)
