@@ -7,22 +7,28 @@ to-png <dump_dir> <out_dir>
     to it with "kind": color, mono (one channel shown as grey) or normal
     (two-channel normal map: do not run it through an image upscaler).
 
-to-dds <png_dir> <out_dir>
+to-dds <png_dir> <out_dir> [--codec bc7|rgba8]
     Finished PNGs (any size, same <name>.png) to <name>.dds for
-    sr_texture_replace_dir: R8G8B8A8_UNORM, DX10 header, full mip chain
-    (2x2 box average). The renderer uploads them with the identity mapping.
+    sr_texture_replace_dir, full mip chain, DX10 header. bc7 (default when
+    .tools/directxtex/texconv.exe exists): BC7_UNORM compressed on the GPU by
+    Microsoft texconv, 4x smaller than rgba8. rgba8: R8G8B8A8_UNORM with 2x2
+    box-average mips, no external tool. The renderer uploads both with the
+    identity mapping.
 """
 import argparse
 import json
 import pathlib
 import struct
+import subprocess
 import sys
+import tempfile
 
 import numpy as np
 from PIL import Image
 
 DXGI_R8_UNORM = 61
 DXGI_R8G8B8A8_UNORM = 28
+TEXCONV = pathlib.Path(__file__).resolve().parents[2] / ".tools" / "directxtex" / "texconv.exe"
 
 
 def read_dds(path):
@@ -117,14 +123,32 @@ def write_dds(path, rgba):
             f.write(np.ascontiguousarray(level).tobytes())
 
 
-def to_dds(png_dir, out_dir):
+def to_dds_bc7(pngs, out_dir, texconv=TEXCONV):
+    """BC7_UNORM with a full mip chain, all files in one texconv run."""
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as flist:
+        flist.write("".join(str(p.resolve()) + "\n" for p in pngs))
+    try:
+        r = subprocess.run([str(texconv), "-nologo", "-y", "-f", "BC7_UNORM", "-m", "0",
+                            "-o", str(out_dir.resolve()), "-flist", flist.name],
+                           capture_output=True, text=True)
+    finally:
+        pathlib.Path(flist.name).unlink()
+    missing = [p.stem for p in pngs if not (out_dir / (p.stem + ".dds")).exists()]
+    if r.returncode or missing:
+        raise SystemExit(f"texconv failed ({r.returncode}), missing {len(missing)}: "
+                         f"{r.stdout[-400:]}{r.stderr[-400:]}")
+
+
+def to_dds(png_dir, out_dir, codec=None):
     out_dir.mkdir(parents=True, exist_ok=True)
-    n = 0
-    for png in sorted(png_dir.glob("*.png")):
-        rgba = np.asarray(Image.open(png).convert("RGBA"))
-        write_dds(out_dir / (png.stem + ".dds"), rgba)
-        n += 1
-    print("to-dds:", n, "textures")
+    pngs = sorted(png_dir.glob("*.png"))
+    codec = codec or ("bc7" if TEXCONV.exists() else "rgba8")
+    if codec == "bc7":
+        to_dds_bc7(pngs, out_dir)
+    else:
+        for png in pngs:
+            write_dds(out_dir / (png.stem + ".dds"), np.asarray(Image.open(png).convert("RGBA")))
+    print("to-dds:", len(pngs), "textures,", codec)
 
 
 def main(argv=None):
@@ -132,8 +156,12 @@ def main(argv=None):
     p.add_argument("command", choices=["to-png", "to-dds"])
     p.add_argument("src", type=pathlib.Path)
     p.add_argument("dst", type=pathlib.Path)
+    p.add_argument("--codec", choices=["bc7", "rgba8"], help="to-dds only")
     a = p.parse_args(argv)
-    (to_png if a.command == "to-png" else to_dds)(a.src, a.dst)
+    if a.command == "to-png":
+        to_png(a.src, a.dst)
+    else:
+        to_dds(a.src, a.dst, a.codec)
 
 
 if __name__ == "__main__":

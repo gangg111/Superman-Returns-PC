@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -61,7 +62,7 @@ def test_to_dds_mips_and_roundtrip(tmp_path):
     rgba = np.array([[[0, 0, 1, 255], [100, 0, 0, 255]],
                      [[0, 200, 0, 255], [0, 0, 40, 255]]], np.uint8)
     Image.fromarray(rgba, "RGBA").save(src / "n.png")
-    texture_png.to_dds(src, out)
+    texture_png.to_dds(src, out, "rgba8")
     data = (out / "n.dds").read_bytes()
     # header: 2x2, mip count 2 (2x2 and 1x1), DXGI 28
     assert struct.unpack_from("<2I", data, 12) == (2, 2)
@@ -75,3 +76,28 @@ def test_to_dds_mips_and_roundtrip(tmp_path):
     assert level1.tolist() == [25, 50, 10, 255]
     # independent decoder (Pillow) reads mip 0 back unchanged
     assert (np.asarray(Image.open(out / "n.dds").convert("RGBA")) == rgba).all()
+
+
+@pytest.mark.skipif(not texture_png.TEXCONV.exists(),
+                    reason="needs .tools/directxtex/texconv.exe (Microsoft DirectXTex)")
+def test_to_dds_bc7(tmp_path):
+    src, out = tmp_path / "png", tmp_path / "dds"
+    src.mkdir()
+    # 64x32 of flat 4x4 blocks (a different colour and alpha per block),
+    # two files in one texconv run
+    by, bx = np.mgrid[0:32, 0:64] // 4
+    rgba = np.stack([bx * 16, by * 32, 255 - bx * 16, 255 - by * 16], -1).astype(np.uint8)
+    for n in ("a", "b"):
+        Image.fromarray(rgba, "RGBA").save(src / f"{n}.png")
+    texture_png.to_dds(src, out, "bc7")
+    data = (out / "a.dds").read_bytes()
+    # source: DDS layout (width at 16, height at 12), DXGI_FORMAT_BC7_UNORM = 98,
+    # full chain for 64x32 = 7 levels (64, 32, 16, 8, 4, 2, 1)
+    assert struct.unpack_from("<2I", data, 12) == (32, 64)
+    assert struct.unpack_from("<I", data, 28)[0] == 7
+    assert struct.unpack_from("<I", data, 128)[0] == 98
+    assert (out / "b.dds").exists()
+    # independent decoder (Pillow). source: BC7 spec, endpoints of 7 bits plus a
+    # p-bit (modes 6, 7) or 7/8 bits (mode 5): a flat block comes back within 1 level
+    back = np.asarray(Image.open(out / "a.dds").convert("RGBA")).astype(int)
+    assert np.abs(back - rgba).max() <= 1
