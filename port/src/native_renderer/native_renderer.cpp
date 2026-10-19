@@ -1170,6 +1170,19 @@ bool Renderer::EnsureInitialized() {
   });
   provider_ = &presenter_->provider();
   device_ = provider_->GetDevice();
+  {
+    // Ray-traced sun shadows (docs/cienie-rt-projekt.md) need DXR 1.1 inline
+    // RayQuery in pixel shaders (shader model 6.5).
+    D3D12_FEATURE_DATA_D3D12_OPTIONS5 options5{};
+    D3D12_FEATURE_DATA_SHADER_MODEL shader_model{D3D_SHADER_MODEL_6_5};
+    const bool have5 = SUCCEEDED(
+        device_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options5, sizeof(options5)));
+    const bool have_sm = SUCCEEDED(
+        device_->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model, sizeof(shader_model)));
+    REXLOG_INFO("native: raytracing tier {:X} (1.1 = 11), highest shader model {:X}",
+                have5 ? uint32_t(options5.RaytracingTier) : 0u,
+                have_sm ? uint32_t(shader_model.HighestShaderModel) : 0u);
+  }
   queue_ = provider_->GetDirectQueue();
   if (REXCVAR_GET(sr_native_own_queue)) {
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
