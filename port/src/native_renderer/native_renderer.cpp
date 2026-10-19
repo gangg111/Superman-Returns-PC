@@ -225,6 +225,16 @@ REXCVAR_DEFINE_DOUBLE(sr_native_render_scale, 0.0, "Superman Returns Native",
                       "1.5 = 1080p, 2 = 1440p, 3 = 2160p, 4 = 2880p); 0 = automatic, the "
                       "primary display's physical height / 720")
     .range(0.0, 4.0);
+REXCVAR_DEFINE_BOOL(sr_rt_shadows, false, "Superman Returns Native",
+                    "Ray-traced sun shadows from the city geometry the game draws (DXR, "
+                    "docs/cienie-rt-projekt.md)");
+REXCVAR_DEFINE_INT32(sr_rt_dump_obj_swap, 0, "Superman Returns Native",
+                     "Debug: at this guest swap, write the ray-traced shadow geometry captured in "
+                     "that frame (world space, from guest memory) to sr_native_dump_dir/rt_city.obj");
+REXCVAR_DEFINE_DOUBLE(sr_rt_shadow_bias, 0.5, "Superman Returns Native",
+                      "Ray-traced shadows: start offset of the shadow ray towards the sun (world "
+                      "units), against the ray hitting the surface it starts on")
+    .range(0.0, 50.0);
 REXCVAR_DEFINE_INT32(sr_rt_shadow_debug, 0, "Superman Returns Native",
                      "Ray-traced shadows debug view: 0 = off, 1 = the sun shadow receivers paint "
                      "their world position as a 10-unit grid, 2 = their ray-traced sun visibility "
@@ -2282,7 +2292,14 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   const float len = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
   if (len <= 0.0f) return;
   for (float& v : sun) v /= len;
-  EnsureRtScene(inv);
+  if (REXCVAR_GET(sr_rt_shadows)) {
+    // Anchor of the city instance window: the first cascade's centre.
+    float anchor[3];
+    for (int r = 0; r < 3; ++r) anchor[r] = inv[r * 4] * 0.5f + inv[r * 4 + 1] * 0.5f + inv[r * 4 + 2] * 0.5f + inv[r * 4 + 3];
+    RtBuildCityTlas(anchor);
+  } else {
+    EnsureRtScene(inv);
+  }
   UploadAlloc up;
   if (!Upload(256, 256, up)) return;
   uint32_t* data = reinterpret_cast<uint32_t*>(up.cpu);
@@ -2291,7 +2308,9 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   std::memcpy(&data[12], sun, 12);
   data[16] = uint32_t(REXCVAR_GET(sr_rt_shadow_debug));
   data[17] = 1;
-  data[18] = rt_scene_ready_ ? 1u : 0u;
+  data[18] = (REXCVAR_GET(sr_rt_shadows) ? rt_city_ready_ : rt_scene_ready_) ? 1u : 0u;
+  const float bias = float(REXCVAR_GET(sr_rt_shadow_bias));
+  std::memcpy(&data[19], &bias, 4);
   Transition(rt_frame_buffer_.Get(), rt_frame_state_, D3D12_RESOURCE_STATE_COPY_DEST);
   command_list_->CopyBufferRegion(rt_frame_buffer_.Get(), 0, up.resource, up.offset, 256);
   Transition(rt_frame_buffer_.Get(), rt_frame_state_,
@@ -2302,6 +2321,194 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
     REXLOG_INFO("native: rt frame light rows ({:.4f} {:.4f} {:.4f} {:.4f}) ({:.4f} {:.4f} {:.4f} {:.4f}) "
                 "({:.4f} {:.4f} {:.4f} {:.4f}) from vs {:016X}", m[0], m[1], m[2], m[3], m[4], m[5],
                 m[6], m[7], m[8], m[9], m[10], m[11], current_vs_hash_);
+  }
+}
+
+namespace {
+struct WorldRegs {
+  uint64_t hash;
+  uint32_t reg, skinned;
+};
+constexpr WorldRegs kWorldRegs[] = {
+#include "rt_world_regs.inc"
+};
+uint64_t RtMix(uint64_t h, uint64_t v) {
+  h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+  return h;
+}
+// Position formats DXR builds from directly (the host vertex buffers hold
+// little-endian elements, swapped on upload). Quantised formats the vertex
+// shader rescales are left out.
+DXGI_FORMAT RtPositionFormat(DXGI_FORMAT host) {
+  switch (host) {
+    case DXGI_FORMAT_R32G32B32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+      return DXGI_FORMAT_R32G32B32_FLOAT;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default:
+      return DXGI_FORMAT_UNKNOWN;
+  }
+}
+}  // namespace
+
+// Ray-traced shadows, step 3: remember the static meshes the game draws as
+// shadow receivers (the city), one BLAS each, and their world matrices as
+// TLAS instances for the following frames.
+void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd,
+                             const BufferEntry* ib, uint32_t start_index, uint32_t index_count,
+                             int32_t base_vertex) {
+  if (!REXCVAR_GET(sr_rt_shadows)) return;
+  static uint64_t calls = 0, no_receiver = 0, no_world = 0, no_pos = 0, bad_args = 0, last_diag = 0;
+  ++calls;
+  if (swap_number_ >= last_diag + 600) {
+    last_diag = swap_number_;
+    REXLOG_INFO("native: rt capture diag: indexed triangle-list draws {}, not receiver {}, no world {}, "
+                "no position {}, bad args {}, skinned {}, format {}, captured {}, meshes {}, instances {}",
+                calls, no_receiver, no_world, no_pos, bad_args, rt_stats_.skip_skinned,
+                rt_stats_.skip_format, rt_stats_.captured, rt_meshes_.size(), rt_city_instances_.size());
+  }
+  if (!ib || base_vertex < 0 || index_count < 3) { ++bad_args; return; }
+  const ShadowRegs* send = std::end(kShadowRegs);
+  const ShadowRegs* sit = std::lower_bound(std::begin(kShadowRegs), send, current_vs_hash_,
+                                           [](const ShadowRegs& e, uint64_t h) { return e.hash < h; });
+  if (sit == send || sit->hash != current_vs_hash_) { ++no_receiver; return; }  // not a sun shadow receiver
+  const WorldRegs* wend = std::end(kWorldRegs);
+  const WorldRegs* wit = std::lower_bound(std::begin(kWorldRegs), wend, current_vs_hash_,
+                                          [](const WorldRegs& e, uint64_t h) { return e.hash < h; });
+  if (wit == wend || wit->hash != current_vs_hash_) { ++no_world; return; }
+  if (wit->skinned) { ++rt_stats_.skip_skinned; return; }
+  // Position element and its stream.
+  const StreamPlan* pos_stream = nullptr;
+  uint32_t pos_offset = 0;
+  DXGI_FORMAT pos_format = DXGI_FORMAT_UNKNOWN;
+  for (uint32_t i = 0; i < cmd.stream_count && !pos_stream; ++i) {
+    const StreamPlan& sp = batch.streams[cmd.stream_first + i];
+    for (const auto& a : ReadVertexDeclaration(base, sp.buffer.decl)) {
+      if (a.stream != sp.stream || a.usage != 0 || a.index != 0) continue;
+      pos_stream = &sp;
+      pos_offset = a.offset;
+      pos_format = RtPositionFormat(MapDeclType(a.type).format);
+      break;
+    }
+  }
+  if (!pos_stream) { ++no_pos; return; }
+  if (pos_format == DXGI_FORMAT_UNKNOWN) { ++rt_stats_.skip_format; return; }
+  ++rt_stats_.captured;
+  uint64_t key = RtMix(pos_stream->buffer.key, pos_stream->offset);
+  key = RtMix(key, (uint64_t(pos_stream->stride) << 32) | pos_offset);
+  key = RtMix(key, cmd.index.key);
+  key = RtMix(key, (uint64_t(start_index) << 32) | index_count);
+  key = RtMix(key, uint64_t(uint32_t(base_vertex)));
+  // World matrix rows (the vertex shader's gWorldXform, dot products with the
+  // position), the same world space the receivers' light rows use.
+  const float* c = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase);
+  RtInstance instance;
+  instance.mesh = key;
+  std::memcpy(instance.transform, c + wit->reg * 4, sizeof(instance.transform));
+  instance.first_swap = instance.last_swap = swap_number_;
+  uint64_t ikey = key;
+  for (float v : instance.transform) ikey = RtMix(ikey, uint64_t(int64_t(std::lround(double(v) * 64.0))));
+  auto mit = rt_meshes_.find(key);
+  if (mit == rt_meshes_.end()) {
+    if (rt_builds_swap_ != swap_number_) {
+      rt_builds_swap_ = swap_number_;
+      rt_builds_this_frame_ = 0;
+    }
+    if (rt_builds_this_frame_ >= 64) { ++rt_stats_.skip_budget; return; }
+    auto vb_it = buffers_.find(pos_stream->buffer.key);  // already uploaded by BindVertexStreams
+    if (vb_it == buffers_.end() || !vb_it->second.resource) return;
+    const BufferEntry* vb = &vb_it->second;
+    const uint32_t stride = pos_stream->stride;
+    const uint64_t first = uint64_t(base_vertex) * stride;
+    if (!stride || first + pos_offset >= pos_stream->size) return;
+    const bool index32 = cmd.index32;
+    D3D12_RAYTRACING_GEOMETRY_DESC geometry{};
+    geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geometry.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    geometry.Triangles.VertexBuffer.StartAddress =
+        vb->resource->GetGPUVirtualAddress() + pos_stream->offset + first + pos_offset;
+    geometry.Triangles.VertexBuffer.StrideInBytes = stride;
+    geometry.Triangles.VertexFormat = pos_format;
+    geometry.Triangles.VertexCount = UINT((pos_stream->size - first - pos_offset) / stride);
+    geometry.Triangles.IndexBuffer =
+        ib->resource->GetGPUVirtualAddress() + uint64_t(start_index) * (index32 ? 4 : 2);
+    geometry.Triangles.IndexFormat = index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
+    geometry.Triangles.IndexCount = index_count - index_count % 3;
+    RtMesh mesh;
+    if (!RtBuildBlas(geometry, mesh)) return;
+    mesh.triangles = index_count / 3;
+    ++rt_builds_this_frame_;
+    ++rt_stats_.new_meshes;
+    mit = rt_meshes_.emplace(key, std::move(mesh)).first;
+  }
+  mit->second.last_swap = swap_number_;
+  if (REXCVAR_GET(sr_rt_dump_obj_swap) > 0 &&
+      swap_number_ == uint64_t(REXCVAR_GET(sr_rt_dump_obj_swap)) &&
+      !rt_city_instances_.count(ikey) && pos_format == DXGI_FORMAT_R32G32B32_FLOAT) {
+    // Debug export: the same vertices and indices from guest memory (big
+    // endian), transformed with the instance matrix.
+    static std::FILE* obj = nullptr;
+    static uint32_t written_vertices = 0, written_meshes = 0;
+    if (!obj) {
+      const std::string path = REXCVAR_GET(sr_native_dump_dir) + "/rt_city.obj";
+      obj = std::fopen(path.c_str(), "w");
+    }
+    if (obj && written_vertices < 2000000) {
+      auto be32 = [&](uint32_t addr) {
+        const uint8_t* q = GuestPtr(base, 0xA0000000u + addr, 4);
+        return (uint32_t(q[0]) << 24) | (uint32_t(q[1]) << 16) | (uint32_t(q[2]) << 8) | q[3];
+      };
+      const uint32_t isize = cmd.index32 ? 4 : 2;
+      uint32_t lo = ~0u, hi = 0;
+      std::vector<uint32_t> idx(index_count - index_count % 3);
+      for (uint32_t i = 0; i < idx.size(); ++i) {
+        const uint32_t a = cmd.index.address + (start_index + i) * isize;
+        uint32_t v;
+        if (isize == 4) {
+          v = be32(a);
+        } else {
+          const uint8_t* q = GuestPtr(base, 0xA0000000u + a, 2);
+          v = (uint32_t(q[0]) << 8) | q[1];
+        }
+        idx[i] = v;
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+      }
+      if (lo <= hi && hi - lo < 200000) {
+        const float* t = instance.transform;
+        for (uint32_t v = lo; v <= hi; ++v) {
+          const uint32_t a = pos_stream->buffer.address + pos_stream->offset +
+                             (uint32_t(base_vertex) + v) * pos_stream->stride + pos_offset;
+          float pp[3];
+          for (int k = 0; k < 3; ++k) {
+            const uint32_t w = be32(a + 4 * k);
+            std::memcpy(&pp[k], &w, 4);
+          }
+          std::fprintf(obj, "v %.3f %.3f %.3f\n", t[0] * pp[0] + t[1] * pp[1] + t[2] * pp[2] + t[3],
+                       t[4] * pp[0] + t[5] * pp[1] + t[6] * pp[2] + t[7],
+                       t[8] * pp[0] + t[9] * pp[1] + t[10] * pp[2] + t[11]);
+        }
+        std::fprintf(obj, "g mesh_%u_vs_%016llX\n", written_meshes++, (unsigned long long)current_vs_hash_);
+        for (uint32_t i = 0; i + 2 < idx.size(); i += 3)
+          std::fprintf(obj, "f %u %u %u\n", written_vertices + idx[i] - lo + 1,
+                       written_vertices + idx[i + 1] - lo + 1, written_vertices + idx[i + 2] - lo + 1);
+        written_vertices += hi - lo + 1;
+        std::fflush(obj);
+      }
+    }
+  }
+  // Same mesh and same matrix again: keep when it was first seen (static
+  // objects accumulate age; moving ones get a new key every frame).
+  auto [iit, inserted] = rt_city_instances_.try_emplace(ikey, instance);
+  if (!inserted) iit->second.last_swap = swap_number_;
+  static uint64_t last_log = 0;
+  if (swap_number_ >= last_log + 600) {
+    last_log = swap_number_;
+    REXLOG_INFO("native: rt city: {} meshes, {} instances; captured {}, new {}, skipped format {} "
+                "skinned {} budget {}", rt_meshes_.size(), rt_city_instances_.size(), rt_stats_.captured,
+                rt_stats_.new_meshes, rt_stats_.skip_format, rt_stats_.skip_skinned,
+                rt_stats_.skip_budget);
   }
 }
 
@@ -5529,6 +5736,8 @@ void Renderer::ExecDrawIndexedVertices(uint8_t* base, const WorkBatch& batch,
   if (!SkipGpuDraw()) command_list_->DrawIndexedInstanced(index_count, 1, start_index, base_vertex, 0);
   ++stats_.draws; ++trace_draws_; Breadcrumb();
   ++stats_.pass_draws[g_current_pass & 31];
+  if (topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+    RtCaptureDraw(base, batch, cmd, ib, start_index, index_count, base_vertex);
 }
 
 // Xenos rectangle list: every 3 vertices describe a rectangle. As in Xenia's

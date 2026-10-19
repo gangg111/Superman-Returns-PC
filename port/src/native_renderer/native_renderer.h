@@ -503,6 +503,34 @@ class Renderer : public NativeFrontend {
       rt_instances_, rt_scratch_;
   bool rt_scene_ready_ = false;
   float rt_cube_center_[3] = {};
+  // City geometry (step 3): one BLAS per static mesh drawn by the game, one
+  // TLAS instance per (mesh, world matrix) seen recently.
+  struct BufferEntry;
+  void RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd, const BufferEntry* ib,
+                     uint32_t start_index, uint32_t index_count, int32_t base_vertex);
+  bool RtBuildCityTlas(const float sun_anchor[3]);
+  struct RtMesh {
+    Microsoft::WRL::ComPtr<ID3D12Resource> blas;
+    uint64_t last_swap = 0;
+    uint32_t triangles = 0;
+  };
+  struct RtInstance {
+    uint64_t mesh = 0;
+    float transform[12] = {};
+    uint64_t first_swap = 0, last_swap = 0;
+  };
+  bool RtBuildBlas(const D3D12_RAYTRACING_GEOMETRY_DESC& geometry, RtMesh& mesh);
+  std::unordered_map<uint64_t, RtMesh> rt_meshes_;
+  std::unordered_map<uint64_t, RtInstance> rt_city_instances_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> rt_city_tlas_, rt_build_scratch_;
+  uint64_t rt_city_tlas_size_ = 0, rt_build_scratch_size_ = 0;
+  uint64_t rt_builds_swap_ = 0;
+  uint32_t rt_builds_this_frame_ = 0;
+  bool rt_city_ready_ = false;
+  struct RtStats {
+    uint64_t captured = 0, new_meshes = 0, skip_format = 0, skip_prim = 0, skip_budget = 0,
+             skip_skinned = 0;
+  } rt_stats_;
   bool rt_scene_failed_ = false;
   bool ssao_ = false;
   HostSurface* scene_rt_ = nullptr;  // HDR scene target of the Opaque pass

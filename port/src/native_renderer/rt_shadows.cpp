@@ -182,4 +182,141 @@ bool Renderer::EnsureRtScene(const float inv_light[16]) {
   return true;
 }
 
+// One bottom-level structure for a game mesh (built on the frame's command
+// list while the vertex/index buffers are current). The scratch buffer is
+// shared by every build of the frame; a UAV barrier separates them.
+bool Renderer::RtBuildBlas(const D3D12_RAYTRACING_GEOMETRY_DESC& geometry, RtMesh& mesh) {
+  if ((!rt_device_ && FAILED(device_->QueryInterface(IID_PPV_ARGS(&rt_device_)))) ||
+      (!rt_list_ && FAILED(command_list_.As(&rt_list_)))) {
+    return false;
+  }
+  D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+  inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+  inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+  inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+  inputs.NumDescs = 1;
+  inputs.pGeometryDescs = &geometry;
+  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+  rt_device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+  if (!info.ResultDataMaxSizeInBytes) return false;
+  if (info.ScratchDataSizeInBytes > rt_build_scratch_size_) {
+    if (rt_build_scratch_) Retire(std::move(rt_build_scratch_));
+    rt_build_scratch_size_ = std::max<uint64_t>(info.ScratchDataSizeInBytes, 4u << 20);
+    rt_build_scratch_ = MakeBuffer(device_, rt_build_scratch_size_, D3D12_HEAP_TYPE_DEFAULT,
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+    if (!rt_build_scratch_) {
+      rt_build_scratch_size_ = 0;
+      return false;
+    }
+  }
+  mesh.blas = MakeBuffer(device_, info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
+                         D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
+  if (!mesh.blas) return false;
+  D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build{};
+  build.Inputs = inputs;
+  build.DestAccelerationStructureData = mesh.blas->GetGPUVirtualAddress();
+  build.ScratchAccelerationStructureData = rt_build_scratch_->GetGPUVirtualAddress();
+  rt_list_->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+  D3D12_RESOURCE_BARRIER uav{};
+  uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  uav.UAV.pResource = nullptr;  // scratch reuse and the following TLAS build
+  rt_list_->ResourceBarrier(1, &uav);
+  return true;
+}
+
+// Top-level structure of the city for this frame: every instance seen in the
+// last 900 frames within 4000 units of the first cascade's centre.
+bool Renderer::RtBuildCityTlas(const float anchor[3]) {
+  rt_city_ready_ = false;
+  if ((!rt_device_ && FAILED(device_->QueryInterface(IID_PPV_ARGS(&rt_device_)))) ||
+      (!rt_list_ && FAILED(command_list_.As(&rt_list_)))) {
+    return false;
+  }
+  // Static instances (same matrix for 30+ frames) stay 900 frames after they
+  // were last drawn, so geometry outside the view keeps casting; moving ones
+  // (a new matrix every frame) only 3.
+  for (auto it = rt_city_instances_.begin(); it != rt_city_instances_.end();) {
+    const RtInstance& in = it->second;
+    const uint64_t keep = in.last_swap >= in.first_swap + 30 ? 900 : 3;
+    if (swap_number_ > in.last_swap + keep) it = rt_city_instances_.erase(it);
+    else ++it;
+  }
+  for (auto it = rt_meshes_.begin(); it != rt_meshes_.end();) {
+    if (swap_number_ > it->second.last_swap + 1800) {
+      Retire(std::move(it->second.blas));
+      it = rt_meshes_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  std::vector<D3D12_RAYTRACING_INSTANCE_DESC> descs;
+  descs.reserve(rt_city_instances_.size());
+  const float radius2 = 4000.0f * 4000.0f;
+  for (const auto& [key, instance] : rt_city_instances_) {
+    auto mesh = rt_meshes_.find(instance.mesh);
+    if (mesh == rt_meshes_.end() || !mesh->second.blas) continue;
+    const float* t = instance.transform;
+    const float dx = t[3] - anchor[0], dy = t[7] - anchor[1], dz = t[11] - anchor[2];
+    if (dx * dx + dy * dy + dz * dz > radius2) continue;
+    D3D12_RAYTRACING_INSTANCE_DESC d{};
+    std::memcpy(d.Transform, t, sizeof(d.Transform));
+    d.InstanceMask = 0xFF;
+    d.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
+    d.AccelerationStructure = mesh->second.blas->GetGPUVirtualAddress();
+    descs.push_back(d);
+    if (descs.size() >= 32768) break;
+  }
+  if (descs.empty()) return false;
+  UploadAlloc up;
+  const size_t bytes = descs.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+  if (!Upload(bytes, D3D12_RAYTRACING_INSTANCE_DESCS_BYTE_ALIGNMENT, up)) return false;
+  std::memcpy(up.cpu, descs.data(), bytes);
+  D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
+  inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+  inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+  inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+  inputs.NumDescs = UINT(descs.size());
+  inputs.InstanceDescs = up.gpu;
+  D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO info{};
+  rt_device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
+  if (info.ScratchDataSizeInBytes > rt_build_scratch_size_) {
+    if (rt_build_scratch_) Retire(std::move(rt_build_scratch_));
+    rt_build_scratch_size_ = std::max<uint64_t>(info.ScratchDataSizeInBytes, 4u << 20);
+    rt_build_scratch_ = MakeBuffer(device_, rt_build_scratch_size_, D3D12_HEAP_TYPE_DEFAULT,
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
+    if (!rt_build_scratch_) {
+      rt_build_scratch_size_ = 0;
+      return false;
+    }
+  }
+  if (info.ResultDataMaxSizeInBytes > rt_city_tlas_size_) {
+    if (rt_city_tlas_) Retire(std::move(rt_city_tlas_));
+    rt_city_tlas_size_ = info.ResultDataMaxSizeInBytes * 2;
+    rt_city_tlas_ = MakeBuffer(device_, rt_city_tlas_size_, D3D12_HEAP_TYPE_DEFAULT,
+                               D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
+    if (!rt_city_tlas_) {
+      rt_city_tlas_size_ = 0;
+      return false;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.RaytracingAccelerationStructure.Location = rt_city_tlas_->GetGPUVirtualAddress();
+    device_->CreateShaderResourceView(
+        nullptr, &srv,
+        provider_->OffsetViewDescriptor(srv_heap_->GetCPUDescriptorHandleForHeapStart(), kRtTlasSrv));
+  }
+  D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build{};
+  build.Inputs = inputs;
+  build.DestAccelerationStructureData = rt_city_tlas_->GetGPUVirtualAddress();
+  build.ScratchAccelerationStructureData = rt_build_scratch_->GetGPUVirtualAddress();
+  rt_list_->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
+  D3D12_RESOURCE_BARRIER uav{};
+  uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+  uav.UAV.pResource = nullptr;
+  rt_list_->ResourceBarrier(1, &uav);
+  rt_city_ready_ = true;
+  return true;
+}
+
 }  // namespace superman_returns::native

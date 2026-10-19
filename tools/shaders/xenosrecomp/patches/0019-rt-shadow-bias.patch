@@ -1,0 +1,19 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 0d7fec9..c10c32d 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -257,9 +257,12 @@ float srRtVisibility(float3 worldPos)
+     if (b.Load(72) == 0)
+         return 1.0;
+     float3 sun = asfloat(b.Load3(48));
++    // Offset along the sun direction (bytes 76: sr_rt_shadow_bias, world units)
++    // so the ray does not hit the surface it starts on.
++    float bias = max(asfloat(b.Load(76)), 0.01);
+     RayDesc ray;
+-    ray.Origin = worldPos + sun * 0.05;
+-    ray.TMin = 0.02;
++    ray.Origin = worldPos + sun * bias;
++    ray.TMin = bias * 0.5;
+     ray.Direction = sun;
+     ray.TMax = 20000.0;
+     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;

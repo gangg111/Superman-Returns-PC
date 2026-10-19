@@ -35,6 +35,21 @@ def test_render_line_format():
     assert text.splitlines()[-1] == '{0x019F34AB2939340Dull, 19, 20, 21},'
 
 
+def test_collect_world_small_catalog():
+    shaders = [
+        {'type': 'vs', 'container_hash': 'B0', 'reflection': {'constants': [
+            {'name': 'gWorldXform', 'reg': 4, 'rows': 4}, {'name': 'RwSkinMatrices', 'reg': 10, 'rows': 1}]}},
+        {'type': 'vs', 'container_hash': 'A0', 'reflection': {'constants': [
+            {'name': 'gWorldXform', 'reg': 0, 'rows': 4}]}},
+        {'type': 'vs', 'container_hash': 'C0', 'reflection': {'constants': [
+            {'name': 'gWorldXform', 'reg': 0, 'rows': 3}]}},   # not 4 rows: skipped
+        {'type': 'vs', 'container_hash': 'D0', 'reflection': {'constants': [
+            {'name': 'Mobj', 'reg': 0, 'rows': 4}]}},           # caster pass world matrix
+    ]
+    # źródło: policzone ręcznie z wejścia powyżej (A0 bez skinningu, B0 ze skinningiem, D0 = Mobj)
+    assert gen_shadow_regs.collect_world(shaders) == [(0xA0, 0, 0), (0xB0, 4, 1), (0xD0, 0, 0)]
+
+
 @pytest.mark.skipif(not os.path.exists(CATALOG), reason='brak artifacts/shaders/catalog.json (lokalny korpus gry)')
 def test_real_catalog_known_shader():
     rows = gen_shadow_regs.collect(json.load(open(CATALOG))['shaders'])
