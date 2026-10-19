@@ -5,9 +5,9 @@
  TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
  #endif
 +// Stacked (2D array) textures fetched through a 3D instruction. Xenos reads
-+// array layer z * layers there (the hardware rounds the layer coordinate), not
-+// a volume; the renderer sets TEX_STACKED_BIT on the 3D index of such a slot
-+// and points it at an array view of the texture.
++// array layer floor(z * layers) (D3D would round to nearest even: 1.5 -> 2),
++// not a volume; the renderer sets TEX_STACKED_BIT on the 3D index of such a
++// slot and points it at an array view of the texture.
 +#ifdef SR_VULKAN_BUFFERS
 +[[vk::binding(3,1)]] Texture2DArray<float4> g_Texture2DArrayDescriptorHeap[32];
 +#else
@@ -27,7 +27,7 @@
 +        uint width, height, layers;
 +        stack.GetDimensions(width, height, layers);
 +        return conanGamma(resourceDescriptorIndex, stack.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex],
-+            float3(texCoord.xy, texCoord.z * float(layers))));
++            float3(texCoord.xy, min(floor(max(texCoord.z * float(layers), 0.0)), float(layers - 1)))));
 +    }
      return conanGamma(resourceDescriptorIndex, g_Texture3DDescriptorHeap[TEX_INDEX(resourceDescriptorIndex)].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord));
  }
