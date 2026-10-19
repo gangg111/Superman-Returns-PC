@@ -6429,6 +6429,7 @@ void Renderer::DumpFrameResources(const std::string& prefix, bool surfaces_only,
     std::string name;
     ID3D12Resource* resource;
     D3D12_RESOURCE_STATES* state;
+    uint32_t subresource = 0;  // array slice (stacked resolve textures: one file per layer)
   };
   std::vector<Item> items;
   for (auto& [key, surf] : surfaces_) {
@@ -6464,7 +6465,12 @@ void Renderer::DumpFrameResources(const std::string& prefix, bool surfaces_only,
     char n[96];
     std::snprintf(n, sizeof(n), "resolve_%08X_f%u_%ux%u", uint32_t(key >> 32), uint32_t(key) & 0xFF,
                   rt.width, rt.height);
-    items.push_back({n, rt.resource.Get(), &rt.state});
+    if (rt.layers <= 1) {
+      items.push_back({n, rt.resource.Get(), &rt.state});
+      continue;
+    }
+    for (uint32_t layer = 0; layer < rt.layers; ++layer)
+      items.push_back({std::string(n) + "_L" + std::to_string(layer), rt.resource.Get(), &rt.state, layer});
   }
   uint32_t written = 0;
   for (Item& item : items) {
@@ -6472,7 +6478,8 @@ void Renderer::DumpFrameResources(const std::string& prefix, bool surfaces_only,
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
     UINT rows;
     UINT64 row_size, total;
-    device_->GetCopyableFootprints(&desc, 0, 1, 0, &fp, &rows, &row_size, &total);
+    device_->GetCopyableFootprints(&desc, item.subresource, 1, 0, &fp, &rows, &row_size, &total);
+    fp.Offset = 0;
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_READBACK;
     D3D12_RESOURCE_DESC buf{};
@@ -6496,6 +6503,7 @@ void Renderer::DumpFrameResources(const std::string& prefix, bool surfaces_only,
     D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
     src.pResource = item.resource;
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = item.subresource;
     dst.pResource = readback.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint = fp;

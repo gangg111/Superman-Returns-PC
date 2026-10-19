@@ -22,7 +22,7 @@
 
 #include "generated/default/superman_returns_init.h"
 
-REXCVAR_DEFINE_DOUBLE(sr_shadow_range, 4.0, "Superman Returns",
+REXCVAR_DEFINE_DOUBLE(sr_shadow_range, 1.0, "Superman Returns",
                       "Dynamic shadow range multiplier (1 = original 750 units; the first cascade "
                       "and every cascade after it grow by this factor)")
     .range(1.0, 16.0)
