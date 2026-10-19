@@ -14,7 +14,8 @@ bool ValidateNativeApi(NativeApi api,bool compiled,const NativeVulkanOptions& op
   else if(options.ssao) error="Native Vulkan does not yet support SSAO (sr_native_ambient_occlusion)";
   else if(options.lsfg && !lsfg_compiled) error="Native Vulkan frame generation unavailable: rebuild with SR_LSFG=ON";
   else if(options.ab_mode) error="Native Vulkan cannot use the Xenos A/B presenter";
-  else if(options.render_scale!=1) error="Native Vulkan currently requires sr_native_render_scale=1";
+  // 0 = automatic: Vulkan has no internal scaling yet and renders at 720p.
+  else if(options.render_scale!=1 && options.render_scale!=0) error="Native Vulkan currently requires sr_native_render_scale=1 (or 0, automatic)";
   else if(options.msaa_samples!=1) error="Native Vulkan currently requires sr_native_msaa_samples=1";
   else if(options.shadow_quality!=1) error="Native Vulkan currently requires sr_native_shadow_quality=1";
   else if(options.bloom_quality!=1) error="Native Vulkan currently requires sr_native_bloom_quality=1";

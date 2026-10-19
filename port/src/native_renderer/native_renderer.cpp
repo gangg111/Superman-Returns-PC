@@ -220,10 +220,11 @@ REXCVAR_DEFINE_BOOL(sr_native_debug_buffers_always_dirty, false, "Superman Retur
                     "Debug: re-upload every draw's vertex/index range (ignores Unlock tracking)");
 REXCVAR_DEFINE_BOOL(sr_native_debug_clears, false, "Superman Returns Native", "Debug: log resolve depth clears");
 REXCVAR_DEFINE_BOOL(sr_native_debug_no_ztest, false, "Superman Returns Native", "Debug: disable all depth tests");
-REXCVAR_DEFINE_DOUBLE(sr_native_render_scale, 1.0, "Superman Returns Native",
+REXCVAR_DEFINE_DOUBLE(sr_native_render_scale, 0.0, "Superman Returns Native",
                       "Internal render resolution multiplier of 720p, may be fractional (1 = 720p, "
-                      "1.5 = 1080p, 2 = 1440p, 3 = 2160p, 4 = 2880p)")
-    .range(1.0, 4.0);
+                      "1.5 = 1080p, 2 = 1440p, 3 = 2160p, 4 = 2880p); 0 = automatic, the "
+                      "primary display's physical height / 720")
+    .range(0.0, 4.0);
 REXCVAR_DEFINE_INT32(sr_native_shadow_quality, 1, "Superman Returns Native",
                      "Shadow map resolution multiplier (1 = original 1024, 2 = 2048, 4 = 4096)")
     .range(1, 4);
@@ -1101,6 +1102,21 @@ bool Renderer::EnsureInitialized() {
   }
   init_failed_ = true;
   render_scale_ = float(std::clamp(REXCVAR_GET(sr_native_render_scale), 1.0, 4.0));
+  if (REXCVAR_GET(sr_native_render_scale) <= 0.0) {
+    // Automatic: the primary display's physical mode (not the DPI-scaled
+    // size), so a 4K screen at 150% gives 3 and a 1080p one 1.5.
+    // The process may be DPI-unaware (the mode is then reported scaled down):
+    // ask with a per-monitor-aware thread for the physical pixels.
+    const DPI_AWARENESS_CONTEXT previous =
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    DEVMODEW mode{};
+    mode.dmSize = sizeof(mode);
+    const double height = EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode)
+                              ? double(mode.dmPelsHeight) : 720.0;
+    if (previous) SetThreadDpiAwarenessContext(previous);
+    render_scale_ = float(std::clamp(height / 720.0, 1.0, 4.0));
+    REXLOG_INFO("native: automatic render scale {} from a {}-line display", render_scale_, height);
+  }
   shadow_scale_ = float(std::clamp(REXCVAR_GET(sr_native_shadow_quality), 1, 4));
   shadow_mul_ = float(std::clamp(REXCVAR_GET(sr_native_shadow_scale_mul), 0.25, 1.0));
   {
