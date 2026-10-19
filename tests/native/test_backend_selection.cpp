@@ -28,7 +28,8 @@ SR_TEST(native_vulkan_rejects_options_it_cannot_apply) {
   options={};options.ab_mode=true;SR_CHECK(!ValidateNativeApi(NativeApi::kVulkan,true,options,error));
   options={};options.shadow_quality=2;SR_CHECK(!ValidateNativeApi(NativeApi::kVulkan,true,options,error));
   options={};options.bloom_quality=2;SR_CHECK(!ValidateNativeApi(NativeApi::kVulkan,true,options,error));
-  options={};options.anisotropic_filtering=16;SR_CHECK(!ValidateNativeApi(NativeApi::kVulkan,true,options,error));
+  options={};options.anisotropic_filtering=16;SR_CHECK(ValidateNativeApi(NativeApi::kVulkan,true,options,error));  // supported since d7f483e
+  options={};options.render_scale=0;SR_CHECK(ValidateNativeApi(NativeApi::kVulkan,true,options,error));  // automatic: 720p on Vulkan
   options={};options.foliage_antialiasing=true;SR_CHECK(!ValidateNativeApi(NativeApi::kVulkan,true,options,error));
   SR_CHECK(ValidateNativeApi(NativeApi::kD3D12,false,options,error));
 }

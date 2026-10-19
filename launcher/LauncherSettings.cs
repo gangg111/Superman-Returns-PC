@@ -16,14 +16,14 @@ public sealed class LauncherSettings
     public string GpuLuid { get; set; } = "";
     public bool VSync { get; set; } = true;
     public string FpsLimit { get; set; } = "30";
-    public string RenderScale { get; set; } = "100";
-    public string TextureFilter { get; set; } = "Original";
+    public string RenderScale { get; set; } = "auto";
+    public string TextureFilter { get; set; } = "Anisotropic16x";
     public string Antialiasing { get; set; } = "Off";
     public string ShadowQuality { get; set; } = "1";
     public string Msaa { get; set; } = "1";
     public string InputMode { get; set; } = "KeyboardMouse";
     public string Renderer { get; set; } = "native";
-    public string GraphicsApi { get; set; } = "vulkan";
+    public string GraphicsApi { get; set; } = "d3d12";
     public bool UsesVulkan => GraphicsApi == "vulkan";
     public bool SkipIntro { get; set; }
     public bool FrameGeneration { get; set; }
@@ -102,13 +102,15 @@ public sealed class LauncherSettings
             && w >= 640 && w <= 8192 && h >= 480 && h <= 8192) { width = w; height = h; }
         int filter = TextureFilter switch { "Anisotropic2x" => 2, "Anisotropic4x" => 4,
             "Anisotropic8x" => 8, "Anisotropic16x" => 16, _ => -1 };
-        // Vulkan does not support the enhancement options yet: they stay at the
+        // Vulkan does not support most enhancement options yet: they stay at the
         // game's defaults so the engine accepts the launch (backend_selection.cpp).
+        // Anisotropic filtering works on both APIs.
         var vulkan = UsesVulkan;
-        var percent = vulkan ? 100 : ValidChoice(RenderScale, 100, 50, 75, 100, 125, 150, 200, 300, 400);
-        if (vulkan) filter = -1;
+        // "auto": the engine picks the scale from the display (sr_native_render_scale=0).
+        var autoScale = !vulkan && RenderScale == "auto";
+        var percent = vulkan || autoScale ? 100 : ValidChoice(RenderScale, 100, 50, 75, 100, 125, 150, 200, 300, 400);
         var lowScale = percent < 100;
-        var scale = (lowScale ? 100 : percent) / 100.0;
+        var scale = autoScale ? 0.0 : (lowScale ? 100 : percent) / 100.0;
         var result = new List<string> {
             $"--sr_renderer={(Renderer == "xenos" && !vulkan ? "xenos" : "native")}", "--sr_preset=custom",
             $"--sr_native_api={(vulkan ? "vulkan" : "d3d12")}",

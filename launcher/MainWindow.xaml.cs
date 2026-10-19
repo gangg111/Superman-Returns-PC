@@ -114,7 +114,7 @@ public partial class MainWindow : Window
         SetChoices(ResolutionBox, new("960x540", $"960 × 540 {low}"), new("1280x720", "1280 × 720"), new("1600x900", "1600 × 900"), new("1920x1080", "1920 × 1080"), new("2560x1440", "2560 × 1440"), new("3840x2160", "3840 × 2160"));
         SetChoices(DisplayModeBox, new("Fullscreen", L.T("Borderless")), new("Windowed", L.T("Windowed")));
         SetChoices(InputBox, new("KeyboardMouse", L.T("KeyboardMouse")), new("Controller", L.T("Controller")));
-        SetChoices(RenderScaleBox, new("50", $"50%, 360p {low}, {exp}"), new("75", $"75%, 540p {low}, {exp}"), new("100", $"100%, {L.T("Original720")}"), new("125", "125%, 900p"), new("150", "150%, 1080p"), new("200", "200%, 1440p"), new("300", "300%, 2160p"), new("400", "400%, 2880p"));
+        SetChoices(RenderScaleBox, new("auto", L.T("RenderScaleAuto")), new("50", $"50%, 360p {low}, {exp}"), new("75", $"75%, 540p {low}, {exp}"), new("100", $"100%, {L.T("Original720")}"), new("125", "125%, 900p"), new("150", "150%, 1080p"), new("200", "200%, 1440p"), new("300", "300%, 2160p"), new("400", "400%, 2880p"));
         SetChoices(AaBox, new("Off", L.T("Off")), new("FXAA", "FXAA"));
         var an = L.T("Anisotropic");
         SetChoices(FilterBox, new("Original", L.T("GameOriginal")), new("Anisotropic2x", $"{an} 2×"), new("Anisotropic4x", $"{an} 4×"), new("Anisotropic8x", $"{an} 8×"), new("Anisotropic16x", $"{an} 16×"));
@@ -171,8 +171,8 @@ public partial class MainWindow : Window
         var mode = _settings.UsesVulkan ? (_settings.NativePort ? "Native port" : "Native")
                  : _settings.Renderer == "xenos" ? "Xenos" : "Native";
         if (L.Language == "pl") mode = mode == "Native port" ? "Natywny port" : mode == "Native" ? "Natywny" : mode;
-        var scale = _settings.UsesVulkan ? "100" : _settings.RenderScale;
-        SummaryText.Text = $"{engine} · {mode} · {resolution} · {scale}% {L.T("Internal")}";
+        var scale = _settings.UsesVulkan ? "100%" : _settings.RenderScale == "auto" ? L.T("RenderScaleAuto") : _settings.RenderScale + "%";
+        SummaryText.Text = $"{engine} · {mode} · {resolution} · {scale} {L.T("Internal")}";
         FpsWarning.Text = _settings.FpsLimit == "30" ? "" : L.T("FpsWarn");
         FpsWarning.Visibility = _settings.FpsLimit == "30" ? Visibility.Collapsed : Visibility.Visible;
         ApiBox.ToolTip = _settings.UsesVulkan ? L.T("VulkanNote") : null;

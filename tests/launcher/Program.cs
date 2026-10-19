@@ -60,14 +60,19 @@ var weakArgs = weak.BuildArgumentList();
 Check(weakArgs.Contains("--sr_renderer=xenos") && weakArgs.Contains("--sr_skip_intro=true"), "engine and intro skip are forwarded");
 Check(weakArgs.Contains("--sr_render_scale=75") && weakArgs.Contains("--sr_native_render_scale=1"), "reduced scale uses guest render scale");
 Check(settings.BuildArgumentList().Contains("--sr_render_scale=100") && settings.BuildArgumentList().Contains("--sr_skip_intro=false"), "defaults keep full quality");
-Check(new LauncherSettings().UsesVulkan, "Vulkan is the default graphics API");
-var vk = new LauncherSettings { GameExe = settings.GameExe, GameData = settings.GameData, Renderer = "xenos", RenderScale = "200",
+Check(!new LauncherSettings().UsesVulkan, "Direct3D 12 is the default graphics API");
+var defaults = new LauncherSettings().BuildArgumentList();
+Check(defaults.Contains("--sr_native_render_scale=0") && defaults.Contains("--sr_render_scale=100") &&
+    defaults.Contains("--sr_native_anisotropic_filtering=16"), "defaults: automatic internal resolution and 16x filtering");
+var vkAuto = new LauncherSettings { GraphicsApi = "vulkan", RenderScale = "auto" }.BuildArgumentList();
+Check(vkAuto.Contains("--sr_native_render_scale=1"), "automatic resolution on Vulkan renders at 720p");
+var vk = new LauncherSettings { GraphicsApi = "vulkan", GameExe = settings.GameExe, GameData = settings.GameData, Renderer = "xenos", RenderScale = "200",
     Antialiasing = "FXAA", Msaa = "4", ShadowQuality = "4", TextureFilter = "Anisotropic16x" };
 var vkLaunch = vk.CreateLaunch(fixture);
 Check(vkLaunch.ArgumentList.Contains("--sr_native_api=vulkan") && vkLaunch.ArgumentList.Contains("--sr_renderer=native"), "Vulkan launches the native renderer");
 Check(vkLaunch.ArgumentList.Contains("--sr_native_render_scale=1") && vkLaunch.ArgumentList.Contains("--sr_native_fxaa=false") &&
     vkLaunch.ArgumentList.Contains("--sr_native_msaa_samples=1") && vkLaunch.ArgumentList.Contains("--sr_native_shadow_quality=1") &&
-    vkLaunch.ArgumentList.Contains("--sr_native_anisotropic_filtering=-1"), "Vulkan forces options it does not support to game defaults");
+    vkLaunch.ArgumentList.Contains("--sr_native_anisotropic_filtering=16"), "Vulkan forces options it does not support to game defaults, keeps anisotropic filtering");
 var d3d = new LauncherSettings { GraphicsApi = "d3d12", Msaa = "4", Antialiasing = "FXAA" };
 Check(d3d.BuildArgumentList().Contains("--sr_native_api=d3d12") && d3d.BuildArgumentList().Contains("--sr_native_msaa_samples=4") &&
     d3d.BuildArgumentList().Contains("--sr_native_fxaa=true"), "Direct3D 12 keeps its enhancement options");
