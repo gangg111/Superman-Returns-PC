@@ -112,8 +112,18 @@ REX_HOOK_RAW(sub_826505B8) {
   Log& log = Get();
   if (log.file) {
     std::lock_guard<std::mutex> lock(log.mutex);
-    char buf[48];
-    std::snprintf(buf, sizeof(buf), "Voice::Release voice=%08X", ctx.r3.u32);
+    // Callers: LR, then the saved LR of the next frames (back chain at 0(r1),
+    // the caller's LR at back_chain - 8).
+    uint32_t lr[7] = {uint32_t(ctx.lr)};
+    uint32_t sp = ctx.r1.u32;
+    for (int i = 1; i < 7 && sp; ++i) {
+      sp = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + sp));
+      if (sp) lr[i] = __builtin_bswap32(*reinterpret_cast<uint32_t*>(base + sp - 8));
+    }
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "Voice::Release voice=%08X from %08X<%08X<%08X<%08X<%08X<%08X<%08X", ctx.r3.u32,
+                  lr[0], lr[1], lr[2], lr[3], lr[4], lr[5], lr[6]);
     Write(log, ctx, buf);
   }
   const uint32_t voice = ctx.r3.u32;

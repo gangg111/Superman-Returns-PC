@@ -315,7 +315,19 @@ void OnVoiceRelease(uint8_t*, uint32_t gvoice) {
   std::lock_guard<std::mutex> lock(s.mutex);
   auto it = s.voices.find(gvoice);
   if (it == s.voices.end()) return;
-  s.engine.ReleaseVoice(it->second);
+  native_audio::Voice* v = it->second;
+  s.engine.ReleaseVoice(v);
+  // The guest frees this voice's memory: forget its plug-ins, so nothing is
+  // written there (full mode mirrors player state) and a reused address maps anew.
+  for (auto p = s.plugins.begin(); p != s.plugins.end();) {
+    if (p->second->voice == v) {
+      std::erase(s.players, p->first);
+      p = s.plugins.erase(p);
+    } else {
+      ++p;
+    }
+  }
+  s.voices.erase(it);
 }
 
 void OnSetParam(uint8_t*, uint32_t plugin, uint32_t index, float value) {
@@ -323,7 +335,18 @@ void OnSetParam(uint8_t*, uint32_t plugin, uint32_t index, float value) {
   State& s = S();
   std::lock_guard<std::mutex> lock(s.mutex);
   auto it = s.plugins.find(plugin);
-  if (it != s.plugins.end()) s.engine.SetParam(it->second, int(index), value);
+  if (it != s.plugins.end()) {
+    if (!std::isfinite(value)) {
+      static int n = 0;
+      if (++n <= 40) {
+        const uint32_t c = uint32_t(it->second->cls);
+        const char cc[5] = {char(c >> 24), char(c >> 16), char(c >> 8), char(c), 0};
+        REXAPU_INFO("native audio non-finite SetParam #{} {} [{}] = {} at block {}", n, cc,
+                    index, value, s.blocks);
+      }
+    }
+    s.engine.SetParam(it->second, int(index), value);
+  }
 }
 
 void OnControl(uint8_t* base, uint32_t plugin, uint32_t index, uint32_t data) {
@@ -450,6 +473,10 @@ REX_HOOK_RAW(sub_8264C540) {
 
 // Voice graph executor: after the original renders the master voice, render
 // the native graph for the same block and compare the master bus outputs.
+namespace {
+native_audio::Plugin* MappedPlugin(uint32_t p);
+}  // namespace
+
 REX_HOOK_RAW(sub_8265A148) {
   const uint32_t voice = ctx.r3.u32, io = ctx.r4.u32;
   if (Active() && FullMode()) {
@@ -460,6 +487,12 @@ REX_HOOK_RAW(sub_8265A148) {
       const int nret = s.engine.RenderGraph(s.native_master, s.engine.io);
       s.last_native_ret = nret;
       ctx.r3.u64 = uint32_t(nret);
+      // The guest players no longer run: give the game the state it reads
+      // from their memory (SndPlayer+40, the planner state).
+      for (uint32_t gp : s.players)
+        if (native_audio::Plugin* p = MappedPlugin(gp))
+          *reinterpret_cast<uint32_t*>(base + gp + 40) = __builtin_bswap32(
+              uint32_t(static_cast<native_audio::SndPlayer*>(p)->Planner()));
       if (++s.blocks % 1000 == 0)
         REXAPU_INFO("native audio full: {} blocks, voices {}, bank {} hits {} misses", s.blocks,
                     s.voices.size(), s.bank_hits, s.bank_misses);
@@ -545,6 +578,16 @@ native_audio::Voice* MappedVoice(uint32_t v) {
   auto it = s.voices.find(v);
   return it == s.voices.end() ? nullptr : it->second;
 }
+// Non-full modes: the original still answers; log where the native answer differs.
+void QueryDiff(const char* what, uint32_t cls, uint32_t index, double guest, double native) {
+  if (guest == native) return;
+  static std::unordered_map<std::string, int> count;
+  int& n = count[what];
+  if (++n > 40) return;
+  const char c[5] = {char(cls >> 24), char(cls >> 16), char(cls >> 8), char(cls), 0};
+  REXAPU_INFO("native audio query diff #{} {} {} [{}]: guest {} native {}", n, what,
+              cls ? c : "-", index, guest, native);
+}
 native_audio::Plugin* MappedPlugin(uint32_t p) {
   auto& s = native_audio::bridge::S();
   auto it = s.plugins.find(p);
@@ -563,6 +606,12 @@ REX_HOOK_RAW(sub_826500F8) {
     }
   }
   __imp__sub_826500F8(ctx, base);
+  if (Active()) {
+    auto& s = native_audio::bridge::S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (native_audio::Voice* v = MappedVoice(ctx.r3.u32))
+      QueryDiff("IsReleaseDone", 0, 0, double(ctx.r3.u8), v->IsStopped() ? 1.0 : 0.0);
+  }
 }
 
 // Voice::GetLatencySeconds(voice) -> f1 = tail / System+12
@@ -575,7 +624,14 @@ REX_HOOK_RAW(sub_826500C8) {
       return;
     }
   }
+  const uint32_t voice = ctx.r3.u32;
   __imp__sub_826500C8(ctx, base);
+  if (Active()) {
+    auto& s = native_audio::bridge::S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (native_audio::Voice* v = MappedVoice(voice))
+      QueryDiff("GetLatency", 0, 0, ctx.f1.f64, double(v->TailNow() / s.engine.rate));
+  }
 }
 
 // Plugin::GetParamD(plugin, index, double* out)
@@ -589,7 +645,14 @@ REX_HOOK_RAW(sub_8264CE00) {
       return;
     }
   }
+  const uint32_t plugin = ctx.r3.u32, index = ctx.r4.u32, out = ctx.r5.u32;
   __imp__sub_8264CE00(ctx, base);
+  if (Active()) {
+    auto& s = native_audio::bridge::S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (native_audio::Plugin* p = MappedPlugin(plugin))
+      QueryDiff("GetParamD", uint32_t(p->cls), index, std::bit_cast<double>(__builtin_bswap64(*reinterpret_cast<uint64_t*>(base + out))), p->GetParam(int(index)));
+  }
 }
 
 // Plugin::GetParamF(plugin, index, float* out)
@@ -603,5 +666,12 @@ REX_HOOK_RAW(sub_8264CDE8) {
       return;
     }
   }
+  const uint32_t plugin = ctx.r3.u32, index = ctx.r4.u32, out = ctx.r5.u32;
   __imp__sub_8264CDE8(ctx, base);
+  if (Active()) {
+    auto& s = native_audio::bridge::S();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    if (native_audio::Plugin* p = MappedPlugin(plugin))
+      QueryDiff("GetParamF", uint32_t(p->cls), index, double(std::bit_cast<float>(__builtin_bswap32(*reinterpret_cast<uint32_t*>(base + out)))), double(float(p->GetParam(int(index)))));
+  }
 }

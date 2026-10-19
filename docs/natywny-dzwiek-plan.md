@@ -113,6 +113,22 @@ więc tylko zgrubne: nowy silnik ma mieścić się w tym rozrzucie. O 1:1 rozstr
   prawdziwej próbki. Do rozstrzygnięcia, jak robi to sprzęt konsoli. `native`: 146 s bez awarii,
   dźwięk ciągły, poziom -24..-12 dBFS, 0 przesterowań.
 
+- **Tryb `full` (2026-10-19):** oryginalny silnik nie renderuje ani nie dekoduje; wykonawca gościa
+  pominięty dla głosu master, zapytania stanu (`GetParamF/D`, `IsReleaseDone`, latencja, `IsDone`)
+  odpowiada silnik natywny. W trybie native każda z tych odpowiedzi jest porównywana z oryginałem
+  (65 tys. `GetParamF`, ponad tysiąc odczytów latencji: 0 różnic). Dwie pułapki:
+  1. Dac czyta bufor wyjścia, który przydzielał graf gościa: bez niego odczyt spod adresu 0.
+  2. **Gra czyta stan odtwarzacza wprost z jego pamięci**, nie przez API: `sub_82333608`
+     przełącza kanał gry ze stanu 1 w 2 („gra”), gdy `SnP0+40` (stan planera) = 2. Dopiero w
+     stanie 2 działa wyciszanie dźwięków poza zasięgiem (`sub_82332138`: odległość od słuchacza
+     większa niż zasięg z obiektu dźwięku, wtedy `Channel::Stop` i znacznik `+417`). Bez lustra
+     tego pola odległe źródła grały do końca (453 zamiast 11 głosów dłuższych niż 1 s), pula głosów
+     się zapychała i gra zabierała głos muzyce (15 s ciszy). Most przepisuje teraz `+40` z
+     natywnego odtwarzacza po każdym bloku i zapomina wtyczki zwolnionego głosu.
+  Wynik: poziomy w każdym oknie 5 s identyczne z trybem native, 2274 przejść do stanu 2 (native
+  2548). Krótkie efekty żyjące 30 ms w trybie native to zamierzone wyciszanie odległych źródeł, nie
+  błąd dekodera. Dźwięk filmów idzie osobną warstwą i w trybie full gra bez zmian.
+
 #### Metoda weryfikacji DSP (po red-teamie agy, 2026-10-20)
 
 1. **Test różnicowy wtyczki przeciw oryginałowi w tym samym procesie.** Oryginalny DSP RenderWare

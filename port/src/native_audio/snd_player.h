@@ -67,6 +67,9 @@ class SndPlayer : public Plugin {
     return {pos_, planner_, planned_, cur_slot_, declick_, have_prev_, pending_.size()};
   }
 
+  // +40, read by the game's channel update (sub_82333608: 2 = playing).
+  int Planner() const { return planner_; }
+
   float last_id = 0.0f;  // +32: id of the last started request
   float id_counter = 0.0f;  // +96
 
