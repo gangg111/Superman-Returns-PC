@@ -23,6 +23,7 @@
 #include <rex/system/xmemory.h>
 
 #include "generated/default/superman_returns_init.h"
+#include "native_audio/plugins.h"
 #include "native_audio/resampler.h"
 
 namespace native_audio {
@@ -42,6 +43,9 @@ struct Guest {
   PPCContext Ctx() const {
     PPCContext ctx{};
     ctx.r1.u64 = stack_top;
+    // A zero csr would be written to MXCSR on the first flush-mode switch and
+    // unmask every FP exception (STATUS_FLOAT_INEXACT_RESULT on the next op).
+    ctx.fpscr.InitHost();
     return ctx;
   }
 };
@@ -214,6 +218,186 @@ void ResamplerCase(Guest& g, Report& rep, int ch, uint32_t seed, bool control = 
   }
 }
 
+// ------------------------------------------------------------ plug-ins
+
+// Guest scaffolding for one plug-in instance: a fake System (+12 mixer rate,
+// +8 block period), a fake Voice (+32 System, +44 rate at voice start), an io
+// object with two preallocated 6-channel buffers (no reallocation ever), and
+// the instance made by the class's own GetSize/Create.
+struct GuestPlugin {
+  Guest& g;
+  uint32_t sys = 0, voice = 0, io = 0, buf[2] = {}, obj = 0;
+
+  GuestPlugin(Guest& gg, uint32_t desc, int in_ch, int out_ch,
+              void (*get_size)(PPCContext&, uint8_t*), void (*create)(PPCContext&, uint8_t*))
+      : g(gg) {
+    sys = g.Alloc(256);
+    std::memset(g.base + sys, 0, 256);
+    g.WF(sys + 12, 48000.0f);
+    g.WF(sys + 8, 256.0f / 48000.0f);
+    voice = g.Alloc(256);
+    std::memset(g.base + voice, 0, 256);
+    g.W32(voice + 32, sys);
+    g.WF(voice + 44, 1.0f);
+    io = g.Alloc(64);
+    std::memset(g.base + io, 0, 64);
+    for (int i = 0; i < 2; ++i) {
+      buf[i] = g.Alloc(6 * 1024);
+      std::memset(g.base + buf[i], 0, 6 * 1024);
+      g.W32(io + 4 + 4 * i, buf[i]);
+      g.W32(io + 20 + 4 * i, 6 * 1024);
+    }
+    g.WF(io + 12, 1.0f);
+    g.WF(io + 16, 1.0f);
+    const uint32_t entry = g.Alloc(16);
+    std::memset(g.base + entry, 0, 16);
+    g.W32(entry + 4, desc);
+    g.base[entry + 8] = uint8_t(out_ch);
+    PPCContext c = g.Ctx();
+    c.r3.u64 = entry;
+    get_size(c, g.base);
+    const uint32_t size = c.r3.u32;
+    obj = g.Alloc(size + 256);
+    std::memset(g.base + obj, 0, size + 256);
+    c = g.Ctx();
+    c.r3.u64 = voice;
+    c.r4.u64 = entry;
+    c.r5.u64 = uint32_t(in_ch);
+    c.r6.u64 = obj;
+    create(c, g.base);
+    g.W32(obj + 8, voice);
+  }
+  uint8_t Cur() const { return g.base[io + 28]; }
+  uint32_t CurBuf() const { return buf[Cur()]; }
+  int Call(void (*fn)(PPCContext&, uint8_t*), uint32_t reset = 0) {
+    PPCContext c = g.Ctx();
+    c.r3.u64 = obj;
+    c.r4.u64 = io;
+    c.r5.u64 = reset;
+    fn(c, g.base);
+    return int32_t(c.r3.u32);
+  }
+};
+
+// Fills the current input buffer on both sides with the same random block.
+void FillInput(GuestPlugin& gp, Io& io, int ch, std::mt19937& rng, int kind) {
+  std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+  for (int i = 0; i < ch * kBlock; ++i) {
+    float v = u(rng);
+    if (kind == 1) v *= 1e-38f;      // denormal-heavy
+    else if (kind == 2) v = 0.0f;    // silence
+    io.Cur()[i] = v;
+    gp.g.WF(gp.CurBuf() + uint32_t(i) * 4, v);
+  }
+}
+
+bool CompareOutput(GuestPlugin& gp, const Io& io, int ch, Report& rep, const char* what) {
+  if (gp.Cur() != io.cur) {
+    rep.Fail(std::string(what) + ": buffer toggle differs");
+    return false;
+  }
+  for (int i = 0; i < ch * kBlock; ++i) {
+    const uint32_t gv = gp.g.R32(gp.CurBuf() + uint32_t(i) * 4);
+    const uint32_t nv = std::bit_cast<uint32_t>(io.Cur()[i]);
+    if (gv != nv) {
+      char buf[160];
+      std::snprintf(buf, sizeof(buf), "%s out[%d]: guest %08X native %08X", what, i, gv, nv);
+      rep.Fail(buf);
+      return false;
+    }
+  }
+  return true;
+}
+
+struct NativeIo {
+  float storage[2][6 * kBlock + 32];
+  Io io;
+  NativeIo() {
+    // 128-byte aligned like the guest buffers (the VMX path depends on it).
+    for (int i = 0; i < 2; ++i)
+      io.buf[i] = reinterpret_cast<float*>((uintptr_t(storage[i]) + 127) & ~uintptr_t(127));
+  }
+};
+
+alignas(128) static NativeIo g_nio;
+
+void FilterCase(Guest& g, Report& rep, bool hp, int ch, uint32_t seed) {
+  std::mt19937 rng(seed);
+  GuestPlugin gp(g, hp ? 0x82937808 : 0x829377B0, ch, ch, hp ? sub_826636E8 : sub_826633F8,
+                 hp ? sub_826637F8 : sub_82663508);
+  BiquadFilter nat(hp, ch);
+  Io& io = g_nio.io;
+  io.cur = 0;
+  std::uniform_int_distribution<int> pick(0, 9);
+  std::uniform_real_distribution<float> hz(10.0f, 30000.0f);
+  const char* name = hp ? "HI20" : "LI20";
+  for (int block = 0; block < 60; ++block) {
+    if (pick(rng) < 3) {
+      const int k = pick(rng);
+      const float cutoff = k == 0 ? (hp ? 0.0f : 1000000.0f) : k == 1 ? 23990.0f : hz(rng);
+      g.WF(gp.obj + 32, cutoff);
+      nat.cutoff = cutoff;
+    }
+    FillInput(gp, io, ch, rng, pick(rng) == 0 ? 1 : 0);
+    // hook, then Process (as the executor does)
+    PPCContext c = g.Ctx();
+    c.r3.u64 = gp.obj;
+    c.r4.u64 = gp.io;
+    (hp ? sub_82663610 : sub_82663320)(c, g.base);
+    nat.Hook(io, 1.0f);
+    const int gr = gp.Call(hp ? sub_82663710 : sub_82663420);
+    const uint8_t before = io.cur;
+    const int nr = nat.Process(io, 48000.0f);
+    char what[64];
+    std::snprintf(what, sizeof(what), "%s ch=%d block %d", name, ch, block);
+    if (gr != nr) rep.Fail(std::string(what) + ": return differs");
+    if (!CompareOutput(gp, io, ch, rep, what)) return;
+    if (io.cur != before) ++rep.processed; else ++rep.passthrough;
+    const uint32_t coef[6] = {std::bit_cast<uint32_t>(nat.a1), std::bit_cast<uint32_t>(nat.a2),
+                              std::bit_cast<uint32_t>(nat.b0), std::bit_cast<uint32_t>(nat.b1),
+                              std::bit_cast<uint32_t>(nat.b2), std::bit_cast<uint32_t>(nat.last_w)};
+    for (int i = 0; i < 6; ++i)
+      if (g.R32(gp.obj + 44 + 4 * i) != coef[i]) {
+        std::snprintf(what, sizeof(what), "%s ch=%d block %d coef %d: guest %08X native %08X",
+                      name, ch, block, i, g.R32(gp.obj + 44 + 4 * i), coef[i]);
+        rep.Fail(what);
+        return;
+      }
+    // Keep both sides on the same input buffer index for the next block.
+    io.cur = gp.Cur();
+  }
+}
+
+void GainCase(Guest& g, Report& rep, int ch, uint32_t seed) {
+  std::mt19937 rng(seed);
+  GuestPlugin gp(g, 0x82937860, ch, ch, sub_8266BE78, sub_826639D8);
+  Gain nat(ch);
+  Io& io = g_nio.io;
+  io.cur = 0;
+  std::uniform_int_distribution<int> pick(0, 9);
+  std::uniform_real_distribution<float> lin(0.0f, 2.0f);
+  for (int block = 0; block < 60; ++block) {
+    if (pick(rng) < 4) {
+      const float v = pick(rng) == 0 ? 0.0f : lin(rng);
+      g.WF(gp.obj + 32, v);
+      nat.gain = v;
+    }
+    const uint32_t reset = (block == 0 || pick(rng) == 0) ? 1 : 0;
+    FillInput(gp, io, ch, rng, pick(rng) == 0 ? 1 : 0);
+    const int gr = gp.Call(sub_82663900, reset);
+    const int nr = nat.Process(io, reset != 0);
+    char what[64];
+    std::snprintf(what, sizeof(what), "Gai0 ch=%d block %d", ch, block);
+    if (gr != nr) rep.Fail(std::string(what) + ": return differs");
+    if (!CompareOutput(gp, io, ch, rep, what)) return;
+    if (g.R32(gp.obj + 40) != std::bit_cast<uint32_t>(nat.prev)) {
+      rep.Fail(std::string(what) + ": prev gain differs");
+      return;
+    }
+    io.cur = gp.Cur();
+  }
+}
+
 }  // namespace
 
 // Returns true when the self-test ran (the caller then exits).
@@ -243,6 +427,23 @@ bool RunAudioSelfTest(uint8_t* base) {
   Report ctl{rep.f};
   for (uint32_t seed = 1; seed <= 4; ++seed) ResamplerCase(g, ctl, 2, seed, true);
   std::fprintf(rep.f, "control (one ulp changed): %d mismatches (must be > 0)\n", ctl.failures);
+
+  auto run = [&](const char* name, auto&& one) {
+    Report r{rep.f};
+    int cases = 0;
+    for (int ch : {1, 2, 4, 6})
+      for (uint32_t seed = 1; seed <= 10; ++seed) {
+        const int before = r.failures;
+        one(r, ch, seed * 104729 + ch);
+        ++cases;
+        if (r.failures != before) std::fprintf(rep.f, "FAIL %s ch=%d seed=%u\n", name, ch, seed);
+      }
+    std::fprintf(rep.f, "%s: %d cases, %d mismatches (filtered blocks %ld, bypass %ld)\n", name,
+                 cases, r.failures, r.processed, r.passthrough);
+  };
+  run("LI20", [&](Report& r, int ch, uint32_t s) { FilterCase(g, r, false, ch, s); });
+  run("HI20", [&](Report& r, int ch, uint32_t s) { FilterCase(g, r, true, ch, s); });
+  run("Gai0", [&](Report& r, int ch, uint32_t s) { GainCase(g, r, ch, s); });
   std::fclose(rep.f);
   return true;
 }

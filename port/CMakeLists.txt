@@ -45,6 +45,8 @@ set(SUPERMANRETURNS_SOURCES
     src/audio_api_log.cpp
     src/native_audio/sample_bank.cpp
     src/native_audio/resampler.cpp
+    src/native_audio/dsp.cpp
+    src/native_audio/plugins.cpp
     src/native_audio/selftest.cpp
     src/frame_rate.cpp
     src/frame_stats.cpp
