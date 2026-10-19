@@ -74,4 +74,60 @@ class PanSurround {
   void Matrix();
 };
 
+// Channel mapping in -> out shared by Send and SndPlayer's converter
+// (spec-proste-wtyczki.md 4.4, spec-pitch-resampler.md 3.6). Planar blocks of
+// n frames. add: accumulate, never zero. ramp: start gain g, step s, 64 frames.
+void MapChannels(float* out, int out_ch, const float* in, int in_ch, int n, float g, float s,
+                 bool ramp, bool add);
+
+// SubMix "Sub0" (spec 5): a bus the senders write into during a block.
+class Bus {
+ public:
+  explicit Bus(int channels);
+  // sub_826514B0: the buffer and the number of earlier contributions this block.
+  float* Acquire(int* count) {
+    *count = contributions++;
+    return buffer;
+  }
+  void AddResidual(const float* residual);  // detach with residual (sub_82651518)
+  int Process(Io& io);
+
+  int channels;
+  alignas(128) float storage[6 * kBlock + 32];
+  float* buffer;
+  uint16_t contributions = 0;  // +148
+  uint16_t attached = 0;       // +146
+  float residual[6] = {};      // +52
+  bool residual_pending = false;  // +151
+};
+
+// Send "Sen0" (spec 4).
+class Send {
+ public:
+  Send(int in_channels, bool ignore_voice_gain);
+  void Hook(const Io& io);
+  int Process(Io& io, bool reset);
+  void Attach(Bus* b);  // Control(0, bus) handler: detach with residual, then attach
+
+  int in_channels;
+  float level = 1.0f;   // +40, param 0
+  float last[6] = {};   // +64
+  float prev = 1.0f;    // +88
+  float target = 0.0f;  // +92
+  bool ignore_voice_gain;  // +96
+  bool need_snap = false;  // +97
+  Bus* bus = nullptr;      // +56
+};
+
+// Route "Rou0" (spec 6).
+class Route {
+ public:
+  int Process(Io& io);
+  void Attach(Bus* b, int src, int dst, int count);  // Control handler
+
+  Bus* bus = nullptr;
+  uint8_t src = 0, dst = 0, count = 0;  // +52..+54
+  float last[6] = {};                   // +56
+};
+
 }  // namespace native_audio

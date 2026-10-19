@@ -272,4 +272,206 @@ int PanSurround::Process(Io& io) {
   return 1;
 }
 
+// ---------------------------------------------------------------- buses
+
+namespace {
+
+const float kSendK = std::bit_cast<float>(0x3F34FDF4u);  // 0x8208228C, 0.707f
+
+struct MapOp {
+  int8_t o, i;
+  bool k;  // scaled by kSendK
+};
+
+// Order of the kernel calls per (in, out), read in sub_8265D3C8.. / sub_82668400..
+const MapOp* MapTable(int in, int out, int* n_ops, uint8_t* zero_mask) {
+  static const MapOp k12[] = {{0, 0, true}, {1, 0, true}};
+  static const MapOp k16[] = {{1, 0, false}};
+  static const MapOp k21[] = {{0, 0, false}, {0, 1, false}};
+  static const MapOp k24[] = {{0, 0, false}, {1, 1, false}};
+  static const MapOp k26[] = {{0, 0, false}, {2, 1, false}};
+  static const MapOp k41[] = {{0, 0, false}, {0, 1, false}, {0, 2, false}, {0, 3, false}};
+  static const MapOp k42[] = {{0, 0, false}, {0, 2, false}, {1, 1, false}, {1, 3, false}};
+  static const MapOp k46[] = {{0, 0, false}, {2, 1, false}, {3, 2, false}, {4, 3, false}};
+  static const MapOp k61[] = {{0, 1, false}, {0, 2, false}, {0, 4, false}, {0, 3, false},
+                              {0, 0, false}};
+  static const MapOp k62[] = {{0, 1, true}, {0, 0, false}, {0, 3, false},
+                              {1, 1, true}, {1, 2, false}, {1, 4, false}};
+  static const MapOp k64[] = {{0, 1, true}, {0, 0, false}, {1, 1, true},
+                              {1, 2, false}, {2, 3, false}, {3, 4, false}};
+#define SR_MAP(tbl, z) \
+  do {                 \
+    *n_ops = int(sizeof(tbl) / sizeof(tbl[0])); \
+    *zero_mask = (z);  \
+    return tbl;        \
+  } while (0)
+  if (in == 1 && out == 2) SR_MAP(k12, 0);
+  if (in == 1 && out == 4) SR_MAP(k12, 0x0C);
+  if (in == 1 && out == 6) SR_MAP(k16, 0x3D);
+  if (in == 2 && out == 1) SR_MAP(k21, 0);
+  if (in == 2 && out == 4) SR_MAP(k24, 0x0C);
+  if (in == 2 && out == 6) SR_MAP(k26, 0x3A);
+  if (in == 4 && out == 1) SR_MAP(k41, 0);
+  if (in == 4 && out == 2) SR_MAP(k42, 0);
+  if (in == 4 && out == 6) SR_MAP(k46, 0x22);
+  if (in == 6 && out == 1) SR_MAP(k61, 0);
+  if (in == 6 && out == 2) SR_MAP(k62, 0);
+  if (in == 6 && out == 4) SR_MAP(k64, 0);
+#undef SR_MAP
+  *n_ops = 0;
+  *zero_mask = 0;
+  return nullptr;
+}
+
+}  // namespace
+
+void MapChannels(float* out, int out_ch, const float* in, int in_ch, int n, float g, float s,
+                 bool ramp, bool add) {
+  if (in_ch == out_ch) {
+    if (ramp) {
+      for (int c = 0; c < in_ch; ++c)
+        add ? GainRampAdd(out + c * n, in + c * n, g, s, n, 64)
+            : GainRampSet(out + c * n, in + c * n, g, s, n, 64);
+    } else {
+      add ? GainAdd(out, in, g, n * in_ch) : GainSet(out, in, g, n * in_ch);
+    }
+    return;
+  }
+  int n_ops;
+  uint8_t zero;
+  const MapOp* ops = MapTable(in_ch, out_ch, &n_ops, &zero);
+  if (!ops) {  // other counts (not used by the game): copy what fits
+    const int m = in_ch < out_ch ? in_ch : out_ch;
+    add ? GainAdd(out, in, g, n * m) : GainSet(out, in, g, n * m);
+    if (!add && out_ch > in_ch) std::memset(out + n * in_ch, 0, size_t(out_ch - in_ch) * n * 4);
+    return;
+  }
+  float gk, sk;
+  {
+    ScalarScope fpu;
+    gk = g * kSendK;
+    sk = s * kSendK;
+  }
+  uint8_t written = 0;
+  for (int k = 0; k < n_ops; ++k) {
+    const MapOp& op = ops[k];
+    float* d = out + op.o * n;
+    const float* x = in + op.i * n;
+    const bool set = !add && !(written & (1u << op.o));
+    written |= uint8_t(1u << op.o);
+    const float gg = op.k ? gk : g, ss = op.k ? sk : s;
+    if (ramp)
+      set ? GainRampSet(d, x, gg, ss, n, 64) : GainRampAdd(d, x, gg, ss, n, 64);
+    else
+      set ? GainSet(d, x, gg, n) : GainAdd(d, x, gg, n);
+  }
+  if (!add)
+    for (int c = 0; c < out_ch; ++c)
+      if (zero & (1u << c)) std::memset(out + c * n, 0, size_t(n) * 4);
+}
+
+Bus::Bus(int ch) : channels(ch) {
+  buffer = reinterpret_cast<float*>((uintptr_t(storage) + 127) & ~uintptr_t(127));
+}
+
+void Bus::AddResidual(const float* res) {
+  residual_pending = true;
+  ScalarScope fpu;
+  for (int c = 0; c < channels; ++c) residual[c] = residual[c] + res[c];
+}
+
+int Bus::Process(Io& io) {
+  if (contributions == 0 && !residual_pending) return 0;
+  float* out = io.Next();
+  io.Toggle();
+  if (contributions) {
+    std::memcpy(out, buffer, size_t(channels) * kBlock * 4);
+    contributions = 0;
+  } else {
+    std::memset(out, 0, size_t(channels) * kBlock * 4);
+  }
+  if (residual_pending) {
+    ResidualFade(out, residual, channels, kBlock);
+    residual_pending = false;
+  }
+  return 1;
+}
+
+Send::Send(int in_ch, bool ignore) : in_channels(in_ch), ignore_voice_gain(ignore) {}
+
+void Send::Hook(const Io& io) {
+  ScalarScope fpu;
+  target = level;
+  if (!ignore_voice_gain) target = io.gain * level;
+}
+
+void Send::Attach(Bus* b) {
+  if (bus) {
+    --bus->attached;
+    bus->AddResidual(last);
+    bus = nullptr;
+  }
+  if (b) {
+    bus = b;
+    ++b->attached;
+  }
+}
+
+int Send::Process(Io& io, bool reset) {
+  if (reset || need_snap) {
+    prev = target;
+    need_snap = false;
+  }
+  if (!bus) {
+    need_snap = true;
+    return 1;
+  }
+  const float* in = io.Cur();
+  int count;
+  float* b = bus->Acquire(&count);
+  bool ramp;
+  float s = 0.0f;
+  {
+    ScalarScope fpu;
+    ramp = target != prev;
+    if (ramp) s = (target - prev) * std::bit_cast<float>(0x3C7C0FC1u);  // 1/65
+  }
+  if (ramp)
+    MapChannels(b, bus->channels, in, in_channels, kBlock, prev, s, true, count != 0);
+  else
+    MapChannels(b, bus->channels, in, in_channels, kBlock, target, 0.0f, false, count != 0);
+  prev = target;
+  ScalarScope fpu;
+  for (int c = 0; c < in_channels; ++c) last[c] = in[c * kBlock + 255] * target;
+  return 1;
+}
+
+void Route::Attach(Bus* b, int s, int d, int n) {
+  if (bus) {
+    --bus->attached;
+    bus->AddResidual(last);
+    bus = nullptr;
+  }
+  if (b) {
+    bus = b;
+    ++b->attached;
+    src = uint8_t(s);
+    dst = uint8_t(d);
+    count = uint8_t(n);
+  }
+}
+
+int Route::Process(Io& io) {
+  if (!bus) return 1;
+  const float* in = io.Cur();
+  int n;
+  float* b = bus->Acquire(&n);
+  if (n == 0) std::memset(b, 0, size_t(bus->channels) * kBlock * 4);
+  for (int i = 0; i < count; ++i)
+    GainAdd(b + (dst + i) * kBlock, in + (src + i) * kBlock, 1.0f, kBlock);
+  for (float& v : last) v = 0.0f;
+  for (int i = 0; i < count; ++i) last[dst + i] = in[(src + i) * kBlock + 255];
+  return 1;
+}
+
 }  // namespace native_audio

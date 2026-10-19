@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -447,6 +448,180 @@ void PanCase(Guest& g, Report& rep, int in_ch, uint32_t seed) {
   }
 }
 
+// A bus (Sub0 built by hand per spec 5.1: +29 channels, +32 buffer) fed by
+// 1..3 senders (Sen0 made by their own Create, attached through the Control
+// handler sub_826623E0), with level changes, resets and re-attachments.
+void BusCase(Guest& g, Report& rep, int bus_ch, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> pick(0, 9);
+  static const int kCh[4] = {1, 2, 4, 6};
+  const uint32_t gbus = g.Alloc(256);
+  std::memset(g.base + gbus, 0, 256);
+  g.base[gbus + 29] = uint8_t(bus_ch);
+  const uint32_t gbuf = g.Alloc(6 * 1024);
+  std::memset(g.base + gbuf, 0, 6 * 1024);
+  g.W32(gbus + 32, gbuf);
+  Bus nbus(bus_ch);
+  // The bus voice's own io (Sub0 Process writes its output there).
+  GuestPlugin busio(g, 0x829375D8, 1, 1, sub_82662058, sub_82662428);  // only its io is used
+  static NativeIo nbusio;
+  nbusio.io.cur = 0;
+  g.base[busio.io + 28] = 0;
+
+  struct Sender {
+    std::unique_ptr<GuestPlugin> gp;
+    std::unique_ptr<Send> nat;
+    std::unique_ptr<NativeIo> nio;
+    int ch;
+  };
+  std::vector<Sender> senders;
+  const int n_send = 1 + pick(rng) % 3;
+  const uint32_t rec = g.Alloc(16);
+  auto attach = [&](Sender& s, bool on) {
+    g.W32(rec + 0, 0x826623E0);
+    g.W32(rec + 4, s.gp->obj);
+    g.W32(rec + 8, on ? gbus : 0);
+    PPCContext c = g.Ctx();
+    c.r3.u64 = rec;
+    sub_826623E0(c, g.base);
+    s.nat->Attach(on ? &nbus : nullptr);
+  };
+  for (int k = 0; k < n_send; ++k) {
+    Sender s;
+    s.ch = kCh[pick(rng) % 4];
+    s.gp = std::make_unique<GuestPlugin>(g, 0x829375D8, s.ch, s.ch, sub_82662058, sub_82662428);
+    s.nat = std::make_unique<Send>(s.ch, false);
+    s.nio = std::make_unique<NativeIo>();
+    s.nio->io.cur = 0;
+    attach(s, true);
+    senders.push_back(std::move(s));
+  }
+  std::uniform_real_distribution<float> lvl(0.0f, 1.5f);
+  char what[96];
+  for (int block = 0; block < 50; ++block) {
+    for (size_t k = 0; k < senders.size(); ++k) {
+      Sender& s = senders[k];
+      if (pick(rng) == 0) attach(s, pick(rng) < 7);  // detach / re-attach now and then
+      if (pick(rng) < 3) {
+        const float v = lvl(rng);
+        g.WF(s.gp->obj + 40, v);
+        s.nat->level = v;
+      }
+      const uint32_t reset = (block == 0 || pick(rng) == 0) ? 1 : 0;
+      FillInput(*s.gp, s.nio->io, s.ch, rng, 0);
+      PPCContext c = g.Ctx();
+      c.r3.u64 = s.gp->obj;
+      c.r4.u64 = s.gp->io;
+      sub_826620D8(c, g.base);
+      s.nat->Hook(s.nio->io);
+      const int gr = s.gp->Call(sub_82662100, reset);
+      const int nr = s.nat->Process(s.nio->io, reset != 0);
+      if (gr != nr || g.R32(s.gp->obj + 88) != std::bit_cast<uint32_t>(s.nat->prev)) {
+        std::snprintf(what, sizeof(what), "Sen0 %d->%d block %d: return or prev level differs",
+                      s.ch, bus_ch, block);
+        rep.Fail(what);
+        return;
+      }
+    }
+    // Sub0 Process on the hand-made bus object, output into the bus voice's io.
+    PPCContext c = g.Ctx();
+    c.r3.u64 = gbus;
+    c.r4.u64 = busio.io;
+    c.r5.u64 = 0;
+    sub_826513E8(c, g.base);
+    const int gret = int32_t(c.r3.u32);
+    const int nret = nbus.Process(nbusio.io);
+    std::snprintf(what, sizeof(what), "Sub0 %dch block %d (%d senders)", bus_ch, block, n_send);
+    if (gret != nret) {
+      rep.Fail(std::string(what) + ": return differs");
+      return;
+    }
+    if (gret) {
+      if (!CompareOutput(busio, nbusio.io, bus_ch, rep, what)) return;
+      ++rep.processed;
+    } else {
+      ++rep.passthrough;
+    }
+    nbusio.io.cur = busio.Cur();
+  }
+}
+
+// Music layout: a 4-channel source through two Route plug-ins into one bus
+// (Rou0 by its own Create, configured through the Control handler sub_82661EA0).
+void RouteCase(Guest& g, Report& rep, int bus_ch, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> pick(0, 9);
+  const uint32_t gbus = g.Alloc(256);
+  std::memset(g.base + gbus, 0, 256);
+  g.base[gbus + 29] = uint8_t(bus_ch);
+  const uint32_t gbuf = g.Alloc(6 * 1024);
+  std::memset(g.base + gbuf, 0, 6 * 1024);
+  g.W32(gbus + 32, gbuf);
+  Bus nbus(bus_ch);
+  GuestPlugin r0(g, 0x82937510, 4, 4, sub_82661D30, sub_82661F28);
+  GuestPlugin r1(g, 0x82937510, 4, 4, sub_82661D30, sub_82661F28);
+  // Both routes read the same source block: give r1 the io of r0.
+  Route n0, n1;
+  const uint32_t rec = g.Alloc(32);
+  auto config = [&](GuestPlugin& gp, Route& nr, bool on) {
+    const int count = 1 + pick(rng) % (bus_ch < 4 ? bus_ch : 4);
+    const int src = pick(rng) % (4 - count + 1), dst = pick(rng) % (bus_ch - count + 1);
+    g.W32(rec + 0, 0x82661EA0);
+    g.W32(rec + 4, gp.obj);
+    g.W32(rec + 8, on ? gbus : 0);
+    g.WF(rec + 12, float(src));
+    g.WF(rec + 16, float(dst));
+    g.WF(rec + 20, float(count));
+    PPCContext c = g.Ctx();
+    c.r3.u64 = rec;
+    sub_82661EA0(c, g.base);
+    nr.Attach(on ? &nbus : nullptr, src, dst, count);
+  };
+  config(r0, n0, true);
+  config(r1, n1, true);
+  GuestPlugin busio(g, 0x829375D8, 1, 1, sub_82662058, sub_82662428);
+  static NativeIo nbusio;
+  nbusio.io.cur = 0;
+  g.base[busio.io + 28] = 0;
+  Io& io = g_nio.io;
+  io.cur = 0;
+  char what[96];
+  for (int block = 0; block < 50; ++block) {
+    if (pick(rng) == 0) {
+      const bool first = pick(rng) < 5;
+      config(first ? r0 : r1, first ? n0 : n1, pick(rng) < 8);
+    }
+    FillInput(r0, io, 4, rng, 0);
+    PPCContext c = g.Ctx();
+    c.r3.u64 = r0.obj;
+    c.r4.u64 = r0.io;
+    sub_82661D58(c, g.base);
+    c = g.Ctx();
+    c.r3.u64 = r1.obj;
+    c.r4.u64 = r0.io;
+    sub_82661D58(c, g.base);
+    n0.Process(io);
+    n1.Process(io);
+    c = g.Ctx();
+    c.r3.u64 = gbus;
+    c.r4.u64 = busio.io;
+    sub_826513E8(c, g.base);
+    const int gret = int32_t(c.r3.u32), nret = nbus.Process(nbusio.io);
+    std::snprintf(what, sizeof(what), "Rou0 -> %dch block %d", bus_ch, block);
+    if (gret != nret) {
+      rep.Fail(std::string(what) + ": return differs");
+      return;
+    }
+    if (gret) {
+      if (!CompareOutput(busio, nbusio.io, bus_ch, rep, what)) return;
+      ++rep.processed;
+    } else {
+      ++rep.passthrough;
+    }
+    nbusio.io.cur = busio.Cur();
+  }
+}
+
 }  // namespace
 
 // Returns true when the self-test ran (the caller then exits).
@@ -495,6 +670,8 @@ bool RunAudioSelfTest(uint8_t* base) {
   run("Gai0", [&](Report& r, int ch, uint32_t s) { GainCase(g, r, ch, s); });
   // PnS0 takes 1, 2 or 4 input channels (6 maps to "1", 4 stays).
   run("PnS0", [&](Report& r, int ch, uint32_t s) { PanCase(g, r, ch == 6 ? 1 : ch, s); });
+  run("Sen0+Sub0", [&](Report& r, int ch, uint32_t s) { BusCase(g, r, ch, s); });
+  run("Rou0+Sub0", [&](Report& r, int ch, uint32_t s) { RouteCase(g, r, ch, s); });
   std::fclose(rep.f);
   return true;
 }
