@@ -29,6 +29,16 @@ W menu pauzy (świat stoi: klatki 1650 i 1690 oraz 1720 i 1760 identyczne) podmi
 się o mniej niż 0,4/255, żaden piksel nie różni się o więcej niż 48, różnicę powyżej 16 ma 0,77%
 pikseli. Wniosek: kanały, orientacja i mipmapy są poprawne.
 
+#### Pierwszy wsad AI i wniosek
+
+597 tekstur-obrazów (filtr: co najmniej 256 kolorów, nie mapa normalnych, lista wykluczeń) przez
+Real-ESRGAN x4 z AI Image Studio (kafelki 192 px, 658 s na RTX 3080), BC7: 1,1 GB. W grze, pas
+budynków nieruchomy (kontrola: dwie klatki z AI różnią się o 0,01/255): tekstury AI zmieniają go
+średnio o 1,42/255, ostrość 10,75 i 10,66 (`docs/tekstury-ai-porownanie.png`). Przyczyna: gra
+renderuje wewnętrznie 1280x720, fasada zajmuje na ekranie mniej pikseli niż oryginalna tekstura,
+więc karta i tak próbkuje pomniejszoną mipmapę. **Tekstury wyższej rozdzielczości mają sens dopiero
+po podniesieniu rozdzielczości wewnętrznej** (`sr_native_render_scale`).
+
 #### Ograniczenia (stan na 2026-10-19)
 
 - Tylko renderer D3D12 (domyślny). Vulkan jeszcze nie podmienia.
