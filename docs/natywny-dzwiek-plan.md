@@ -110,7 +110,19 @@ więc tylko zgrubne: nowy silnik ma mieścić się w tym rozrzucie. O 1:1 rozstr
   (3 ramki XMA, 32 ms; strumienie 4-kanałowe 1773): na początku daje ciszę, a ponieważ odtwarzacz
   gra dokładnie tyle próbek, ile mówi nagłówek, w obecnym porcie każdy dźwięk startuje 32 ms za
   późno i traci ostatnie 32 ms. Bank (FFmpeg z pominięciem opóźnienia kodera) zaczyna od pierwszej
-  prawdziwej próbki. Do rozstrzygnięcia, jak robi to sprzęt konsoli. `native`: 146 s bez awarii,
+  prawdziwej próbki. **Rozstrzygnięte (2026-10-19): to artefakt emulacji, konsola zaczyna od
+  pierwszej prawdziwej próbki, czyli jak bank.** Dowody: (1) strumień bitów XMA każdego dźwięku
+  niesie pominięcie startowe w nagłówku pierwszej ramki (metoda vgmstream
+  `coding_utils.c` `ms_audio_get_skips`), w grze **512 w 400 na 400 sprawdzonych dźwięków**;
+  dekoder WMA Pro/XMA ma je wyrzucić (vgmstream: opóźnienie jest częścią strumienia i dekoder je
+  honoruje). (2) Nagłówek EA podaje liczbę próbek PO pominięciu: FFmpeg z pominięciem daje
+  dokładnie tę liczbę w 4648 na 4648 dźwiękach, a SndPlayer gra dokładnie tyle próbek, ile mówi
+  nagłówek, więc projekt EA zakłada dekoder, który pominięcie stosuje. (3) Dekoder SDK ustawia
+  FFmpegowi `AV_CODEC_FLAG2_SKIP_MANUAL` (`xma_context.cpp:509`), czyli pominięcia ze strumienia
+  nie stosuje (tylko `loop_subframe_skip` przy pętlach), i dokłada ramkę wyrównania (`carry`).
+  Skutek w obecnym porcie: każdy dźwięk zaczyna się 32 ms ciszy i traci ostatnie 32 ms. Silnik
+  natywny z bankiem tego nie ma. Niepewność rzędu 64 próbek (vgmstream opisuje, że FFmpeg potrafi
+  podać XMA pół podramki później) zostaje do sprawdzenia na sprzęcie. `native`: 146 s bez awarii,
   dźwięk ciągły, poziom -24..-12 dBFS, 0 przesterowań.
 
 - **Tryb `full` (2026-10-19):** oryginalny silnik nie renderuje ani nie dekoduje; wykonawca gościa

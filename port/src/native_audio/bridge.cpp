@@ -122,9 +122,21 @@ std::string ReadString(const uint8_t* base, uint32_t p) {
 }  // namespace
 
 namespace {
+std::string BankDir();
+
+// SR_NATIVE_AUDIO picks the mode ("off" = the original engine, for
+// comparisons). Unset: full when the sample bank is present, else off.
 std::string ModeName() {
-  const char* v = std::getenv("SR_NATIVE_AUDIO");
-  return v ? v : "";
+  static const std::string mode = [] {
+    std::string m;
+    if (const char* v = std::getenv("SR_NATIVE_AUDIO"); v && *v)
+      m = v;
+    else if (GetFileAttributesA((BankDir() + "/index.bin").c_str()) != INVALID_FILE_ATTRIBUTES)
+      m = "full";
+    REXAPU_INFO("native audio: mode {}", m.empty() || m == "off" ? "off (original engine)" : m);
+    return m;
+  }();
+  return mode;
 }
 
 // shadow-bank: the native SndPlayers play the converted sounds from the bank

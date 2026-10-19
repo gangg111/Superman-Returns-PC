@@ -1,6 +1,8 @@
 @echo off
 rem Gra z natywnym silnikiem dzwieku (docs/natywny-dzwiek-plan.md).
-rem   run_native_audio.cmd              dzwiek z silnika natywnego (bank probek)
+rem   run_native_audio.cmd              pelny silnik natywny (full, domyslnie)
+rem   run_native_audio.cmd native       natywny miks, oryginal liczy obok
+rem   run_native_audio.cmd off          oryginalny silnik (do porownan)
 rem   run_native_audio.cmd shadow       oryginal gra, natywny liczy obok i porownuje (log)
 rem   run_native_audio.cmd shadow-bank  jak shadow, natywny z banku probek
 setlocal
@@ -11,7 +13,7 @@ if not exist "%EXE%" (
   echo Brak %EXE%. Zbuduj wariant sdksrc.
   exit /b 1
 )
-set "SR_NATIVE_AUDIO=native"
+set "SR_NATIVE_AUDIO=full"
 if not "%~1"=="" set "SR_NATIVE_AUDIO=%~1"
 if not defined SR_NATIVE_AUDIO_DIR set "SR_NATIVE_AUDIO_DIR=%ROOT%..\SupermanReturnsPC\native_audio"
 if not exist "%ROOT%logs" mkdir "%ROOT%logs"
