@@ -1,0 +1,55 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index c10c32d..c9003d9 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -270,13 +270,34 @@ float srRtVisibility(float3 worldPos)
+     q.Proceed();
+     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
+ }
++// Debug: distance along the sun ray to the nearest occluder, -1 = none.
++float srRtHitDistance(float3 worldPos)
++{
++    ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
++    if (b.Load(72) == 0)
++        return -1.0;
++    float3 sun = asfloat(b.Load3(48));
++    float bias = max(asfloat(b.Load(76)), 0.01);
++    RayDesc ray;
++    ray.Origin = worldPos + sun * bias;
++    ray.TMin = bias * 0.5;
++    ray.Direction = sun;
++    ray.TMax = 20000.0;
++    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
++    q.TraceRayInline(g_RtTlas, RAY_FLAG_NONE, 0xFF, ray);
++    while (q.Proceed())
++        q.CommitNonOpaqueTriangleHit();
++    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() : -1.0;
++}
+ #else
+ float srRtVisibility(float3 worldPos) { return 1.0; }
++float srRtHitDistance(float3 worldPos) { return -1.0; }
+ #endif
+ #else
+ uint srRtDebug() { return 0; }
+ float3 srRtWorldPos(float3 lightCoord) { return lightCoord; }
+ float srRtVisibility(float3 worldPos) { return 1.0; }
++float srRtHitDistance(float3 worldPos) { return -1.0; }
+ #endif
+ #ifdef SR_VULKAN_BUFFERS
+ [[vk::binding(0,2)]] SamplerState g_SamplerDescriptorHeap[32];
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 23026f4..aab48ae 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -2720,7 +2720,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     {
+                         indent();
+                         out += "[branch] if (srRtDebug() == 1) { oC0 = float4(frac(srRtWorldPos(iSrLight.xyz) / 10.0), 1.0); } "
+-                               "else if (srRtDebug() == 2) { oC0 = float4(srRtVisibility(srRtWorldPos(iSrLight.xyz)).xxx, 1.0); }";
++                               "else if (srRtDebug() == 2) { oC0 = float4(srRtVisibility(srRtWorldPos(iSrLight.xyz)).xxx, 1.0); } "
++                               "else if (srRtDebug() == 4) { float d = srRtHitDistance(srRtWorldPos(iSrLight.xyz)); "
++                               "oC0 = float4(max(d, 0.0) / 100.0, d >= 0.0 ? 1.0 : 0.0, "
++                               "all(iSrLight.xyz == saturate(iSrLight.xyz)) ? 1.0 : 0.0, 1.0); }";
+                     }
+                     // Xenos fixed-point render targets (k_16_16, k_16_16_16_16)
+                     // store -32..32: every write clamps there. The host keeps

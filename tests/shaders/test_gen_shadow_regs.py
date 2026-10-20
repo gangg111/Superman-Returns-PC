@@ -50,6 +50,31 @@ def test_collect_world_small_catalog():
     assert gen_shadow_regs.collect_world(shaders) == [(0xA0, 0, 0), (0xB0, 4, 1), (0xD0, 0, 0)]
 
 
+def test_collect_instanced_small_catalog():
+    # Input: catalog entries + translated HLSL per hash (only the CONST_REL lines matter).
+    shaders = [
+        entry('vs', 'B0', [('instance_data', 4), ('instance_transforms', 100)]),
+        entry('vs', 'A0', [('instance_data', 8), ('instance_transforms', 120)]),
+        entry('vs', 'C0', [('instance_transforms', 100)]),                     # no instance_data: skipped
+        entry('ps', 'D0', [('instance_data', 4), ('instance_transforms', 100)]),  # pixel: skipped
+    ]
+    src = {'A0': 'r0.y = r4.y + CONST_REL(120 + a0).y; r0.x = dot(r4.xz, CONST_REL(121 + a0).yx);',
+           'B0': 'r1 = r2.zzzz * CONST_REL(102 + a0).yzxw; r1 = r1.zxyw + CONST_REL(103 + a0).xyzw;'}
+    # źródło: policzone ręcznie z wejścia powyżej (A0 czyta tylko 120..121 -> 2, B0 czyta 103 -> 4)
+    assert gen_shadow_regs.collect_instanced(shaders, src.__getitem__) == [(0xA0, 8, 120, 2), (0xB0, 4, 100, 4)]
+
+
+@pytest.mark.skipif(not os.path.exists(CATALOG), reason='brak artifacts/shaders/catalog.json (lokalny korpus gry)')
+def test_real_catalog_instanced():
+    from srpaths import ARTIFACTS
+    rows = gen_shadow_regs.collect_instanced(
+        json.load(open(CATALOG))['shaders'], lambda h: open(ARTIFACTS / 'hlsl' / f'{h}.vs.hlsl').read())
+    # źródło: artifacts/shaders/hlsl/1C89B1A64AA3110B.vs.hlsl linie 979-994 (c100+a0, c101+a0, a0 = 2*instancja)
+    assert (0x1C89B1A64AA3110B, 4, 100, 2) in rows
+    # źródło: artifacts/shaders/hlsl/B27A827D7AA91D13.vs.hlsl linie 1047-1062 (c100..c103 + a0, a0 = 4*instancja)
+    assert (0xB27A827D7AA91D13, 4, 100, 4) in rows
+
+
 @pytest.mark.skipif(not os.path.exists(CATALOG), reason='brak artifacts/shaders/catalog.json (lokalny korpus gry)')
 def test_real_catalog_known_shader():
     rows = gen_shadow_regs.collect(json.load(open(CATALOG))['shaders'])

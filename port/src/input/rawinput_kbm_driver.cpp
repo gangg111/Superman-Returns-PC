@@ -1,6 +1,8 @@
 #include "input/rawinput_kbm_driver.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
@@ -14,6 +16,11 @@
 #include <rex/ui/virtual_key.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
+
+REXCVAR_DEFINE_STRING(sr_input_script, "", "Input",
+                      "Automation: keys pressed inside the game without focus or system input, "
+                      "\"seconds:Key[:ms];...\" from the driver start (Key as in keybind_*, "
+                      "e.g. \"25:Return;29:Shift+Down;97:Up:1500\"; default hold 120 ms)");
 
 namespace superman_returns::input {
 
@@ -67,6 +74,53 @@ bool Pressed(const bool (&down)[256], const char* cvar) {
     if (!token.empty() && TokenPressed(down, token, live)) return true;
   }
   return false;
+}
+
+// sr_input_script: the keys (modifiers included) held at `elapsed_ms`.
+// Returns whether any scripted key is held.
+bool ScriptKeys(double elapsed_ms, bool (&down)[256]) {
+  struct Step {
+    double start_ms, end_ms;
+    std::vector<uint8_t> keys;
+  };
+  static const std::vector<Step> steps = [] {
+    std::vector<Step> out;
+    std::string_view rest = rex::cvar::Query<std::string>("sr_input_script");
+    static std::string text;  // keeps the cvar text alive for the views
+    text = std::string(rest);
+    rest = text;
+    while (!rest.empty()) {
+      const size_t semi = rest.find(';');
+      std::string_view item = rest.substr(0, semi);
+      rest = semi == std::string_view::npos ? std::string_view() : rest.substr(semi + 1);
+      const size_t c1 = item.find(':');
+      if (c1 == std::string_view::npos) continue;
+      const size_t c2 = item.find(':', c1 + 1);
+      Step s;
+      s.start_ms = std::atof(std::string(item.substr(0, c1)).c_str()) * 1000.0;
+      const double hold = c2 == std::string_view::npos ? 120.0 : std::atof(std::string(item.substr(c2 + 1)).c_str());
+      s.end_ms = s.start_ms + hold;
+      std::string_view combo = item.substr(c1 + 1, c2 == std::string_view::npos ? std::string_view::npos : c2 - c1 - 1);
+      while (!combo.empty()) {
+        const size_t plus = combo.find('+');
+        const std::string_view name = combo.substr(0, plus);
+        combo = plus == std::string_view::npos ? std::string_view() : combo.substr(plus + 1);
+        const uint16_t vk = name == "Shift" ? VK_SHIFT : name == "Ctrl" ? VK_CONTROL : name == "Alt" ? VK_MENU
+                                                  : uint16_t(rex::ui::ParseVirtualKey(name));
+        if (vk && vk < 256) s.keys.push_back(uint8_t(vk));
+      }
+      if (!s.keys.empty()) out.push_back(std::move(s));
+    }
+    if (!out.empty()) REXLOG_INFO("Raw Input: input script with {} steps", out.size());
+    return out;
+  }();
+  bool any = false;
+  for (const Step& s : steps) {
+    if (elapsed_ms < s.start_ms || elapsed_ms >= s.end_ms) continue;
+    for (uint8_t vk : s.keys) down[vk] = true;
+    any = true;
+  }
+  return any;
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -199,8 +253,12 @@ void RawInputKbmDriver::EnumerateDevices(std::vector<rex::input::DeviceInfo>& ou
 
 X_RESULT RawInputKbmDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   if (!Enabled() || id != kDevice) return X_ERROR_DEVICE_NOT_CONNECTED;
+  static const auto script_start = std::chrono::steady_clock::now();
+  bool scripted[256] = {};
+  const bool script_held = ScriptKeys(
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - script_start).count(), scripted);
   const bool foreground = GameInForeground();
-  const bool live = foreground && is_active();
+  const bool live = (foreground || script_held) && is_active();
   const bool mouse_look = live && rex::cvar::Query<bool>("mnk_mouse");
 
   // Mouse look: hidden cursor held at the window centre (Raw Input reports
@@ -236,7 +294,8 @@ X_RESULT RawInputKbmDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state
   out_state->packet_number = packet_;
   if (!live) return X_ERROR_SUCCESS;
 
-  const auto& k = key_down_;
+  bool k[256];
+  for (int i = 0; i < 256; ++i) k[i] = (foreground && key_down_[i]) || scripted[i];
   constexpr struct {
     const char* cvar;
     uint16_t button;

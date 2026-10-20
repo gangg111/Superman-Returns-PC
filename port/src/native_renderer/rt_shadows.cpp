@@ -16,6 +16,10 @@ REXCVAR_DEFINE_DOUBLE(sr_rt_test_cube, 0.0, "Superman Returns Native",
                       "Ray-traced shadows step 2: light-space depth (0..1) of a 6-unit test cube on "
                       "the sun line through the first cascade's centre; 0 = no cube")
     .range(0.0, 1.0);
+REXCVAR_DEFINE_INT32(sr_rt_exclude_sources, 0, "Superman Returns Native",
+                     "Debug: leave these capture sources out of the ray-traced scene (bit mask: 1 = indexed "
+                     "scene draws, 2 = the shadow caster pass, 4 = instanced draws)")
+    .range(0, 7);
 
 namespace superman_returns::native {
 
@@ -224,6 +228,17 @@ bool Renderer::RtBuildBlas(const D3D12_RAYTRACING_GEOMETRY_DESC& geometry, RtMes
   return true;
 }
 
+// Index buffer a mesh owns (instanced meshes keep their indices in a vertex
+// stream, read from guest memory once). Upload heap: written once, read by the
+// BLAS build.
+bool Renderer::RtMakeIndexBuffer(const std::vector<uint32_t>& indices, RtMesh& mesh) {
+  const size_t bytes = indices.size() * sizeof(uint32_t);
+  mesh.indices = MakeBuffer(device_, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+  if (!mesh.indices) return false;
+  Fill(mesh.indices.Get(), indices.data(), bytes);
+  return true;
+}
+
 // Top-level structure of the city for this frame: every instance seen in the
 // last 900 frames within 4000 units of the first cascade's centre.
 bool Renderer::RtBuildCityTlas(const float anchor[3]) {
@@ -244,6 +259,7 @@ bool Renderer::RtBuildCityTlas(const float anchor[3]) {
   for (auto it = rt_meshes_.begin(); it != rt_meshes_.end();) {
     if (swap_number_ > it->second.last_swap + 1800) {
       Retire(std::move(it->second.blas));
+      if (it->second.indices) Retire(std::move(it->second.indices));
       it = rt_meshes_.erase(it);
     } else {
       ++it;
@@ -252,7 +268,9 @@ bool Renderer::RtBuildCityTlas(const float anchor[3]) {
   std::vector<D3D12_RAYTRACING_INSTANCE_DESC> descs;
   descs.reserve(rt_city_instances_.size());
   const float radius2 = 4000.0f * 4000.0f;
+  const int32_t excluded = REXCVAR_GET(sr_rt_exclude_sources);
   for (const auto& [key, instance] : rt_city_instances_) {
+    if (instance.source & excluded) continue;
     auto mesh = rt_meshes_.find(instance.mesh);
     if (mesh == rt_meshes_.end() || !mesh->second.blas) continue;
     const float* t = instance.transform;

@@ -305,6 +305,9 @@ class Renderer : public NativeFrontend {
     std::string rt;
   };
   bool SkipGpuDraw() const;
+  int32_t RtDebugMode() const;  // sr_rt_shadow_debug, or this frame's step of sr_rt_shadow_debug_cycle
+  uint64_t rt_measure_base_ = 0;  // first swap of the sr_rt_measure_at_s dumps
+  float rt_frame_rows_[12] = {};  // light rows U, V, Z the frame's world reconstruction inverts
   bool shader_pending_ = false;  // LoadShader: translation still running
   void ProfileBegin();
   void ProfileMark(Op op, bool drew);
@@ -508,9 +511,14 @@ class Renderer : public NativeFrontend {
   struct BufferEntry;
   void RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd, const BufferEntry* ib,
                      uint32_t start_index, uint32_t index_count, int32_t base_vertex);
+  // Non-indexed instanced draws (the instance_transforms vertex shaders): many
+  // copies of one mesh per draw, mesh indices in the POSITION1 stream.
+  void RtCaptureInstanced(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd,
+                          uint32_t start_vertex, uint32_t vertex_count);
   bool RtBuildCityTlas(const float sun_anchor[3]);
   struct RtMesh {
     Microsoft::WRL::ComPtr<ID3D12Resource> blas;
+    Microsoft::WRL::ComPtr<ID3D12Resource> indices;  // own index buffer (instanced meshes)
     uint64_t last_swap = 0;
     uint32_t triangles = 0;
   };
@@ -518,8 +526,13 @@ class Renderer : public NativeFrontend {
     uint64_t mesh = 0;
     float transform[12] = {};
     uint64_t first_swap = 0, last_swap = 0;
+    uint8_t source = 0;  // 1 = indexed scene draw, 2 = shadow caster pass (Mobj), 4 = instanced draw
   };
+  void RtAddInstance(const RtInstance& instance);
+  void RtDumpObj(uint8_t* base, uint32_t vertex0, uint32_t stride, const std::vector<uint32_t>& idx,
+                 const float transform[12], uint64_t instance_key);
   bool RtBuildBlas(const D3D12_RAYTRACING_GEOMETRY_DESC& geometry, RtMesh& mesh);
+  bool RtMakeIndexBuffer(const std::vector<uint32_t>& indices, RtMesh& mesh);
   std::unordered_map<uint64_t, RtMesh> rt_meshes_;
   std::unordered_map<uint64_t, RtInstance> rt_city_instances_;
   Microsoft::WRL::ComPtr<ID3D12Resource> rt_city_tlas_, rt_build_scratch_;
@@ -529,7 +542,7 @@ class Renderer : public NativeFrontend {
   bool rt_city_ready_ = false;
   struct RtStats {
     uint64_t captured = 0, new_meshes = 0, skip_format = 0, skip_prim = 0, skip_budget = 0,
-             skip_skinned = 0;
+             skip_skinned = 0, instanced_draws = 0, instanced_copies = 0, skip_instanced = 0;
   } rt_stats_;
   bool rt_scene_failed_ = false;
   bool ssao_ = false;

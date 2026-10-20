@@ -238,8 +238,23 @@ REXCVAR_DEFINE_DOUBLE(sr_rt_shadow_bias, 0.5, "Superman Returns Native",
 REXCVAR_DEFINE_INT32(sr_rt_shadow_debug, 0, "Superman Returns Native",
                      "Ray-traced shadows debug view: 0 = off, 1 = the sun shadow receivers paint "
                      "their world position as a 10-unit grid, 2 = their ray-traced sun visibility "
-                     "(white lit, black shadowed; docs/cienie-rt-projekt.md)")
-    .range(0, 2);
+                     "(white lit, black shadowed; docs/cienie-rt-projekt.md), 3 = the game without "
+                     "its shadow map (no geometry drawn into the shadow targets), 4 = distance to the "
+                     "nearest occluder along the sun ray (red = distance / 100, green = hit)")
+    .range(0, 4);
+REXCVAR_DEFINE_BOOL(sr_rt_shadows_replace, true, "Superman Returns Native",
+                    "With sr_rt_shadows: the sun shadow comes from the ray-traced scene instead of the "
+                    "game's cascades (the receivers' shadow map fetches read the ray result; false = "
+                    "cascades only, for comparison)");
+REXCVAR_DEFINE_DOUBLE(sr_rt_measure_at_s, 0.0, "Superman Returns Native",
+                      "Measurement: after this bench time, dump (sr_native_dump_dir, prefix m<mode>_) one "
+                      "frame of each sr_rt_shadow_debug_cycle step");
+REXCVAR_DEFINE_INT32(sr_rt_shadow_debug_cycle, 0, "Superman Returns Native",
+                     "Measurement: every N frames switch sr_rt_shadow_debug through 0 (game), 2 (ray-traced "
+                     "visibility), 3 (game without shadows), 4 (occluder distance), so a paused frame gives "
+                     "all four images; "
+                     "0 = off")
+    .range(0, 100000);
 REXCVAR_DEFINE_INT32(sr_native_shadow_quality, 4, "Superman Returns Native",
                      "Shadow map resolution multiplier (1 = original 1024, 2 = 2048, 4 = 4096)")
     .range(1, 4);
@@ -1707,7 +1722,27 @@ void Renderer::Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES& state
 // Per-command GPU profile of one frame (sr_native_profile_frame_at_s).
 // ---------------------------------------------------------------------------
 
+namespace {
+bool RtGeometryVs(uint64_t hash);  // a vertex shader drawing world geometry (rt_world/instanced tables)
+}  // namespace
+
+int32_t Renderer::RtDebugMode() const {
+  const int32_t cycle = REXCVAR_GET(sr_rt_shadow_debug_cycle);
+  if (cycle <= 0) return REXCVAR_GET(sr_rt_shadow_debug);
+  static constexpr int32_t kModes[4] = {0, 2, 3, 4};
+  return kModes[(swap_number_ / uint64_t(cycle)) % 4];
+}
+
 bool Renderer::SkipGpuDraw() const {
+  // Game without shadows: no geometry into the shadow depth targets (the game
+  // clears them with a draw of its own, which stays).
+  if (((bound_ds_ && bound_ds_->shadow) || (bound_rts_[0] && bound_rts_[0]->shadow)) && RtDebugMode() == 3 &&
+      RtGeometryVs(current_vs_hash_)) {
+    static uint64_t skipped = 0;
+    if ((++skipped & (skipped - 1)) == 0)
+      REXLOG_INFO("native: rt debug 3: {} shadow caster draws skipped (swap {})", skipped, swap_number_);
+    return true;
+  }
   const int32_t format = REXCVAR_GET(sr_native_debug_nodraw_format);
   return format >= 0 && bound_rts_[0] && !bound_rts_[0]->depth &&
          int32_t(bound_rts_[0]->guest_format) == format;
@@ -2250,7 +2285,26 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   const ShadowRegs* it = std::lower_bound(std::begin(kShadowRegs), end, current_vs_hash_,
                                           [](const ShadowRegs& e, uint64_t h) { return e.hash < h; });
   if (it == end || it->hash != current_vs_hash_) return;
-  if (rt_frame_swap_ == swap_number_) return;
+  if (rt_frame_swap_ == swap_number_) {
+    // Diagnostic: receivers whose light rows differ from the frame's (another
+    // shadow matrix, e.g. a per-character map): logged once per shader.
+    const float* c = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase);
+    float diff = 0.0f;
+    for (int k = 0; k < 4; ++k) {
+      diff = std::max(diff, std::abs(c[it->u * 4 + k] - rt_frame_rows_[k]));
+      diff = std::max(diff, std::abs(c[it->v * 4 + k] - rt_frame_rows_[4 + k]));
+      diff = std::max(diff, std::abs(c[it->z * 4 + k] - rt_frame_rows_[8 + k]));
+    }
+    static std::unordered_set<uint64_t> logged_vs;
+    if (diff > 1e-4f && logged_vs.size() < 32 && logged_vs.insert(current_vs_hash_).second) {
+      REXLOG_INFO("native: rt receiver vs {:016X} has other light rows (max diff {:.4f}): ({:.4f} {:.4f} {:.4f} "
+                  "{:.4f}) ({:.4f} {:.4f} {:.4f} {:.4f}) ({:.4f} {:.4f} {:.4f} {:.4f})", current_vs_hash_, diff,
+                  c[it->u * 4], c[it->u * 4 + 1], c[it->u * 4 + 2], c[it->u * 4 + 3], c[it->v * 4],
+                  c[it->v * 4 + 1], c[it->v * 4 + 2], c[it->v * 4 + 3], c[it->z * 4], c[it->z * 4 + 1],
+                  c[it->z * 4 + 2], c[it->z * 4 + 3]);
+    }
+    return;
+  }
   if (!rt_frame_buffer_) {
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -2287,6 +2341,7 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   m[15] = 1.0f;
   float inv[16];
   if (!Invert4x4(m, inv)) return;
+  std::memcpy(rt_frame_rows_, m, sizeof(rt_frame_rows_));
   // Towards the sun: light-space depth grows away from the light (row Z).
   float sun[3] = {-m[8], -m[9], -m[10]};
   const float len = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
@@ -2306,18 +2361,21 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   std::memset(data, 0, 256);
   std::memcpy(data, inv, 48);
   std::memcpy(&data[12], sun, 12);
-  data[16] = uint32_t(REXCVAR_GET(sr_rt_shadow_debug));
+  data[16] = uint32_t(RtDebugMode());
   data[17] = 1;
   data[18] = (REXCVAR_GET(sr_rt_shadows) ? rt_city_ready_ : rt_scene_ready_) ? 1u : 0u;
   const float bias = float(REXCVAR_GET(sr_rt_shadow_bias));
   std::memcpy(&data[19], &bias, 4);
+  data[20] = REXCVAR_GET(sr_rt_shadows) && REXCVAR_GET(sr_rt_shadows_replace) && RtDebugMode() == 0 ? 1u : 0u;
   Transition(rt_frame_buffer_.Get(), rt_frame_state_, D3D12_RESOURCE_STATE_COPY_DEST);
   command_list_->CopyBufferRegion(rt_frame_buffer_.Get(), 0, up.resource, up.offset, 256);
   Transition(rt_frame_buffer_.Get(), rt_frame_state_,
              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   rt_frame_swap_ = swap_number_;
   static int logged = 0;
-  if (logged++ < 3) {
+  if (logged++ < 3 || swap_number_ == uint64_t(REXCVAR_GET(sr_rt_dump_obj_swap))) {
+    REXLOG_INFO("native: rt frame swap {} light rows {} {} {} {} {} {} {} {} {} {} {} {}", swap_number_, m[0], m[1],
+                m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
     REXLOG_INFO("native: rt frame light rows ({:.4f} {:.4f} {:.4f} {:.4f}) ({:.4f} {:.4f} {:.4f} {:.4f}) "
                 "({:.4f} {:.4f} {:.4f} {:.4f}) from vs {:016X}", m[0], m[1], m[2], m[3], m[4], m[5],
                 m[6], m[7], m[8], m[9], m[10], m[11], current_vs_hash_);
@@ -2335,6 +2393,27 @@ constexpr WorldRegs kWorldRegs[] = {
 uint64_t RtMix(uint64_t h, uint64_t v) {
   h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
   return h;
+}
+template <typename Instance>
+uint64_t RtInstanceKey(const Instance& instance) {
+  uint64_t k = instance.mesh;
+  for (float v : instance.transform) k = RtMix(k, uint64_t(int64_t(std::lround(double(v) * 64.0))));
+  return k;
+}
+struct InstancedRegs {
+  uint64_t hash;
+  uint32_t data, transforms, per_instance;
+};
+constexpr InstancedRegs kInstancedRegs[] = {
+#include "rt_instanced_regs.inc"
+};
+bool RtGeometryVs(uint64_t hash) {
+  auto in = [hash](const auto& table) {
+    const auto it = std::lower_bound(std::begin(table), std::end(table), hash,
+                                     [](const auto& e, uint64_t h) { return e.hash < h; });
+    return it != std::end(table) && it->hash == hash;
+  };
+  return in(kWorldRegs) || in(kInstancedRegs);
 }
 // Position formats DXR builds from directly (the host vertex buffers hold
 // little-endian elements, swapped on upload). Quantised formats the vertex
@@ -2405,10 +2484,9 @@ void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCm
   const float* c = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase);
   RtInstance instance;
   instance.mesh = key;
+  instance.source = current_vs_hash_ == 0xC7C0E381A3C9B79Eull ? 2 : 1;
   std::memcpy(instance.transform, c + wit->reg * 4, sizeof(instance.transform));
-  instance.first_swap = instance.last_swap = swap_number_;
-  uint64_t ikey = key;
-  for (float v : instance.transform) ikey = RtMix(ikey, uint64_t(int64_t(std::lround(double(v) * 64.0))));
+  const uint64_t ikey = RtInstanceKey(instance);
   auto mit = rt_meshes_.find(key);
   if (mit == rt_meshes_.end()) {
     if (rt_builds_swap_ != swap_number_) {
@@ -2442,73 +2520,215 @@ void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCm
     ++rt_stats_.new_meshes;
     mit = rt_meshes_.emplace(key, std::move(mesh)).first;
   }
-  mit->second.last_swap = swap_number_;
   if (REXCVAR_GET(sr_rt_dump_obj_swap) > 0 &&
       swap_number_ == uint64_t(REXCVAR_GET(sr_rt_dump_obj_swap)) &&
-      !rt_city_instances_.count(ikey) && pos_format == DXGI_FORMAT_R32G32B32_FLOAT) {
-    // Debug export: the same vertices and indices from guest memory (big
-    // endian), transformed with the instance matrix.
-    static std::FILE* obj = nullptr;
-    static uint32_t written_vertices = 0, written_meshes = 0;
-    if (!obj) {
-      const std::string path = REXCVAR_GET(sr_native_dump_dir) + "/rt_city.obj";
-      obj = std::fopen(path.c_str(), "w");
+      pos_format == DXGI_FORMAT_R32G32B32_FLOAT) {
+    const uint32_t isize = cmd.index32 ? 4 : 2;
+    std::vector<uint32_t> idx(index_count - index_count % 3);
+    for (uint32_t i = 0; i < idx.size(); ++i) {
+      const uint8_t* q = GuestPtr(base, 0xA0000000u + cmd.index.address + (start_index + i) * isize, isize);
+      idx[i] = isize == 4 ? (uint32_t(q[0]) << 24) | (uint32_t(q[1]) << 16) | (uint32_t(q[2]) << 8) | q[3]
+                          : (uint32_t(q[0]) << 8) | q[1];
     }
-    if (obj && written_vertices < 2000000) {
-      auto be32 = [&](uint32_t addr) {
-        const uint8_t* q = GuestPtr(base, 0xA0000000u + addr, 4);
-        return (uint32_t(q[0]) << 24) | (uint32_t(q[1]) << 16) | (uint32_t(q[2]) << 8) | q[3];
-      };
-      const uint32_t isize = cmd.index32 ? 4 : 2;
-      uint32_t lo = ~0u, hi = 0;
-      std::vector<uint32_t> idx(index_count - index_count % 3);
-      for (uint32_t i = 0; i < idx.size(); ++i) {
-        const uint32_t a = cmd.index.address + (start_index + i) * isize;
-        uint32_t v;
-        if (isize == 4) {
-          v = be32(a);
-        } else {
-          const uint8_t* q = GuestPtr(base, 0xA0000000u + a, 2);
-          v = (uint32_t(q[0]) << 8) | q[1];
-        }
-        idx[i] = v;
-        lo = std::min(lo, v);
-        hi = std::max(hi, v);
-      }
-      if (lo <= hi && hi - lo < 200000) {
-        const float* t = instance.transform;
-        for (uint32_t v = lo; v <= hi; ++v) {
-          const uint32_t a = pos_stream->buffer.address + pos_stream->offset +
-                             (uint32_t(base_vertex) + v) * pos_stream->stride + pos_offset;
-          float pp[3];
-          for (int k = 0; k < 3; ++k) {
-            const uint32_t w = be32(a + 4 * k);
-            std::memcpy(&pp[k], &w, 4);
-          }
-          std::fprintf(obj, "v %.3f %.3f %.3f\n", t[0] * pp[0] + t[1] * pp[1] + t[2] * pp[2] + t[3],
-                       t[4] * pp[0] + t[5] * pp[1] + t[6] * pp[2] + t[7],
-                       t[8] * pp[0] + t[9] * pp[1] + t[10] * pp[2] + t[11]);
-        }
-        std::fprintf(obj, "g mesh_%u_vs_%016llX\n", written_meshes++, (unsigned long long)current_vs_hash_);
-        for (uint32_t i = 0; i + 2 < idx.size(); i += 3)
-          std::fprintf(obj, "f %u %u %u\n", written_vertices + idx[i] - lo + 1,
-                       written_vertices + idx[i + 1] - lo + 1, written_vertices + idx[i + 2] - lo + 1);
-        written_vertices += hi - lo + 1;
-        std::fflush(obj);
-      }
-    }
+    RtDumpObj(base, pos_stream->buffer.address + pos_stream->offset +
+                        uint32_t(base_vertex) * pos_stream->stride + pos_offset,
+              pos_stream->stride, idx, instance.transform, ikey);
   }
-  // Same mesh and same matrix again: keep when it was first seen (static
-  // objects accumulate age; moving ones get a new key every frame).
-  auto [iit, inserted] = rt_city_instances_.try_emplace(ikey, instance);
-  if (!inserted) iit->second.last_swap = swap_number_;
+  RtAddInstance(instance);
+}
+
+// Debug export (sr_rt_dump_obj_swap): a mesh's vertices from guest memory (big
+// endian floats, the first at vertex0), transformed with the instance matrix,
+// appended to sr_native_dump_dir/rt_city.obj.
+void Renderer::RtDumpObj(uint8_t* base, uint32_t vertex0, uint32_t stride, const std::vector<uint32_t>& idx,
+                         const float t[12], uint64_t instance_key) {
+  static std::FILE* obj = nullptr;
+  static uint32_t written_vertices = 0, written_meshes = 0;
+  static std::unordered_set<uint64_t> written;
+  if (!written.insert(instance_key).second) return;
+  if (!obj) {
+    const std::string path = REXCVAR_GET(sr_native_dump_dir) + "/rt_city.obj";
+    obj = std::fopen(path.c_str(), "w");
+  }
+  if (!obj || written_vertices >= 4000000 || idx.empty()) return;
+  const auto [lo_it, hi_it] = std::minmax_element(idx.begin(), idx.end());
+  const uint32_t lo = *lo_it, hi = *hi_it;
+  if (hi - lo >= 200000) return;
+  for (uint32_t v = lo; v <= hi; ++v) {
+    float p[3];
+    for (int k = 0; k < 3; ++k) {
+      const uint8_t* q = GuestPtr(base, 0xA0000000u + vertex0 + v * stride + 4 * k, 4);
+      const uint32_t w = (uint32_t(q[0]) << 24) | (uint32_t(q[1]) << 16) | (uint32_t(q[2]) << 8) | q[3];
+      std::memcpy(&p[k], &w, 4);
+    }
+    std::fprintf(obj, "v %.3f %.3f %.3f\n", t[0] * p[0] + t[1] * p[1] + t[2] * p[2] + t[3],
+                 t[4] * p[0] + t[5] * p[1] + t[6] * p[2] + t[7], t[8] * p[0] + t[9] * p[1] + t[10] * p[2] + t[11]);
+  }
+  std::fprintf(obj, "g mesh_%u_vs_%016llX\n", written_meshes++, (unsigned long long)current_vs_hash_);
+  for (size_t i = 0; i + 2 < idx.size(); i += 3)
+    std::fprintf(obj, "f %u %u %u\n", written_vertices + idx[i] - lo + 1, written_vertices + idx[i + 1] - lo + 1,
+                 written_vertices + idx[i + 2] - lo + 1);
+  written_vertices += hi - lo + 1;
+  std::fflush(obj);
+}
+
+// A TLAS instance of a captured mesh with its world matrix. The same mesh and
+// matrix again keeps when it was first seen (static objects accumulate age;
+// moving ones get a new key every frame).
+void Renderer::RtAddInstance(const RtInstance& instance) {
+  auto mit = rt_meshes_.find(instance.mesh);
+  if (mit == rt_meshes_.end()) return;
+  mit->second.last_swap = swap_number_;
+  auto [iit, inserted] = rt_city_instances_.try_emplace(RtInstanceKey(instance), instance);
+  if (inserted) iit->second.first_swap = swap_number_;
+  iit->second.last_swap = swap_number_;
   static uint64_t last_log = 0;
   if (swap_number_ >= last_log + 600) {
     last_log = swap_number_;
     REXLOG_INFO("native: rt city: {} meshes, {} instances; captured {}, new {}, skipped format {} "
-                "skinned {} budget {}", rt_meshes_.size(), rt_city_instances_.size(), rt_stats_.captured,
-                rt_stats_.new_meshes, rt_stats_.skip_format, rt_stats_.skip_skinned,
-                rt_stats_.skip_budget);
+                "skinned {} budget {}; instanced draws {} copies {} skipped {}", rt_meshes_.size(),
+                rt_city_instances_.size(), rt_stats_.captured, rt_stats_.new_meshes,
+                rt_stats_.skip_format, rt_stats_.skip_skinned, rt_stats_.skip_budget,
+                rt_stats_.instanced_draws, rt_stats_.instanced_copies, rt_stats_.skip_instanced);
+  }
+}
+
+// Instanced city geometry (the instance_transforms vertex shaders, e.g.
+// 1C89B1A64AA3110B): the draw is non-indexed, vertex id v belongs to copy
+// i = floor((v + 0.5) / N) with N = instance_data.x vertices per copy, the
+// mesh vertex is POSITION1[v - i*N + instance_data.y] and copy i's transform
+// is in instance_transforms + i * per_instance: per_instance 2 = translation
+// c0.xyz and a yaw c1 (x' = c0.x + x*c1.x + z*c1.z, y' = c0.y + y,
+// z' = c0.z + x*c1.y + z*c1.x), 4 = world = x*c0 + y*c1 + z*c2 + c3.
+void Renderer::RtCaptureInstanced(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd,
+                                  uint32_t start_vertex, uint32_t vertex_count) {
+  if (!REXCVAR_GET(sr_rt_shadows)) return;
+  const InstancedRegs* iend = std::end(kInstancedRegs);
+  const InstancedRegs* iit = std::lower_bound(std::begin(kInstancedRegs), iend, current_vs_hash_,
+                                              [](const InstancedRegs& e, uint64_t h) { return e.hash < h; });
+  if (iit == iend || iit->hash != current_vs_hash_) return;
+  const ShadowRegs* send = std::end(kShadowRegs);
+  const ShadowRegs* sit = std::lower_bound(std::begin(kShadowRegs), send, current_vs_hash_,
+                                           [](const ShadowRegs& e, uint64_t h) { return e.hash < h; });
+  if (sit == send || sit->hash != current_vs_hash_) return;  // only the sun shadow receivers
+  ++rt_stats_.instanced_draws;
+  const float* c = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase);
+  const float* data = c + iit->data * 4;
+  const uint32_t per_copy = std::isfinite(data[0]) && data[0] >= 3.0f ? uint32_t(data[0]) : 0;
+  const uint32_t first_local = std::isfinite(data[1]) && data[1] >= 0.0f ? uint32_t(data[1]) : 0;
+  auto skip = [&](const char* why) {
+    ++rt_stats_.skip_instanced;
+    static int logged = 0;
+    if (logged++ < 12)
+      REXLOG_INFO("native: rt instanced skip ({}): vs {:016X} instance_data ({} {} {} {}) start {} vertices {}",
+                  why, current_vs_hash_, data[0], data[1], data[2], data[3], start_vertex, vertex_count);
+  };
+  if (!per_copy || per_copy % 3) return skip("vertices per copy");
+  // POSITION0 (the vertices) and POSITION1 (the mesh's vertex indices).
+  const StreamPlan* streams[2] = {};
+  uint32_t offsets[2] = {};
+  DXGI_FORMAT formats[2] = {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
+  for (uint32_t i = 0; i < cmd.stream_count; ++i) {
+    const StreamPlan& sp = batch.streams[cmd.stream_first + i];
+    for (const auto& a : ReadVertexDeclaration(base, sp.buffer.decl)) {
+      if (a.stream != sp.stream || a.usage != 0 || a.index > 1 || streams[a.index]) continue;
+      streams[a.index] = &sp;
+      offsets[a.index] = a.offset;
+      formats[a.index] = MapDeclType(a.type).format;
+    }
+  }
+  const DXGI_FORMAT pos_format = streams[0] ? RtPositionFormat(formats[0]) : DXGI_FORMAT_UNKNOWN;
+  const bool index_uint = formats[1] == DXGI_FORMAT_R32_UINT;
+  if (pos_format == DXGI_FORMAT_UNKNOWN || !streams[1] ||
+      (!index_uint && formats[1] != DXGI_FORMAT_R32_FLOAT && formats[1] != DXGI_FORMAT_R32G32_FLOAT &&
+       formats[1] != DXGI_FORMAT_R32G32B32_FLOAT && formats[1] != DXGI_FORMAT_R32G32B32A32_FLOAT)) {
+    return skip(fmt::format("formats {} {} streams {} {}", int(formats[0]), int(formats[1]),
+                            streams[0] != nullptr, streams[1] != nullptr).c_str());
+  }
+  const StreamPlan& ps = *streams[0];
+  const StreamPlan& xs = *streams[1];
+  uint64_t key = RtMix(ps.buffer.key, ps.offset);
+  key = RtMix(key, (uint64_t(ps.stride) << 32) | offsets[0]);
+  key = RtMix(key, RtMix(xs.buffer.key, xs.offset));
+  key = RtMix(key, (uint64_t(first_local) << 32) | per_copy);
+  const bool fresh = !rt_meshes_.count(key);
+  const bool dump = REXCVAR_GET(sr_rt_dump_obj_swap) > 0 &&
+                    swap_number_ == uint64_t(REXCVAR_GET(sr_rt_dump_obj_swap)) &&
+                    pos_format == DXGI_FORMAT_R32G32B32_FLOAT;
+  if (fresh) {
+    if (rt_builds_swap_ != swap_number_) {
+      rt_builds_swap_ = swap_number_;
+      rt_builds_this_frame_ = 0;
+    }
+    if (rt_builds_this_frame_ >= 64) { ++rt_stats_.skip_budget; return; }
+  }
+  if (!ps.stride) return;
+  const uint32_t vertex_total = (ps.size - offsets[0]) / ps.stride;
+  // Mesh indices: guest memory, big-endian uint32 or float.
+  std::vector<uint32_t> indices;
+  if (fresh || dump) {
+    indices.resize(per_copy);
+    for (uint32_t i = 0; i < per_copy; ++i) {
+      const uint64_t at = uint64_t(first_local + i) * xs.stride + offsets[1];
+      if (!xs.stride || at + 4 > xs.size) return skip("index stream size");
+      const uint8_t* q = GuestPtr(base, 0xA0000000u + xs.buffer.address + xs.offset + uint32_t(at), 4);
+      const uint32_t w = (uint32_t(q[0]) << 24) | (uint32_t(q[1]) << 16) | (uint32_t(q[2]) << 8) | q[3];
+      float f;
+      if (index_uint) f = float(w);
+      else std::memcpy(&f, &w, 4);
+      if (!(f >= 0.0f) || f >= float(vertex_total))
+        return skip(fmt::format("index {} of {} vertices", f, vertex_total).c_str());
+      indices[i] = uint32_t(f);
+    }
+  }
+  if (fresh) {
+    auto vb_it = buffers_.find(ps.buffer.key);  // already uploaded by BindVertexStreams
+    if (vb_it == buffers_.end() || !vb_it->second.resource) return;
+    RtMesh mesh;
+    if (!RtMakeIndexBuffer(indices, mesh)) return;
+    D3D12_RAYTRACING_GEOMETRY_DESC geometry{};
+    geometry.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+    geometry.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+    geometry.Triangles.VertexBuffer.StartAddress =
+        vb_it->second.resource->GetGPUVirtualAddress() + ps.offset + offsets[0];
+    geometry.Triangles.VertexBuffer.StrideInBytes = ps.stride;
+    geometry.Triangles.VertexFormat = pos_format;
+    geometry.Triangles.VertexCount = vertex_total;
+    geometry.Triangles.IndexBuffer = mesh.indices->GetGPUVirtualAddress();
+    geometry.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+    geometry.Triangles.IndexCount = per_copy;
+    if (!RtBuildBlas(geometry, mesh)) return;
+    mesh.triangles = per_copy / 3;
+    ++rt_builds_this_frame_;
+    ++rt_stats_.new_meshes;
+    rt_meshes_.emplace(key, std::move(mesh));
+  }
+  // Copies covered by this draw (SV_VertexID starts at start_vertex).
+  const uint32_t first = uint32_t((double(start_vertex) + 0.5) / per_copy);
+  const uint32_t last = uint32_t((double(start_vertex) + vertex_count - 1 + 0.5) / per_copy);
+  for (uint32_t i = first; i <= last; ++i) {
+    const uint32_t reg = iit->transforms + i * iit->per_instance;
+    if (reg + iit->per_instance > 256) break;
+    const float* t = c + reg * 4;
+    RtInstance instance;
+    instance.mesh = key;
+    instance.source = 4;
+    float* m = instance.transform;  // 3x4 rows
+    if (iit->per_instance == 2) {
+      const float* r = t + 4;
+      const float rows[12] = {r[0], 0.0f, r[2], t[0], 0.0f, 1.0f, 0.0f, t[1], r[1], 0.0f, r[0], t[2]};
+      std::memcpy(m, rows, sizeof(rows));
+    } else {
+      for (int k = 0; k < 3; ++k) {
+        for (int col = 0; col < 4; ++col) m[k * 4 + col] = t[col * 4 + k];
+      }
+    }
+    bool finite = true;
+    for (int k = 0; k < 12; ++k) finite = finite && std::isfinite(m[k]);
+    if (!finite) continue;
+    ++rt_stats_.instanced_copies;
+    if (dump) RtDumpObj(base, ps.buffer.address + ps.offset + offsets[0], ps.stride, indices, m, RtInstanceKey(instance));
+    RtAddInstance(instance);
   }
 }
 
@@ -5669,6 +5889,8 @@ void Renderer::ExecDrawVertices(uint8_t* base, const WorkBatch& batch, const Wor
   }
   ++stats_.draws; ++trace_draws_; Breadcrumb();
   ++stats_.pass_draws[g_current_pass & 31];
+  if (topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && !quads)
+    RtCaptureInstanced(base, batch, cmd, start_vertex, vertex_count);
 }
 
 void Renderer::ExecDrawIndexedVertices(uint8_t* base, const WorkBatch& batch,
@@ -6414,6 +6636,20 @@ void Renderer::EndFrameAndPresent(uint32_t front_buffer_address) {
                             REXCVAR_GET(sr_native_dump_frame_at_s) * 1000.0))) {
     frame_dump_done_ = true;
     DumpFrameResources();
+  }
+  // Shadow measurement (sr_rt_measure_at_s with sr_rt_shadow_debug_cycle): the
+  // middle frame of each of the three debug steps after that time, prefixed
+  // m<mode>_, so a paused scene gives game / RT visibility / game unshadowed.
+  if (const int32_t cycle = REXCVAR_GET(sr_rt_shadow_debug_cycle);
+      cycle > 0 && REXCVAR_GET(sr_rt_measure_at_s) > 0 &&
+      compat::BenchElapsedMs() >= REXCVAR_GET(sr_rt_measure_at_s) * 1000.0) {
+    const uint64_t c = uint64_t(cycle);
+    if (!rt_measure_base_ && swap_number_ % (4 * c) == c / 2) rt_measure_base_ = swap_number_;
+    if (rt_measure_base_ && swap_number_ <= rt_measure_base_ + 3 * c &&
+        (swap_number_ - rt_measure_base_) % c == 0) {
+      DumpFrameResources("m" + std::to_string(RtDebugMode()) + "_");
+      REXLOG_INFO("native: rt measure: dumped swap {} (debug mode {})", swap_number_, RtDebugMode());
+    }
   }
   // Multi-swap A/B (sr_native_ab_swaps): the output only, prefixed by the swap.
   {

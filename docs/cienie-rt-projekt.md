@@ -92,3 +92,70 @@ gdzie działają poprawnie; wynik to minimum obu.
 | 3 | Pamięć statycznej geometrii (BLAS z VB/IB gry + `gWorldXform`), eksport .obj | .obj pokazuje miasto w poprawnych proporcjach |
 | 4 | Cienie miasta z pamięci, eksmisja, LOD | film z lotu: brak znikania i skoków, koszt w ms zmierzony |
 | 5 | Półcień, filtr, stabilność | brak migotania przy ruchu kamery |
+
+#### Stan kroku 3 (2026-10-20)
+
+Budynki miasta nie idą przez `DrawIndexed` z `gWorldXform`, tylko przez draw bez indeksów
+w czterech shaderach instancjonowanych (`1C89B1A6`, `2C45BFFE`, `5F7299BB`, `B27A827D`):
+numer wierzchołka dzieli się na kopię `i = floor((id + 0,5) / instance_data.x)` i wierzchołek
+kopii, indeksy siatki leżą w strumieniu `POSITION1` (`R32_UINT`, pamięć gry), a transformacja
+kopii w `instance_transforms + i * k`: `k = 2` to przesunięcie `c0.xyz` i obrót wokół pionu
+`c1`, `k = 4` to pełna macierz (`świat = x*c0 + y*c1 + z*c2 + c3`). Tabela shaderów:
+`rt_instanced_regs.inc` z `tools/shaders/gen_shadow_regs.py`, przechwytywanie:
+`Renderer::RtCaptureInstanced`.
+
+Dowód: zrzut `sr_rt_dump_obj_swap=5000` (1,24 mln wierzchołków, 289 tys. trójkątów, 1676 grup
+instancji) daje kwartały, ulice, estakadę i drapacze chmur we właściwym układzie
+(`docs/rt-budynki-krok3.png`). W grze widok widoczności RT dzieli fasady na oświetlone
+i zasłonięte, przesunięcie startu promienia 0,5 i 20 daje prawie ten sam obraz (brak
+trafień we własną powierzchnię). Otwarte: RT zaciemnia więcej niż mapa cieni gry; trzeba
+porównać oba wyniki piksel w piksel w zasięgu kaskady 0, zanim cień RT zastąpi kaskady.
+Liczniki pokazują też dużo nowych siatek na sekundę i pominięć z budżetu 64 BLAS na klatkę.
+
+#### Pomiar RT kontra mapa cieni gry (2026-10-20)
+
+Metoda, bez dotykania pulpitu: `sr_input_script` wczytuje zapis i pauzuje grę w samym
+sterowniku wejścia, `sr_rt_shadow_debug_cycle=60` przełącza co 60 klatek tryby 0 (gra),
+2 (widoczność RT), 3 (gra bez geometrii w mapie cieni), 4 (odległość do przeszkody RT
+i flaga kaskady 0), a `sr_rt_measure_at_s` zrzuca jedną klatkę każdego trybu. Cień gry =
+jasność(0) / jasność(3) na pikselach odbiorców. Zrzut to około 2 GB surowych plików:
+tylko na D, kasowane po analizie.
+
+| Obszar | Gra cień, RT cień | Gra cień, RT światło | Gra światło, RT cień |
+|---|---|---|---|
+| Cały kadr | 223 175 | 529 | 887 606 |
+| Kaskada 0 | 0 | 0 | 105 132 (obie postacie) |
+
+- Każdy cień gry RT odtwarza (99,8%); przeszkody 92 do 360 jednostek dalej.
+- Nadmiar RT poza kaskadą 0 to dalekie fasady, na których gra nie rysuje cieni wcale.
+  Rzucają go te same budynki, które gra sama rysuje do mapy cieni (wyłączenie przejścia
+  cieni albo instancji z osobna nie zmienia wyniku, wyłączenie obu zeruje cień RT).
+- W kaskadzie 0 rozbieżność to postacie: promień trafia w budynek `mesh_131` (152 jednostki
+  wysokości) 65 jednostek w stronę słońca (sprawdzone poza grą na zrzucie OBJ). Kaskada 0
+  ma 30 x 30 jednostek i tylko 69 jednostek głębi (±34,5), ten budynek leży na głębokości
+  światła -0,451, więc gra wycina go z mapy (brak spłaszczania rzucających przed bliską
+  płaszczyzną). To błąd gry, nie RT: dokładnie znikające cienie budynków.
+- Wniosek dla kroku 4: cień RT zastępuje kaskady, a nie wchodzi przez min z nimi (min
+  zachowałby, ale nie naprawił, a kaskady nie mają niczego, czego nie ma RT).
+- Ten sam budynek trafia do sceny RT dwa razy (przejście cieni i instancje): do odchudzenia.
+
+#### Krok 4: cień RT zamiast kaskad (2026-10-20)
+
+Łatki XenosRecomp 0021 i 0022. Odbiorca liczy raz na piksel widoczność słońca
+(`g_srRtShadowVis`), a każda jego próbka mapy cieni (`tfetch3D` z `samp_depth`) przechodzi
+przez `srRtShadowDepth`: głębia 1 tam, gdzie słońce widać, 0 tam, gdzie promień trafia.
+Porównanie gry, gęstość (`shadow_dens_vis`), kolor i miękkie przejścia zostają grze.
+Zasięg: odcięcie 750 jednostek i wygaszanie (FalloffStart/Rate) mnożone przez 4000/750,
+czyli do zasięgu sceny RT. Włącznik: `sr_rt_shadows_replace` (domyślnie tak, przy
+`sr_rt_shadows`), bajt 80 danych klatki; w widokach diagnostycznych wyłączony.
+
+| Pomiar (ten sam kadr) | Cień w obrazie i w RT | Cień w obrazie, RT światło | RT cień, obraz światło |
+|---|---|---|---|
+| Kaskady gry | 218 454 | 486 | 810 386 |
+| Cień RT, zasięg gry | 559 670 | 0 | 468 279 |
+| Cień RT, zasięg 4000 | 589 800 | 0 | 471 798 |
+| Kaskada 0, cień RT | 53 175 | 0 | 13 870 |
+
+Zero fałszywych cieni. Zostaje: Superman (jego shader nie wykonuje gałęzi cienia, gra nie
+cieniuje bohatera) i pasy dalekich fasad, gdzie gałąź cienia gry też się nie wykonuje.
+Do zrobienia: koszt w ms, film z lotu (krok 4 wg tabeli), półcień (krok 5).

@@ -1,0 +1,105 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index c9003d9..1a88174 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -289,16 +289,32 @@ float srRtHitDistance(float3 worldPos)
+         q.CommitNonOpaqueTriangleHit();
+     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() : -1.0;
+ }
++// Ray-traced shadows replace the cascades (byte 80: on; not in the debug views):
++// the receivers' shadow map fetches return the light depth 1 (nothing in front)
++// where the sun is visible and 0 (occluded) where not, so the game's own
++// comparison, shadow density and colour turn the ray result into its shadow.
++bool srRtShadowsReplace()
++{
++    ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
++    return b.Load(68) != 0 && b.Load(72) != 0 && b.Load(80) != 0;
++}
+ #else
+ float srRtVisibility(float3 worldPos) { return 1.0; }
+ float srRtHitDistance(float3 worldPos) { return -1.0; }
++bool srRtShadowsReplace() { return false; }
+ #endif
+ #else
+ uint srRtDebug() { return 0; }
+ float3 srRtWorldPos(float3 lightCoord) { return lightCoord; }
+ float srRtVisibility(float3 worldPos) { return 1.0; }
+ float srRtHitDistance(float3 worldPos) { return -1.0; }
++bool srRtShadowsReplace() { return false; }
+ #endif
++static float g_srRtShadowVis = -1.0;  // this pixel's sun visibility, -1 = use the shadow map
++float4 srRtShadowDepth(float4 fetched)
++{
++    return g_srRtShadowVis < 0.0 ? fetched : g_srRtShadowVis.xxxx;
++}
+ #ifdef SR_VULKAN_BUFFERS
+ [[vk::binding(0,2)]] SamplerState g_SamplerDescriptorHeap[32];
+ #else
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index aab48ae..d7f5283 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -424,6 +424,12 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     printDstSwizzle(instr.dstSwizzle, false);
+ 
+     out += " = ";
++#ifdef CONAN_RECOMP
++    const bool srRtShadowFetch = srShadowReceiverShader && instr.opcode == FetchOpcode::TextureFetch &&
++        instr.dimension == TextureDimension::Texture3D && strcmp(constNamePtr, "samp_depth") == 0;
++    if (srRtShadowFetch)
++        out += "srRtShadowDepth(";
++#endif
+     switch (instr.opcode)
+     {
+     case FetchOpcode::TextureFetch:
+@@ -486,7 +492,12 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+         break;
+     }
+ 
+-    out += ").";
++    out += ")";
++#ifdef CONAN_RECOMP
++    if (srRtShadowFetch)
++        out += ")";
++#endif
++    out += ".";
+ 
+     printDstSwizzle(instr.dstSwizzle, true);
+ 
+@@ -1411,6 +1422,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         srShadowReceiver |= strcmp(reinterpret_cast<const char*>(constantTableData + constantInfo->name),
+                                    "shadowMapOffsetScales") == 0;
+     }
++    srShadowReceiverShader = srShadowReceiver && isPixelShader;
+ #endif
+ 
+     out += "#ifdef __spirv__\n\n";
+@@ -2108,6 +2120,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     out += "\tfloat ps = 0.0;\n";
+     if (isPixelShader)
+     {
++#ifdef CONAN_RECOMP
++        // One sun ray per pixel; the shadow map fetches below read its result.
++        if (srShadowReceiverShader)
++            out += "\tg_srRtShadowVis = srRtShadowsReplace() ? srRtVisibility(srRtWorldPos(iSrLight.xyz)) : -1.0;\n";
++#endif
+ #if defined(UNLEASHED_RECOMP) || defined(CONAN_RECOMP)
+         out += "\tfloat2 pixelCoord = 0.0;\n";
+ #endif
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index ae5e5dd..6c7e906 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -57,6 +57,12 @@ struct ShaderRecompiler : StringBuffer
+     bool hasMtxPrevInvViewProjection = false;
+ #endif
+ 
++#ifdef CONAN_RECOMP
++    // A sun shadow receiver pixel shader: its samp_depth fetches go through
++    // srRtShadowDepth (ray-traced shadows replace the cascades).
++    bool srShadowReceiverShader = false;
++#endif
++
+ #ifdef REBLUE_RECOMP
+     bool hasShadowTexture = false;
+     uint32_t shadowTapUVCount = 0;
