@@ -248,6 +248,14 @@ REXCVAR_DEFINE_STRING(sr_record_path, "", "Superman Returns Native",
                       "to this .mp4, from sr_record_from_s for sr_record_seconds");
 REXCVAR_DEFINE_DOUBLE(sr_record_from_s, 0.0, "Superman Returns Native", "Recording start (bench time, s)");
 REXCVAR_DEFINE_DOUBLE(sr_record_seconds, 30.0, "Superman Returns Native", "Recording length (s)");
+REXCVAR_DEFINE_INT32(sr_rt_shadow_rays, 16, "Superman Returns Native",
+                     "Ray-traced shadows: rays per pixel over the sun's disc (penumbra; 1 = hard shadows; "
+                     "2 go first and the rest only where they disagree)")
+    .range(1, 32);
+REXCVAR_DEFINE_DOUBLE(sr_rt_sun_angle, 0.53, "Superman Returns Native",
+                      "Ray-traced shadows: angular diameter of the sun in degrees (0.53 = the real sun; "
+                      "larger = softer penumbra)")
+    .range(0.0, 10.0);
 REXCVAR_DEFINE_BOOL(sr_rt_shadows_replace, true, "Superman Returns Native",
                     "With sr_rt_shadows: the sun shadow comes from the ray-traced scene instead of the "
                     "game's cascades (the receivers' shadow map fetches read the ray result; false = "
@@ -2373,6 +2381,9 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   const float bias = float(REXCVAR_GET(sr_rt_shadow_bias));
   std::memcpy(&data[19], &bias, 4);
   data[20] = REXCVAR_GET(sr_rt_shadows) && REXCVAR_GET(sr_rt_shadows_replace) && RtDebugMode() == 0 ? 1u : 0u;
+  data[21] = uint32_t(REXCVAR_GET(sr_rt_shadow_rays));
+  const float spread = float(std::tan(REXCVAR_GET(sr_rt_sun_angle) * 0.5 * 3.14159265358979 / 180.0));
+  std::memcpy(&data[22], &spread, 4);
   Transition(rt_frame_buffer_.Get(), rt_frame_state_, D3D12_RESOURCE_STATE_COPY_DEST);
   command_list_->CopyBufferRegion(rt_frame_buffer_.Get(), 0, up.resource, up.offset, 256);
   Transition(rt_frame_buffer_.Get(), rt_frame_state_,

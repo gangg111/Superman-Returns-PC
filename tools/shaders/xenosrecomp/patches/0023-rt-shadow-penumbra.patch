@@ -1,0 +1,99 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 595b9b8..3289e42 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -298,10 +298,53 @@ bool srRtShadowsReplace()
+     ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
+     return b.Load(68) != 0 && b.Load(72) != 0 && b.Load(80) != 0;
+ }
++uint srRtSunRay(float3 worldPos, float3 dir, float bias)  // 1 = sun visible along dir
++{
++    RayDesc ray;
++    ray.Origin = worldPos + dir * bias;
++    ray.TMin = bias * 0.5;
++    ray.Direction = dir;
++    ray.TMax = 20000.0;
++    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
++    q.TraceRayInline(g_RtTlas, RAY_FLAG_NONE, 0xFF, ray);
++    q.Proceed();
++    return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0u : 1u;
++}
++// Penumbra: the fraction of the sun's disc visible from worldPos, from N rays
++// (byte 84) spread over a cone of tan(angular radius) (byte 88). Two rays at
++// opposite edges of the disc go first; when they agree the point is taken as
++// fully lit or fully shadowed and the rest is skipped, so only penumbra pixels
++// pay for all N. The pattern is rotated by a hash of the world position, so
++// the noise stays put on the surfaces when the camera moves.
++float srRtVisibilitySoft(float3 worldPos)
++{
++    ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
++    uint rays = clamp(b.Load(84), 1u, 32u);
++    float spread = asfloat(b.Load(88));
++    if (rays == 1u || spread <= 0.0)
++        return srRtVisibility(worldPos);
++    float3 sun = asfloat(b.Load3(48));
++    float bias = max(asfloat(b.Load(76)), 0.01);
++    float3 t1 = normalize(cross(sun, abs(sun.y) < 0.9 ? float3(0, 1, 0) : float3(1, 0, 0)));
++    float3 t2 = cross(sun, t1);
++    float rot = frac(sin(dot(floor(worldPos * 16.0), float3(12.9898, 78.233, 37.719))) * 43758.5453) * 6.2831853;
++    float3 edge = (t1 * cos(rot) + t2 * sin(rot)) * spread;
++    uint lit = srRtSunRay(worldPos, normalize(sun + edge), bias) + srRtSunRay(worldPos, normalize(sun - edge), bias);
++    if (lit != 1u)
++        return lit == 2u ? 1.0 : 0.0;
++    for (uint i = 2; i < rays; ++i)
++    {
++        float r = spread * sqrt((float(i - 2) + 0.5) / float(rays - 2));
++        float a = rot + float(i) * 2.3999632;  // golden angle
++        lit += srRtSunRay(worldPos, normalize(sun + (t1 * cos(a) + t2 * sin(a)) * r), bias);
++    }
++    return float(lit) / float(max(rays, 2u));
++}
+ #else
+ float srRtVisibility(float3 worldPos) { return 1.0; }
+ float srRtHitDistance(float3 worldPos) { return -1.0; }
+ bool srRtShadowsReplace() { return false; }
++float srRtVisibilitySoft(float3 worldPos) { return 1.0; }
+ #endif
+ #else
+ uint srRtDebug() { return 0; }
+@@ -309,11 +352,17 @@ float3 srRtWorldPos(float3 lightCoord) { return lightCoord; }
+ float srRtVisibility(float3 worldPos) { return 1.0; }
+ float srRtHitDistance(float3 worldPos) { return -1.0; }
+ bool srRtShadowsReplace() { return false; }
++float srRtVisibilitySoft(float3 worldPos) { return 1.0; }
+ #endif
+ static float g_srRtShadowVis = -1.0;  // this pixel's sun visibility, -1 = use the shadow map
++// The receivers turn a fetch into shadow as saturate((receiver - fetched) * K),
++// K = depthBias_FadeRange_FalloffStart_FalloffRate.y. With srRtFade making K
++// 0.001, fetched = -1000 * (1 - visibility) gives shadow = 1 - visibility
++// (+ receiver depth / 1000 <= 0.001), so a partial visibility is a partial shadow.
++static const float kSrRtShadowScale = 1000.0;
+ float4 srRtShadowDepth(float4 fetched)
+ {
+-    return g_srRtShadowVis < 0.0 ? fetched : g_srRtShadowVis.xxxx;
++    return g_srRtShadowVis < 0.0 ? fetched : (-kSrRtShadowScale * (1.0 - g_srRtShadowVis)).xxxx;
+ }
+ // With ray-traced shadows the receivers keep shadows out to the ray-traced
+ // scene's 4000 units instead of the cascades' 750: the literal cutoff
+@@ -325,7 +374,7 @@ float srRtShadowRangeScale(float gameRange)
+ }
+ float4 srRtFade(float4 v)
+ {
+-    return srRtShadowsReplace() ? float4(v.x, v.y, v.z * kSrRtRangeScale, v.w / kSrRtRangeScale) : v;
++    return srRtShadowsReplace() ? float4(v.x, 1.0 / kSrRtShadowScale, v.z * kSrRtRangeScale, v.w / kSrRtRangeScale) : v;
+ }
+ #ifdef SR_VULKAN_BUFFERS
+ [[vk::binding(0,2)]] SamplerState g_SamplerDescriptorHeap[32];
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index bfd94d4..9520cc2 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -2131,7 +2131,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ #ifdef CONAN_RECOMP
+         // One sun ray per pixel; the shadow map fetches below read its result.
+         if (srShadowReceiverShader)
+-            out += "\tg_srRtShadowVis = srRtShadowsReplace() ? srRtVisibility(srRtWorldPos(iSrLight.xyz)) : -1.0;\n";
++            out += "\tg_srRtShadowVis = srRtShadowsReplace() ? srRtVisibilitySoft(srRtWorldPos(iSrLight.xyz)) : -1.0;\n";
+ #endif
+ #if defined(UNLEASHED_RECOMP) || defined(CONAN_RECOMP)
+         out += "\tfloat2 pixelCoord = 0.0;\n";

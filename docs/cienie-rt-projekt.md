@@ -163,4 +163,26 @@ Koszt (czas GPU z logu renderera, ten sam zapauzowany kadr, wewnętrznie 2560x14
 piksel odbiorcy). W locie z budową nowych BLAS: 9,9 do 10,6 ms na klatkę.
 Film z lotu: `sr_record_path` (obraz wyjściowy, 30 kl./s, połowa rozdzielczości, ffmpeg
 bez okna) i trasa z `sr_input_script`; nagranie spowalnia grę (odczyt synchroniczny).
-Do zrobienia: półcień (krok 5), dwa razy ta sama geometria w scenie RT, budżet BLAS.
+Do zrobienia: dwa razy ta sama geometria w scenie RT, budżet BLAS.
+
+#### Krok 5: półcień (2026-10-20, łatka 0023)
+
+Odbiorca zamienia próbkę w cień liniowo przed nasyceniem: `saturate((odbiorca - próbka) * K)`,
+`K = depthBias_FadeRange_FalloffStart_FalloffRate.y` (we wszystkich 37 odbiorcach tylko
+w tym miejscu). Przy podmianie `srRtFade` daje `K = 0,001`, a próbka `-1000 * (1 - v)`, więc
+cień = `1 - v` (+ głębia odbiorcy / 1000), ułamek widoczności tarczy słońca `v` przechodzi
+przez kolor i gęstość cienia gry bez zmian. `v` z N promieni w stożku tarczy
+(`sr_rt_sun_angle`, domyślnie 0,53°), obrót wzoru z pozycji w świecie (szum nie pływa
+z kamerą). Najpierw 2 promienie z przeciwnych brzegów tarczy; gdy się zgadzają, piksel
+jest cały w świetle albo w cieniu, resztę promieni liczy tylko półcień.
+
+| Promienie (`sr_rt_shadow_rays`) | Wszystkie | Adaptacyjnie |
+|---|---|---|
+| 1 (twardy) | 7,84 ms | |
+| 4 | 10,10 ms | 8,65 ms |
+| 8 | 13,38 ms | 8,84 ms |
+| 16 (domyślnie) | | 9,41 ms |
+
+Bez RT ten kadr kosztuje 7,32 ms. Kaskada 0 przy półcieniu: 78 683 piksele cienia w obrazie
+i w RT, 0 fałszywych. Przy 4 promieniach krawędź ma widoczne ziarno, przy 16 prawie znika.
+Brakuje jeszcze cieni od postaci (skinning) i świateł innych niż słońce.
