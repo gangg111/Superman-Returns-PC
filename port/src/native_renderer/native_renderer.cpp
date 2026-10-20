@@ -41,6 +41,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <io.h>  // _open_osfhandle (recording pipe)
 
 #include <fmt/format.h>
 #include <rex/cvar.h>
@@ -242,6 +243,11 @@ REXCVAR_DEFINE_INT32(sr_rt_shadow_debug, 0, "Superman Returns Native",
                      "its shadow map (no geometry drawn into the shadow targets), 4 = distance to the "
                      "nearest occluder along the sun ray (red = distance / 100, green = hit)")
     .range(0, 4);
+REXCVAR_DEFINE_STRING(sr_record_path, "", "Superman Returns Native",
+                      "Record the presented image (30 fps, half resolution, H.264 through ffmpeg on PATH) "
+                      "to this .mp4, from sr_record_from_s for sr_record_seconds");
+REXCVAR_DEFINE_DOUBLE(sr_record_from_s, 0.0, "Superman Returns Native", "Recording start (bench time, s)");
+REXCVAR_DEFINE_DOUBLE(sr_record_seconds, 30.0, "Superman Returns Native", "Recording length (s)");
 REXCVAR_DEFINE_BOOL(sr_rt_shadows_replace, true, "Superman Returns Native",
                     "With sr_rt_shadows: the sun shadow comes from the ray-traced scene instead of the "
                     "game's cascades (the receivers' shadow map fetches read the ray result; false = "
@@ -6637,6 +6643,7 @@ void Renderer::EndFrameAndPresent(uint32_t front_buffer_address) {
     frame_dump_done_ = true;
     DumpFrameResources();
   }
+  RecordFrame();
   // Shadow measurement (sr_rt_measure_at_s with sr_rt_shadow_debug_cycle): the
   // middle frame of each of the three debug steps after that time, prefixed
   // m<mode>_, so a paused scene gives game / RT visibility / game unshadowed.
@@ -7049,66 +7056,153 @@ void Renderer::DumpFrameResources(const std::string& prefix, bool surfaces_only,
   }
   uint32_t written = 0;
   for (Item& item : items) {
-    D3D12_RESOURCE_DESC desc = item.resource->GetDesc();
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
-    UINT rows;
-    UINT64 row_size, total;
-    device_->GetCopyableFootprints(&desc, item.subresource, 1, 0, &fp, &rows, &row_size, &total);
-    fp.Offset = 0;
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC buf{};
-    buf.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buf.Width = total;
-    buf.Height = 1;
-    buf.DepthOrArraySize = 1;
-    buf.MipLevels = 1;
-    buf.SampleDesc.Count = 1;
-    buf.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    ComPtr<ID3D12Resource> readback;
-    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buf,
-                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                IID_PPV_ARGS(&readback)))) {
-      continue;
-    }
-    allocators_[frame_index_]->Reset();
-    command_list_->Reset(allocators_[frame_index_].Get(), nullptr);
-    D3D12_RESOURCE_STATES old_state = *item.state;
-    Transition(item.resource, *item.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-    src.pResource = item.resource;
-    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.SubresourceIndex = item.subresource;
-    dst.pResource = readback.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint = fp;
-    command_list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    Transition(item.resource, *item.state, old_state);
-    command_list_->Close();
-    ID3D12CommandList* lists[] = {command_list_.Get()};
-    queue_->ExecuteCommandLists(1, lists);
-    queue_->Signal(fence_.Get(), next_fence_value_);
-    fence_->SetEventOnCompletion(next_fence_value_, fence_event_);
-    ++next_fence_value_;
-    WaitForSingleObject(fence_event_, 5000);
-    void* data = nullptr;
-    D3D12_RANGE range{0, size_t(total)};
-    if (SUCCEEDED(readback->Map(0, &range, &data))) {
+    ReadbackSubresource(item.resource, item.state, item.subresource,
+                        [&](const uint8_t* data, const D3D12_RESOURCE_DESC& desc, uint32_t pitch, uint32_t rows) {
       if (std::FILE* f = std::fopen((dir + "/" + prefix + item.name + ".raw").c_str(), "wb")) {
-        uint32_t header[4] = {uint32_t(desc.Width), desc.Height, uint32_t(desc.Format),
-                              fp.Footprint.RowPitch};
+        uint32_t header[4] = {uint32_t(desc.Width), desc.Height, uint32_t(desc.Format), pitch};
         std::fwrite(header, 4, 4, f);
-        std::fwrite(static_cast<uint8_t*>(data) + fp.Offset, 1,
-                    size_t(fp.Footprint.RowPitch) * rows, f);
+        std::fwrite(data, 1, size_t(pitch) * rows, f);
         std::fclose(f);
         ++written;
       } else {
         REXLOG_ERROR("native: cannot write dump {}/{}{}.raw", dir, prefix, item.name);
       }
-      readback->Unmap(0, nullptr);
-    }
+    });
   }
   REXLOG_INFO("native: dumped {}/{} frame resources to {}", written, items.size(), dir);
+}
+
+// Copies one subresource to a readback buffer on the frame's (already
+// submitted) command list, waits for it and hands the rows to `use`. The
+// frame's allocator is reset here, so all submitted work must finish first.
+bool Renderer::ReadbackSubresource(
+    ID3D12Resource* resource, D3D12_RESOURCE_STATES* state, uint32_t subresource,
+    const std::function<void(const uint8_t*, const D3D12_RESOURCE_DESC&, uint32_t, uint32_t)>& use) {
+  if (fence_->GetCompletedValue() < next_fence_value_ - 1) {
+    fence_->SetEventOnCompletion(next_fence_value_ - 1, fence_event_);
+    WaitForSingleObject(fence_event_, 5000);
+  }
+  D3D12_RESOURCE_DESC desc = resource->GetDesc();
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+  UINT rows;
+  UINT64 row_size, total;
+  device_->GetCopyableFootprints(&desc, subresource, 1, 0, &fp, &rows, &row_size, &total);
+  fp.Offset = 0;
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_READBACK;
+  D3D12_RESOURCE_DESC buf{};
+  buf.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buf.Width = total;
+  buf.Height = 1;
+  buf.DepthOrArraySize = 1;
+  buf.MipLevels = 1;
+  buf.SampleDesc.Count = 1;
+  buf.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  ComPtr<ID3D12Resource> readback;
+  if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buf,
+                                              D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                              IID_PPV_ARGS(&readback)))) {
+    return false;
+  }
+  allocators_[frame_index_]->Reset();
+  command_list_->Reset(allocators_[frame_index_].Get(), nullptr);
+  D3D12_RESOURCE_STATES old_state = *state;
+  Transition(resource, *state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+  src.pResource = resource;
+  src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  src.SubresourceIndex = subresource;
+  dst.pResource = readback.Get();
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dst.PlacedFootprint = fp;
+  command_list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  Transition(resource, *state, old_state);
+  command_list_->Close();
+  ID3D12CommandList* lists[] = {command_list_.Get()};
+  queue_->ExecuteCommandLists(1, lists);
+  queue_->Signal(fence_.Get(), next_fence_value_);
+  fence_->SetEventOnCompletion(next_fence_value_, fence_event_);
+  ++next_fence_value_;
+  WaitForSingleObject(fence_event_, 5000);
+  void* data = nullptr;
+  D3D12_RANGE range{0, size_t(total)};
+  if (FAILED(readback->Map(0, &range, &data))) return false;
+  use(static_cast<const uint8_t*>(data), desc, fp.Footprint.RowPitch, rows);
+  readback->Unmap(0, nullptr);
+  return true;
+}
+
+// sr_record_path: the presented image, every second frame, halved (2x2 box)
+// to 8-bit RGB and piped to ffmpeg as a 30 fps H.264 video.
+void Renderer::RecordFrame() {
+  const std::string path = REXCVAR_GET(sr_record_path);
+  if (path.empty() || !output_rts_[frame_index_]) return;
+  const double now_s = compat::BenchElapsedMs() / 1000.0;
+  const double from = REXCVAR_GET(sr_record_from_s), until = from + REXCVAR_GET(sr_record_seconds);
+  if (now_s < from || (swap_number_ & 1)) return;
+  if (now_s >= until) {
+    if (record_pipe_) {
+      std::fclose(record_pipe_);  // EOF: ffmpeg finishes the file
+      record_pipe_ = nullptr;
+      WaitForSingleObject(record_process_, 30000);
+      CloseHandle(record_process_);
+      record_process_ = nullptr;
+      REXLOG_INFO("native: recording finished: {} frames -> {}", record_frames_, path);
+    }
+    return;
+  }
+  ReadbackSubresource(output_rts_[frame_index_].Get(), &output_rt_states_[frame_index_], 0,
+                      [&](const uint8_t* data, const D3D12_RESOURCE_DESC& desc, uint32_t pitch, uint32_t rows) {
+    if (desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM && desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM) return;
+    const uint32_t w = uint32_t(desc.Width) / 2, h = rows / 2;
+    if (!record_pipe_ && !record_failed_) {
+      // ffmpeg is a console program: started without a window (the game has
+      // no console to lend it), stdin = our pipe.
+      std::string cmd = fmt::format(
+          "ffmpeg -hide_banner -loglevel error -y -f rawvideo -pix_fmt rgb24 -s {}x{} -r 30 -i - "
+          "-c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p \"{}\"", w, h, path);
+      SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+      HANDLE read_end = nullptr, write_end = nullptr;
+      STARTUPINFOA si{};
+      PROCESS_INFORMATION pi{};
+      si.cb = sizeof(si);
+      si.dwFlags = STARTF_USESTDHANDLES;
+      if (CreatePipe(&read_end, &write_end, &sa, 1 << 20) &&
+          SetHandleInformation(write_end, HANDLE_FLAG_INHERIT, 0)) {
+        si.hStdInput = read_end;
+        si.hStdOutput = si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        if (CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+                           &si, &pi)) {
+          CloseHandle(pi.hThread);
+          record_process_ = pi.hProcess;
+          record_pipe_ = _fdopen(_open_osfhandle(intptr_t(write_end), 0), "wb");
+          write_end = nullptr;
+        }
+      }
+      if (read_end) CloseHandle(read_end);
+      if (write_end) CloseHandle(write_end);
+      record_failed_ = !record_pipe_;
+      record_size_ = {w, h};
+      REXLOG_INFO("native: recording {}x{} to {}{}", w, h, path, record_failed_ ? " FAILED (ffmpeg on PATH?)" : "");
+    }
+    if (!record_pipe_ || record_size_[0] != w || record_size_[1] != h) return;
+    std::vector<uint8_t> rgb(size_t(w) * h * 3);
+    const bool ten = desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM;
+    for (uint32_t y = 0; y < h; ++y) {
+      const uint32_t* r0 = reinterpret_cast<const uint32_t*>(data + size_t(2 * y) * pitch);
+      const uint32_t* r1 = reinterpret_cast<const uint32_t*>(data + size_t(2 * y + 1) * pitch);
+      for (uint32_t x = 0; x < w; ++x) {
+        const uint32_t px[4] = {r0[2 * x], r0[2 * x + 1], r1[2 * x], r1[2 * x + 1]};
+        for (int c = 0; c < 3; ++c) {
+          uint32_t sum = 0;
+          for (uint32_t p : px) sum += ten ? ((p >> (10 * c)) & 1023) >> 2 : (p >> (8 * c)) & 255;
+          rgb[(size_t(y) * w + x) * 3 + c] = uint8_t(sum / 4);
+        }
+      }
+    }
+    std::fwrite(rgb.data(), 1, rgb.size(), record_pipe_);
+    ++record_frames_;
+  });
 }
 
 // ---------------------------------------------------------------------------

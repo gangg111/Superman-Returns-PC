@@ -31,8 +31,11 @@
 #include "buffer_content.h"
 #include "shared_constants_cache.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <functional>
 #include <string>
 #include <condition_variable>
 #include <cstdint>
@@ -308,6 +311,15 @@ class Renderer : public NativeFrontend {
   int32_t RtDebugMode() const;  // sr_rt_shadow_debug, or this frame's step of sr_rt_shadow_debug_cycle
   uint64_t rt_measure_base_ = 0;  // first swap of the sr_rt_measure_at_s dumps
   float rt_frame_rows_[12] = {};  // light rows U, V, Z the frame's world reconstruction inverts
+  bool ReadbackSubresource(
+      ID3D12Resource* resource, D3D12_RESOURCE_STATES* state, uint32_t subresource,
+      const std::function<void(const uint8_t*, const D3D12_RESOURCE_DESC&, uint32_t, uint32_t)>& use);
+  void RecordFrame();  // sr_record_path
+  std::FILE* record_pipe_ = nullptr;
+  void* record_process_ = nullptr;  // ffmpeg process handle
+  bool record_failed_ = false;
+  std::array<uint32_t, 2> record_size_ = {};
+  uint64_t record_frames_ = 0;
   bool shader_pending_ = false;  // LoadShader: translation still running
   void ProfileBegin();
   void ProfileMark(Op op, bool drew);

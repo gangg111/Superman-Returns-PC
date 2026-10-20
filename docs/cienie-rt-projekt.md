@@ -158,4 +158,9 @@ czyli do zasięgu sceny RT. Włącznik: `sr_rt_shadows_replace` (domyślnie tak,
 
 Zero fałszywych cieni. Zostaje: Superman (jego shader nie wykonuje gałęzi cienia, gra nie
 cieniuje bohatera) i pasy dalekich fasad, gdzie gałąź cienia gry też się nie wykonuje.
-Do zrobienia: koszt w ms, film z lotu (krok 4 wg tabeli), półcień (krok 5).
+Koszt (czas GPU z logu renderera, ten sam zapauzowany kadr, wewnętrznie 2560x1440):
+7,32 ms bez RT, 7,77 ms z RT, czyli około 0,45 ms na klatkę (budowa TLAS i promień na
+piksel odbiorcy). W locie z budową nowych BLAS: 9,9 do 10,6 ms na klatkę.
+Film z lotu: `sr_record_path` (obraz wyjściowy, 30 kl./s, połowa rozdzielczości, ffmpeg
+bez okna) i trasa z `sr_input_script`; nagranie spowalnia grę (odczyt synchroniczny).
+Do zrobienia: półcień (krok 5), dwa razy ta sama geometria w scenie RT, budżet BLAS.
