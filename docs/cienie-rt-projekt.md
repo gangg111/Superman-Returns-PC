@@ -186,3 +186,77 @@ jest cały w świetle albo w cieniu, resztę promieni liczy tylko półcień.
 Bez RT ten kadr kosztuje 7,32 ms. Kaskada 0 przy półcieniu: 78 683 piksele cienia w obrazie
 i w RT, 0 fałszywych. Przy 4 promieniach krawędź ma widoczne ziarno, przy 16 prawie znika.
 Brakuje jeszcze cieni od postaci (skinning) i świateł innych niż słońce.
+
+#### Cienie postaci (2026-10-20)
+
+Postacie są rysowane jako paski trójkątów shaderami ze skinningiem (C687EB65D635C5D7,
+C20921D0DBBD2F1F, 57A00D4EB3BF4C31). Każdy taki draw odbiorcy jest powtarzany przez PSO
+ze stream output (ten sam VS, bez rasteryzacji), który zapisuje SRLIGHT0.xyz, czyli pozycję
+po skinningu w przestrzeni światła; liczba trójkątów paska liczona na CPU z przerwami
+restartu. Na początku następnej klatki wszystkie te zupy trójkątów idą do jednego BLAS-a,
+instancjonowanego odwrotnością macierzy światła (jedna klatka opóźnienia). Zmierzone:
+8 drawów, 10 252 trójkąty, 546 KB; w locie do 398 drawów i 62 652 trójkątów. Cień Supermana
+na fasadzie i na pasach potwierdzony różnicą widoczności z postaciami i bez. Włącznik
+`sr_rt_characters`, wykluczenie `sr_rt_exclude_sources=8`.
+
+#### Odbicia RT, etap 1 (2026-10-20, łatka 0024)
+
+37 odbiorców z `env_map` (kostka nieba budynków, szyby): próbka kostki zastąpiona tym, co
+trafia promień z piksela w tym samym kierunku (`cubeMapData.cubeMapDirections`, przestrzeń
+świata). Pudło: zostaje kostka gry. Maska szyb, fresnel i odcień zostają grze. Kolor
+trafienia: najmniejszy mip tekstury `*col_map` drawa, który dał tę instancję (indeks SRV
+w InstanceID, generacja SRV chroni przed zwolnioną teksturą), razy słońce i cień w punkcie
+trafienia. Pomiar (tryby 0 i 5 w jednym przebiegu): zmieniają się tylko szyby, dolne
+odbijają budynki naprzeciwko, górne niebo. Koszt: 9,9 ms bez odbić, 15,9 do 22,3 ms z nimi.
+Brakuje: detalu tekstur (UV liczone inaczej w każdej parze shaderów) i taniej wersji.
+
+#### Odbicia RT, etap 2: UV trafienia (2026-10-20, łatka 0025)
+
+- `gen_shadow_regs.py` liczy symbolicznie (`analyze_albedo_uv`) UV pobrania `*col_map`
+  w każdym pixel shaderze: `iTexCoordK.c * skala + przesunięcie`, składniki zależne od piksela
+  (paralaksa) odpadają. 81 z 87 shaderów (`rt_albedo_regs.inc`, testy w
+  `tests/shaders/test_gen_shadow_regs.py`).
+- Siatka dostaje UV raz, przy pierwszym drawie z teksturą koloru: draw powtórzony przez PSO
+  ze stream output zapisuje TEXCOORDK (4 składowe) jako zupę trójkątów w puli 192 MB
+  (`kRtUvSrv`, kolejność prymitywów BLAS). Także drawy instancjonowane (pierwsza pełna kopia).
+  Zmierzone: 11 657 siatek, 2,6 mln wierzchołków.
+- Tabela materiałów per instancja TLAS (`kRtMaterialSrv`, InstanceID = indeks): tekstura,
+  sampler, składowe i skala UV ze stałych drawu. Materiał przeżywa drawy bez tekstury
+  (przejście cieni rysuje też to, co poza kadrem) i jest też pamiętany na siatce.
+  Zmierzone: 81% instancji z teksturą i UV.
+- Widok diagnostyczny UV (tryb 7) potwierdza spójne UV, ale tryb 6 (kolor odbicia) pokazuje
+  szum: w shaderach budynków (np. 0D62162D76A532D1) kolor fasady to maska `L1_mat_map`
+  mieszająca odcienie `L1_R/G/B_tint`, a `L1_col_map` jest mnożoną warstwą detalu. Jedna
+  tekstura nie oddaje wyglądu materiału. Dlatego `sr_rt_reflection_detail` (bajt 96) jest
+  domyślnie wyłączony i trafienia mają średni kolor tekstury jak w etapie 1.
+- Dalej: albo kolor z poprzedniej klatki tam, gdzie trafienie jest na ekranie (dokładny
+  wygląd), albo odtworzenie mieszania odcieni dla głównych rodzin shaderów budynków.
+
+#### Odbicia RT, etap 3: mieszanie odcieni (2026-10-20, łatki 0026, 0027)
+
+- `analyze_tint_blend` śledzi kanały maski `*mat_map` (zamiany składowych, normalizacja przez
+  odwrotność sumy, tor skalarny, bloki `if (p0)` nie kasują znanych wartości) aż do mnożenia
+  przez `R/G/B_tint`: 16 shaderów (`rt_tint_regs.inc`).
+- `analyze_palette_blend` dla rodziny 8A6DD1D52752FAD6: reszta `1 - sum` waży `A_tint`, kolor
+  miesza się z paletą budynku z wagą `saturate(dot(kanały i reszta, gBuildingTint))`, numer
+  palety `floor(TEXCOORD5.w * 8)`, paletę 8 barw liczy symulacja łańcucha `select` na stałych
+  (`rt_palette_regs.inc`; test z ręcznie przeliczoną paletą).
+- Pomiar instancji: 99% budynków w scenie RT pochodzi z 8A6DD1D52752FAD6, a nie z 0D62162D.
+  Jego odcienie są w grze białe (1, 1, 1), a `gBuildingTint` zerowe, więc kolor fasady to
+  wprost `col_map` (wzór okien i gzymsów); różowo-beżowy ton dodaje dalej oświetlenie gry
+  (`ramp_col_exp`, `gShadCol`, `ao_col_exp`), którego trafienie nie odtwarza.
+- Ta sama geometria jest w scenie dwa razy (przejście cieni bez materiału, zwykły draw z nim):
+  maska instancji 1 = z materiałem, 2 = bez, promień odbicia najpierw 1, przy pudle 2.
+  Bez tego trafienia losowo wybierały kopię bez materiału.
+- `RayQuery` zadeklarowany w pętli (`[unroll] for`) zawieszał GPU na pierwszej klatce
+  z odbiciami (bisekcja przełącznikami); dwa jawne zapytania działają.
+- Funkcja wołana poza gałęzią SM 6.5 bez zaślepki zabiła 204 shadery, a `build_corpus.ps1`
+  skończył się kodem 0; gra tłumaczyła je w locie i chodziła w 28 kl./s.
+- Ton oświetlenia (łatka 0028): stałe shadera miasta z gry, `gShadCol` (0,60 0,42 0,32),
+  `ramp_col_exp` (0,60 0,50 0,59) i `Kramp_lo_hi_Kao.x` (0,97), idą co klatkę do bajtów 112..143
+  danych klatki; trafienie = albedo · 1,35 · lerp(1, rampa, Kramp) · lerp(gShadCol, 1, słońce).
+  Pomiar proporcji RGB: fasady 1,16 / 0,95 / 0,89, odbicia 1,28 / 0,94 / 0,78 (wcześniej szare).
+  Połowa siły koloru cienia prawie nic nie zmieniła (1,26 / 0,95 / 0,79), więc zostaje wierny wzór.
+- Wynik w grze: szyby odbijają fasady budynków z naprzeciwka z ich wzorem zamiast nieba
+  z kostki; zmienia się wyłącznie szkło. Czas GPU z odbiciami około 12,5 ms na kadr
+  testowy (bez odbić wcześniej około 9,9 ms, inny przebieg).

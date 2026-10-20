@@ -1,0 +1,126 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 3289e42..e24c86e 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -340,11 +340,40 @@ float srRtVisibilitySoft(float3 worldPos)
+     }
+     return float(lit) / float(max(rays, 2u));
+ }
++// Ray-traced reflections (byte 92: on): the closest scene triangle along dir,
++// coloured by its draw's colour texture (InstanceID: SRV index | 0x8000 for
++// PWL gamma, 0xFFFFFF = none) at its smallest mip, i.e. the material's mean
++// colour, lit by the sun where the hit point sees it (one shadow ray).
++bool srRtReflections()
++{
++    ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
++    return b.Load(68) != 0 && b.Load(72) != 0 && b.Load(92) != 0;
++}
++bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id)
++{
++    t = 0.0;
++    id = 0xFFFFFFu;
++    RayDesc ray;
++    ray.Origin = origin;
++    ray.TMin = 0.5;
++    ray.Direction = dir;
++    ray.TMax = 4000.0;
++    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
++    q.TraceRayInline(g_RtTlas, RAY_FLAG_NONE, 0xFF, ray);
++    while (q.Proceed()) {}
++    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
++        return false;
++    t = q.CommittedRayT();
++    id = q.CommittedInstanceID();
++    return true;
++}
+ #else
+ float srRtVisibility(float3 worldPos) { return 1.0; }
+ float srRtHitDistance(float3 worldPos) { return -1.0; }
+ bool srRtShadowsReplace() { return false; }
+ float srRtVisibilitySoft(float3 worldPos) { return 1.0; }
++bool srRtReflections() { return false; }
++bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id) { t = 0.0; id = 0xFFFFFFu; return false; }
+ #endif
+ #else
+ uint srRtDebug() { return 0; }
+@@ -353,8 +382,11 @@ float srRtVisibility(float3 worldPos) { return 1.0; }
+ float srRtHitDistance(float3 worldPos) { return -1.0; }
+ bool srRtShadowsReplace() { return false; }
+ float srRtVisibilitySoft(float3 worldPos) { return 1.0; }
++bool srRtReflections() { return false; }
++bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id) { t = 0.0; id = 0xFFFFFFu; return false; }
+ #endif
+ static float g_srRtShadowVis = -1.0;  // this pixel's sun visibility, -1 = use the shadow map
++static float3 g_srRtPixelPos = 0.0;   // this pixel's world position (receivers)
+ // The receivers turn a fetch into shadow as saturate((receiver - fetched) * K),
+ // K = depthBias_FadeRange_FalloffStart_FalloffRate.y. With srRtFade making K
+ // 0.001, fetched = -1000 * (1 - visibility) gives shadow = 1 - visibility
+@@ -539,6 +571,28 @@ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, flo
+     return conanGamma(resourceDescriptorIndex, g_TextureCubeDescriptorHeap[TEX_INDEX(resourceDescriptorIndex)].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]));
+ }
+ 
++// A receiver's environment sample (env_map) replaced by what a ray from the
++// pixel along the cube direction hits; the sky cube stays where it misses.
++float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData)
++{
++    if (!srRtReflections())
++        return env;
++    float3 dir = normalize(cubeMapData.cubeMapDirections[texCoord.z]);
++    float3 origin = g_srRtPixelPos + dir * 0.3;
++    float t;
++    uint id;
++    if (!srRtReflectTrace(origin, dir, t, id))
++        return env;
++    float sun = srRtVisibility(origin + dir * t);
++    float3 albedo = float3(0.45, 0.43, 0.40);
++    if (id != 0xFFFFFFu)
++    {
++        float4 texel = g_Texture2DDescriptorHeap[id & 0x7FFFu].SampleLevel(g_SamplerDescriptorHeap[0], 0.5, 16.0);
++        albedo = conanGamma((id & 0x8000u) ? 0x80000000u : 0u, texel).rgb;
++    }
++    return float4(albedo * (0.45 + 0.9 * sun), env.a);
++}
++
+ #ifdef CONAN_RECOMP
+ // D3D12 has no unsigned scaled 16-bit IA format. Bind USHORT2 as UNORM
+ // and restore its original integer values before the guest VS uses them.
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 9520cc2..e3c2dd6 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -429,6 +429,12 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+         instr.dimension == TextureDimension::Texture3D && strcmp(constNamePtr, "samp_depth") == 0;
+     if (srRtShadowFetch)
+         out += "srRtShadowDepth(";
++    // Ray-traced reflections: the receivers' environment cube sample becomes
++    // what a ray along the same direction hits (the sky cube where it misses).
++    const bool srRtReflectFetch = srShadowReceiverShader && instr.opcode == FetchOpcode::TextureFetch &&
++        instr.dimension == TextureDimension::TextureCube && strcmp(constNamePtr, "env_map") == 0;
++    if (srRtReflectFetch)
++        out += "srRtReflect(";
+ #endif
+     switch (instr.opcode)
+     {
+@@ -496,6 +502,12 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+ #ifdef CONAN_RECOMP
+     if (srRtShadowFetch)
+         out += ")";
++    if (srRtReflectFetch)
++    {
++        out += ", ";
++        printSrcRegister(3);
++        out += ", cubeMapData)";
++    }
+ #endif
+     out += ".";
+ 
+@@ -2131,7 +2143,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ #ifdef CONAN_RECOMP
+         // One sun ray per pixel; the shadow map fetches below read its result.
+         if (srShadowReceiverShader)
+-            out += "\tg_srRtShadowVis = srRtShadowsReplace() ? srRtVisibilitySoft(srRtWorldPos(iSrLight.xyz)) : -1.0;\n";
++            out += "\tg_srRtPixelPos = srRtWorldPos(iSrLight.xyz);\n"
++                   "\tg_srRtShadowVis = srRtShadowsReplace() ? srRtVisibilitySoft(g_srRtPixelPos) : -1.0;\n";
+ #endif
+ #if defined(UNLEASHED_RECOMP) || defined(CONAN_RECOMP)
+         out += "\tfloat2 pixelCoord = 0.0;\n";

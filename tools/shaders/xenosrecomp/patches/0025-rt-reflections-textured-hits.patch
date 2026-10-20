@@ -1,0 +1,167 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index e24c86e..b2d6c6e 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -240,6 +240,8 @@ Texture2DArray<float4> g_Texture2DArrayDescriptorHeap[] : register(t0, space6);
+ #if !defined(SR_VULKAN_BUFFERS) && !defined(__spirv__)
+ ByteAddressBuffer g_RtBuffers[] : register(t0, space9);
+ #define SR_RT_FRAME_INDEX 32766
++#define SR_RT_MATERIAL_INDEX 32765  // per TLAS instance: uv base, texture, uv comps | sampler, uv scale/offset
++#define SR_RT_UV_INDEX 32764        // mesh interpolants, 3 float4 per triangle (BLAS primitive order)
+ uint srRtDebug() { return g_RtBuffers[SR_RT_FRAME_INDEX].Load(68) != 0 ? g_RtBuffers[SR_RT_FRAME_INDEX].Load(64) : 0; }
+ float3 srRtWorldPos(float3 lightCoord)
+ {
+@@ -349,10 +351,19 @@ bool srRtReflections()
+     ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
+     return b.Load(68) != 0 && b.Load(72) != 0 && b.Load(92) != 0;
+ }
+-bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id)
++// Byte 96: reflection hits sample the colour texture at their UV (else its
++// mean colour): the *col_map of many materials is a detail layer the game
++// multiplies with tints from a mask, so the texture alone is not their look.
++bool srRtReflectionDetail()
++{
++    return g_RtBuffers[SR_RT_FRAME_INDEX].Load(96) != 0;
++}
++bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id, out uint prim, out float2 bary)
+ {
+     t = 0.0;
+     id = 0xFFFFFFu;
++    prim = 0;
++    bary = 0.0;
+     RayDesc ray;
+     ray.Origin = origin;
+     ray.TMin = 0.5;
+@@ -365,6 +376,8 @@ bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id)
+         return false;
+     t = q.CommittedRayT();
+     id = q.CommittedInstanceID();
++    prim = q.CommittedPrimitiveIndex();
++    bary = q.CommittedTriangleBarycentrics();
+     return true;
+ }
+ #else
+@@ -373,7 +386,8 @@ float srRtHitDistance(float3 worldPos) { return -1.0; }
+ bool srRtShadowsReplace() { return false; }
+ float srRtVisibilitySoft(float3 worldPos) { return 1.0; }
+ bool srRtReflections() { return false; }
+-bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id) { t = 0.0; id = 0xFFFFFFu; return false; }
++bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id, out uint prim, out float2 bary)
++{ t = 0.0; id = 0xFFFFFFu; prim = 0; bary = 0.0; return false; }
+ #endif
+ #else
+ uint srRtDebug() { return 0; }
+@@ -383,10 +397,12 @@ float srRtHitDistance(float3 worldPos) { return -1.0; }
+ bool srRtShadowsReplace() { return false; }
+ float srRtVisibilitySoft(float3 worldPos) { return 1.0; }
+ bool srRtReflections() { return false; }
+-bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id) { t = 0.0; id = 0xFFFFFFu; return false; }
++bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id, out uint prim, out float2 bary)
++{ t = 0.0; id = 0xFFFFFFu; prim = 0; bary = 0.0; return false; }
+ #endif
+ static float g_srRtShadowVis = -1.0;  // this pixel's sun visibility, -1 = use the shadow map
+ static float3 g_srRtPixelPos = 0.0;   // this pixel's world position (receivers)
++static float3 g_srRtReflectSeen = 0.0;  // debug 6: the last reflection colour of this pixel (7: frac of the hit UV, blue = has UV)
+ // The receivers turn a fetch into shadow as saturate((receiver - fetched) * K),
+ // K = depthBias_FadeRange_FalloffStart_FalloffRate.y. With srRtFade making K
+ // 0.001, fetched = -1000 * (1 - visibility) gives shadow = 1 - visibility
+@@ -571,26 +587,75 @@ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, flo
+     return conanGamma(resourceDescriptorIndex, g_TextureCubeDescriptorHeap[TEX_INDEX(resourceDescriptorIndex)].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]));
+ }
+ 
++// Material of a reflection hit (entry m of SR_RT_MATERIAL_INDEX) and its UV:
++// the captured interpolant of the triangle's corners, interpolated, times the
++// draw's UV scale plus offset. hasUv = false: no texture coordinates (the
++// texture's mean colour is used), m.y = 0xFFFFFF: no texture.
++void srRtHitMaterial(bool hit, uint id, uint prim, float2 bary, out uint4 m, out float2 uv, out bool hasUv)
++{
++    m = uint4(0xFFFFFFFFu, 0xFFFFFFu, 0, 0);
++    uv = 0.0;
++    hasUv = false;
++#if !defined(SR_VULKAN_BUFFERS) && !defined(__spirv__)
++    if (!hit)
++        return;
++    ByteAddressBuffer materials = g_RtBuffers[SR_RT_MATERIAL_INDEX];
++    m = materials.Load4(id * 32);
++    if (m.y == 0xFFFFFFu || m.x == 0xFFFFFFFFu || !srRtReflectionDetail())
++        return;
++    ByteAddressBuffer pool = g_RtBuffers[SR_RT_UV_INDEX];
++    uint b = (m.x + prim * 3) * 16;
++    float4 a = asfloat(pool.Load4(b)) * (1.0 - bary.x - bary.y) + asfloat(pool.Load4(b + 16)) * bary.x +
++               asfloat(pool.Load4(b + 32)) * bary.y;
++    float4 xf = asfloat(materials.Load4(id * 32 + 16));
++    uv = float2(a[m.z & 3u], a[(m.z >> 2) & 3u]) * xf.xy + xf.zw;
++    hasUv = true;
++#endif
++}
++
++// Colour of a reflection hit: the material's colour texture at uv with the
++// footprint of the neighbouring pixels' hits (dx, dy: their UV differences,
++// as the hardware takes them for an ordinary fetch); the smallest mip without
++// UV; stone grey without texture. Texture and sampler differ per pixel.
++float3 srRtHitAlbedo(uint4 m, float2 uv, bool hasUv, float2 dx, float2 dy)
++{
++#if defined(SR_VULKAN_BUFFERS) || defined(__spirv__)
++    return float3(0.45, 0.43, 0.40);
++#else
++    if (m.y == 0xFFFFFFu)
++        return float3(0.45, 0.43, 0.40);
++    Texture2D<float4> tex = g_Texture2DDescriptorHeap[NonUniformResourceIndex(m.y & 0x7FFFu)];
++    SamplerState samp = g_SamplerDescriptorHeap[NonUniformResourceIndex((m.z >> 8) & 0xFFFFu)];
++    float4 texel = hasUv ? tex.SampleGrad(samp, uv, dx, dy) : tex.SampleLevel(samp, 0.5, 16.0);
++    return conanGamma((m.y & 0x8000u) ? 0x80000000u : 0u, texel).rgb;
++#endif
++}
++
+ // A receiver's environment sample (env_map) replaced by what a ray from the
+ // pixel along the cube direction hits; the sky cube stays where it misses.
++// Every pixel of the quad gets to the derivatives (misses with uv 0).
+ float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData)
+ {
+-    if (!srRtReflections())
++    if (!srRtReflections() && srRtDebug() != 6 && srRtDebug() != 7)
+         return env;
+     float3 dir = normalize(cubeMapData.cubeMapDirections[texCoord.z]);
++    g_srRtReflectSeen = env.rgb;
+     float3 origin = g_srRtPixelPos + dir * 0.3;
+     float t;
+-    uint id;
+-    if (!srRtReflectTrace(origin, dir, t, id))
++    uint id, prim;
++    float2 bary;
++    bool hit = srRtReflectTrace(origin, dir, t, id, prim, bary);
++    uint4 m;
++    float2 uv;
++    bool hasUv;
++    srRtHitMaterial(hit, id, prim, bary, m, uv, hasUv);
++    float2 dx = ddx(uv), dy = ddy(uv);
++    if (!hit)
+         return env;
+     float sun = srRtVisibility(origin + dir * t);
+-    float3 albedo = float3(0.45, 0.43, 0.40);
+-    if (id != 0xFFFFFFu)
+-    {
+-        float4 texel = g_Texture2DDescriptorHeap[id & 0x7FFFu].SampleLevel(g_SamplerDescriptorHeap[0], 0.5, 16.0);
+-        albedo = conanGamma((id & 0x8000u) ? 0x80000000u : 0u, texel).rgb;
+-    }
+-    return float4(albedo * (0.45 + 0.9 * sun), env.a);
++    float3 color = srRtHitAlbedo(m, uv, hasUv, dx, dy) * (0.45 + 0.9 * sun);
++    g_srRtReflectSeen = srRtDebug() == 7 ? float3(frac(uv), hasUv ? 1.0 : 0.0) : color;
++    return float4(color, env.a);
+ }
+ 
+ #ifdef CONAN_RECOMP
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index e3c2dd6..6753a1f 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -2761,7 +2761,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                                "else if (srRtDebug() == 2) { oC0 = float4(srRtVisibility(srRtWorldPos(iSrLight.xyz)).xxx, 1.0); } "
+                                "else if (srRtDebug() == 4) { float d = srRtHitDistance(srRtWorldPos(iSrLight.xyz)); "
+                                "oC0 = float4(max(d, 0.0) / 100.0, d >= 0.0 ? 1.0 : 0.0, "
+-                               "all(iSrLight.xyz == saturate(iSrLight.xyz)) ? 1.0 : 0.0, 1.0); }";
++                               "all(iSrLight.xyz == saturate(iSrLight.xyz)) ? 1.0 : 0.0, 1.0); } "
++                               "else if (srRtDebug() == 6 || srRtDebug() == 7) { oC0 = float4(g_srRtReflectSeen, 1.0); }";
+                     }
+                     // Xenos fixed-point render targets (k_16_16, k_16_16_16_16)
+                     // store -32..32: every write clamps there. The host keeps

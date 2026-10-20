@@ -1,0 +1,38 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index cbe5ccf..59e7292 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -705,6 +705,24 @@ float3 srRtHitAlbedo(uint id, uint4 m, uint4 m1, float2 uv, bool hasUv, float pa
+ #endif
+ }
+ 
++// Light on a reflection hit with the city shaders' tone (frame bytes 112..143,
++// taken from their constants): the pink ramp colour blended in by its strength,
++// the warm shadow colour where the sun does not reach; 1.35 = the lit level the
++// hits had before. Without the tone: grey light, 0.45 in shadow, 1.35 in sun.
++float3 srRtHitLight(float sun)
++{
++#if !defined(SR_VULKAN_BUFFERS) && !defined(__spirv__)
++    ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
++    if (asfloat(b.Load(140)) > 0.0)
++    {
++        float4 shadow = asfloat(b.Load4(112));
++        float3 ramp = asfloat(b.Load3(128));
++        return 1.35 * lerp(1.0, ramp, shadow.w) * lerp(shadow.rgb, 1.0, sun);
++    }
++#endif
++    return 0.45 + 0.9 * sun;
++}
++
+ // A receiver's environment sample (env_map) replaced by what a ray from the
+ // pixel along the cube direction hits; the sky cube stays where it misses.
+ // Every pixel of the quad gets to the derivatives (misses with uv 0).
+@@ -732,7 +750,7 @@ float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData)
+         return env;
+     }
+     float sun = srRtVisibility(origin + dir * t);
+-    float3 color = srRtHitAlbedo(id, m, m1, uv, hasUv, palSrc, dx, dy) * (0.45 + 0.9 * sun);
++    float3 color = srRtHitAlbedo(id, m, m1, uv, hasUv, palSrc, dx, dy) * srRtHitLight(sun);
+     // Debug 7: the hit's path (red: tint blend, green: colour texture, blue: no material),
+     // brighter with texture coordinates.
+     float3 path = (m1.y & (1u << 9)) ? float3(1, 0, 0) : m.y != 0xFFFFFFu ? float3(0, 1, 0) : float3(0, 0, 1);

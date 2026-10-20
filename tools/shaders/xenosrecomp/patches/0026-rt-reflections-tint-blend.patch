@@ -1,0 +1,148 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index b2d6c6e..2da615b 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -386,6 +386,7 @@ float srRtHitDistance(float3 worldPos) { return -1.0; }
+ bool srRtShadowsReplace() { return false; }
+ float srRtVisibilitySoft(float3 worldPos) { return 1.0; }
+ bool srRtReflections() { return false; }
++bool srRtReflectionDetail() { return false; }
+ bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id, out uint prim, out float2 bary)
+ { t = 0.0; id = 0xFFFFFFu; prim = 0; bary = 0.0; return false; }
+ #endif
+@@ -397,6 +398,7 @@ float srRtHitDistance(float3 worldPos) { return -1.0; }
+ bool srRtShadowsReplace() { return false; }
+ float srRtVisibilitySoft(float3 worldPos) { return 1.0; }
+ bool srRtReflections() { return false; }
++bool srRtReflectionDetail() { return false; }
+ bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id, out uint prim, out float2 bary)
+ { t = 0.0; id = 0xFFFFFFu; prim = 0; bary = 0.0; return false; }
+ #endif
+@@ -587,47 +589,81 @@ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, flo
+     return conanGamma(resourceDescriptorIndex, g_TextureCubeDescriptorHeap[TEX_INDEX(resourceDescriptorIndex)].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]));
+ }
+ 
+-// Material of a reflection hit (entry m of SR_RT_MATERIAL_INDEX) and its UV:
+-// the captured interpolant of the triangle's corners, interpolated, times the
+-// draw's UV scale plus offset. hasUv = false: no texture coordinates (the
+-// texture's mean colour is used), m.y = 0xFFFFFF: no texture.
+-void srRtHitMaterial(bool hit, uint id, uint prim, float2 bary, out uint4 m, out float2 uv, out bool hasUv)
++// Material of a reflection hit (128-byte entry id of SR_RT_MATERIAL_INDEX:
++// m = uv base, colour texture, uv components | sampler << 8, mask texture;
++// m1 = mask sampler, tint flags; then uv scale/offset and the R, G, B and
++// overall tints) and its UV: the captured interpolant of the triangle's
++// corners, interpolated, times the draw's UV scale plus offset. hasUv = false:
++// no texture coordinates (textures give their mean colour).
++void srRtHitMaterial(bool hit, uint id, uint prim, float2 bary, out uint4 m, out uint4 m1, out float2 uv,
++                     out bool hasUv)
+ {
+-    m = uint4(0xFFFFFFFFu, 0xFFFFFFu, 0, 0);
++    m = uint4(0xFFFFFFFFu, 0xFFFFFFu, 0, 0xFFFFFFu);
++    m1 = 0;
+     uv = 0.0;
+     hasUv = false;
+ #if !defined(SR_VULKAN_BUFFERS) && !defined(__spirv__)
+     if (!hit)
+         return;
+     ByteAddressBuffer materials = g_RtBuffers[SR_RT_MATERIAL_INDEX];
+-    m = materials.Load4(id * 32);
+-    if (m.y == 0xFFFFFFu || m.x == 0xFFFFFFFFu || !srRtReflectionDetail())
++    m = materials.Load4(id * 128);
++    m1 = materials.Load4(id * 128 + 16);
++    bool tinted = (m1.y & (1u << 9)) != 0;
++    if ((m.y == 0xFFFFFFu && !tinted) || m.x == 0xFFFFFFFFu || (!tinted && !srRtReflectionDetail()))
+         return;
+     ByteAddressBuffer pool = g_RtBuffers[SR_RT_UV_INDEX];
+     uint b = (m.x + prim * 3) * 16;
+     float4 a = asfloat(pool.Load4(b)) * (1.0 - bary.x - bary.y) + asfloat(pool.Load4(b + 16)) * bary.x +
+                asfloat(pool.Load4(b + 32)) * bary.y;
+-    float4 xf = asfloat(materials.Load4(id * 32 + 16));
++    float4 xf = asfloat(materials.Load4(id * 128 + 32));
+     uv = float2(a[m.z & 3u], a[(m.z >> 2) & 3u]) * xf.xy + xf.zw;
+     hasUv = true;
+ #endif
+ }
+ 
+-// Colour of a reflection hit: the material's colour texture at uv with the
+-// footprint of the neighbouring pixels' hits (dx, dy: their UV differences,
+-// as the hardware takes them for an ordinary fetch); the smallest mip without
+-// UV; stone grey without texture. Texture and sampler differ per pixel.
+-float3 srRtHitAlbedo(uint4 m, float2 uv, bool hasUv, float2 dx, float2 dy)
++#if !defined(SR_VULKAN_BUFFERS) && !defined(__spirv__)
++// One 2D texture of a hit (SRV index | 0x8000 PWL gamma) at uv with the
++// neighbouring hits' footprint, or its mean colour without UV.
++float4 srRtHitTexel(uint texture, uint sampler, float2 uv, bool hasUv, float2 dx, float2 dy)
++{
++    Texture2D<float4> tex = g_Texture2DDescriptorHeap[NonUniformResourceIndex(texture & 0x7FFFu)];
++    SamplerState samp = g_SamplerDescriptorHeap[NonUniformResourceIndex(sampler & 0xFFFFu)];
++    float4 texel = hasUv ? tex.SampleGrad(samp, uv, dx, dy) : tex.SampleLevel(samp, 0.5, 16.0);
++    return conanGamma((texture & 0x8000u) ? 0x80000000u : 0u, texel);
++}
++#endif
++
++// Colour of a reflection hit. Building shaders (tint flag, bit 9): the game's
++// blend, sum(mask channel (/ saturate(sum of the three)) * R/G/B tint), times
++// the overall tint (bit 7) and the colour texture (bit 8). Others: the colour
++// texture; stone grey without texture. dx, dy: the UV differences to the
++// neighbouring pixels' hits, as the hardware takes them for a fetch.
++float3 srRtHitAlbedo(uint id, uint4 m, uint4 m1, float2 uv, bool hasUv, float2 dx, float2 dy)
+ {
+ #if defined(SR_VULKAN_BUFFERS) || defined(__spirv__)
+     return float3(0.45, 0.43, 0.40);
+ #else
++    if (m1.y & (1u << 9))
++    {
++        ByteAddressBuffer materials = g_RtBuffers[SR_RT_MATERIAL_INDEX];
++        float4 mask = srRtHitTexel(m.w, m1.x, uv, hasUv, dx, dy);
++        float3 w = float3(mask[m1.y & 3u], mask[(m1.y >> 2) & 3u], mask[(m1.y >> 4) & 3u]);
++        if (m1.y & (1u << 6))
++        {
++            float sum = saturate(w.x + w.y + w.z);
++            w = sum > 1.17549435e-38 ? w / sum : 0.0;
++        }
++        float3 color = w.x * asfloat(materials.Load3(id * 128 + 48)) + w.y * asfloat(materials.Load3(id * 128 + 64)) +
++                       w.z * asfloat(materials.Load3(id * 128 + 80));
++        if (m1.y & (1u << 7))
++            color *= asfloat(materials.Load3(id * 128 + 96));
++        if (m1.y & (1u << 8))
++            color *= srRtHitTexel(m.y, m.z >> 8, uv, hasUv, dx, dy).rgb;
++        return color;
++    }
+     if (m.y == 0xFFFFFFu)
+         return float3(0.45, 0.43, 0.40);
+-    Texture2D<float4> tex = g_Texture2DDescriptorHeap[NonUniformResourceIndex(m.y & 0x7FFFu)];
+-    SamplerState samp = g_SamplerDescriptorHeap[NonUniformResourceIndex((m.z >> 8) & 0xFFFFu)];
+-    float4 texel = hasUv ? tex.SampleGrad(samp, uv, dx, dy) : tex.SampleLevel(samp, 0.5, 16.0);
+-    return conanGamma((m.y & 0x8000u) ? 0x80000000u : 0u, texel).rgb;
++    return srRtHitTexel(m.y, m.z >> 8, uv, hasUv, dx, dy).rgb;
+ #endif
+ }
+ 
+@@ -645,16 +681,23 @@ float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData)
+     uint id, prim;
+     float2 bary;
+     bool hit = srRtReflectTrace(origin, dir, t, id, prim, bary);
+-    uint4 m;
++    uint4 m, m1;
+     float2 uv;
+     bool hasUv;
+-    srRtHitMaterial(hit, id, prim, bary, m, uv, hasUv);
++    srRtHitMaterial(hit, id, prim, bary, m, m1, uv, hasUv);
+     float2 dx = ddx(uv), dy = ddy(uv);
+     if (!hit)
++    {
++        if (srRtDebug() == 7)
++            g_srRtReflectSeen = 0.0;
+         return env;
++    }
+     float sun = srRtVisibility(origin + dir * t);
+-    float3 color = srRtHitAlbedo(m, uv, hasUv, dx, dy) * (0.45 + 0.9 * sun);
+-    g_srRtReflectSeen = srRtDebug() == 7 ? float3(frac(uv), hasUv ? 1.0 : 0.0) : color;
++    float3 color = srRtHitAlbedo(id, m, m1, uv, hasUv, dx, dy) * (0.45 + 0.9 * sun);
++    // Debug 7: the hit's path (red: tint blend, green: colour texture, blue: no material),
++    // brighter with texture coordinates.
++    float3 path = (m1.y & (1u << 9)) ? float3(1, 0, 0) : m.y != 0xFFFFFFu ? float3(0, 1, 0) : float3(0, 0, 1);
++    g_srRtReflectSeen = srRtDebug() == 7 ? path * (hasUv ? 1.0 : 0.5) : color;
+     return float4(color, env.a);
+ }
+ 

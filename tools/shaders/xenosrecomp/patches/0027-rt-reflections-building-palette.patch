@@ -1,0 +1,173 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 2da615b..cbe5ccf 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -241,7 +241,8 @@ Texture2DArray<float4> g_Texture2DArrayDescriptorHeap[] : register(t0, space6);
+ ByteAddressBuffer g_RtBuffers[] : register(t0, space9);
+ #define SR_RT_FRAME_INDEX 32766
+ #define SR_RT_MATERIAL_INDEX 32765  // per TLAS instance: uv base, texture, uv comps | sampler, uv scale/offset
+-#define SR_RT_UV_INDEX 32764        // mesh interpolants, 3 float4 per triangle (BLAS primitive order)
++#define SR_RT_UV_INDEX 32764        // mesh interpolants, 3 x 32 bytes per triangle (BLAS primitive order)
++#define SR_RT_PALETTE_OFFSET (32769 * 128)  // building palettes after the material entries (8 float4 each)
+ uint srRtDebug() { return g_RtBuffers[SR_RT_FRAME_INDEX].Load(68) != 0 ? g_RtBuffers[SR_RT_FRAME_INDEX].Load(64) : 0; }
+ float3 srRtWorldPos(float3 lightCoord)
+ {
+@@ -369,16 +370,33 @@ bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id, out u
+     ray.TMin = 0.5;
+     ray.Direction = dir;
+     ray.TMax = 4000.0;
++    // Instance mask 1: copies with a material; 2: without (the shadow pass's
++    // copies of the same buildings, characters). The same triangles exist in
++    // both, so the material ones go first and the others only where they miss.
++    // Two separate queries: a RayQuery inside a loop hung the GPU.
+     RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+-    q.TraceRayInline(g_RtTlas, RAY_FLAG_NONE, 0xFF, ray);
++    q.TraceRayInline(g_RtTlas, RAY_FLAG_NONE, 0x01, ray);
+     while (q.Proceed()) {}
+-    if (q.CommittedStatus() != COMMITTED_TRIANGLE_HIT)
+-        return false;
+-    t = q.CommittedRayT();
+-    id = q.CommittedInstanceID();
+-    prim = q.CommittedPrimitiveIndex();
+-    bary = q.CommittedTriangleBarycentrics();
+-    return true;
++    if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
++    {
++        t = q.CommittedRayT();
++        id = q.CommittedInstanceID();
++        prim = q.CommittedPrimitiveIndex();
++        bary = q.CommittedTriangleBarycentrics();
++        return true;
++    }
++    RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q2;
++    q2.TraceRayInline(g_RtTlas, RAY_FLAG_NONE, 0x02, ray);
++    while (q2.Proceed()) {}
++    if (q2.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
++    {
++        t = q2.CommittedRayT();
++        id = q2.CommittedInstanceID();
++        prim = q2.CommittedPrimitiveIndex();
++        bary = q2.CommittedTriangleBarycentrics();
++        return true;
++    }
++    return false;
+ }
+ #else
+ float srRtVisibility(float3 worldPos) { return 1.0; }
+@@ -591,17 +609,20 @@ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, flo
+ 
+ // Material of a reflection hit (128-byte entry id of SR_RT_MATERIAL_INDEX:
+ // m = uv base, colour texture, uv components | sampler << 8, mask texture;
+-// m1 = mask sampler, tint flags; then uv scale/offset and the R, G, B and
+-// overall tints) and its UV: the captured interpolant of the triangle's
+-// corners, interpolated, times the draw's UV scale plus offset. hasUv = false:
+-// no texture coordinates (textures give their mean colour).
++// m1 = mask sampler, tint flags, palette | component << 8, palette scale; then
++// uv scale/offset, the R, G, B tints, the overall tint or building weights and
++// the rest tint) and its UV: the captured interpolants of the triangle's
++// corners (32 bytes each: the UV one, the palette index one), interpolated;
++// uv = UV interpolant * scale + offset; palSrc = the palette index component.
++// hasUv = false: no texture coordinates (textures give their mean colour).
+ void srRtHitMaterial(bool hit, uint id, uint prim, float2 bary, out uint4 m, out uint4 m1, out float2 uv,
+-                     out bool hasUv)
++                     out bool hasUv, out float palSrc)
+ {
+     m = uint4(0xFFFFFFFFu, 0xFFFFFFu, 0, 0xFFFFFFu);
+     m1 = 0;
+     uv = 0.0;
+     hasUv = false;
++    palSrc = 0.0;
+ #if !defined(SR_VULKAN_BUFFERS) && !defined(__spirv__)
+     if (!hit)
+         return;
+@@ -612,11 +633,14 @@ void srRtHitMaterial(bool hit, uint id, uint prim, float2 bary, out uint4 m, out
+     if ((m.y == 0xFFFFFFu && !tinted) || m.x == 0xFFFFFFFFu || (!tinted && !srRtReflectionDetail()))
+         return;
+     ByteAddressBuffer pool = g_RtBuffers[SR_RT_UV_INDEX];
+-    uint b = (m.x + prim * 3) * 16;
+-    float4 a = asfloat(pool.Load4(b)) * (1.0 - bary.x - bary.y) + asfloat(pool.Load4(b + 16)) * bary.x +
+-               asfloat(pool.Load4(b + 32)) * bary.y;
++    uint b = (m.x + prim * 3) * 32;
++    float w0 = 1.0 - bary.x - bary.y;
++    float4 a = asfloat(pool.Load4(b)) * w0 + asfloat(pool.Load4(b + 32)) * bary.x + asfloat(pool.Load4(b + 64)) * bary.y;
++    float4 q = asfloat(pool.Load4(b + 16)) * w0 + asfloat(pool.Load4(b + 48)) * bary.x +
++               asfloat(pool.Load4(b + 80)) * bary.y;
+     float4 xf = asfloat(materials.Load4(id * 128 + 32));
+     uv = float2(a[m.z & 3u], a[(m.z >> 2) & 3u]) * xf.xy + xf.zw;
++    palSrc = q[(m1.z >> 8) & 3u];
+     hasUv = true;
+ #endif
+ }
+@@ -633,12 +657,16 @@ float4 srRtHitTexel(uint texture, uint sampler, float2 uv, bool hasUv, float2 dx
+ }
+ #endif
+ 
+-// Colour of a reflection hit. Building shaders (tint flag, bit 9): the game's
+-// blend, sum(mask channel (/ saturate(sum of the three)) * R/G/B tint), times
+-// the overall tint (bit 7) and the colour texture (bit 8). Others: the colour
+-// texture; stone grey without texture. dx, dy: the UV differences to the
+-// neighbouring pixels' hits, as the hardware takes them for a fetch.
+-float3 srRtHitAlbedo(uint id, uint4 m, uint4 m1, float2 uv, bool hasUv, float2 dx, float2 dy)
++// Colour of a reflection hit, as the game's shaders mix it:
++// - tint blend (flag bit 9): mask channels (/ saturate(their sum) with bit 6)
++//   weight the R, G, B tints; with a building palette (bit 10) the rest
++//   1 - saturate(sum) weights A_tint and the colour is blended towards the
++//   palette entry floor(palSrc * scale) by saturate(dot(weights and rest,
++//   building weights)); else times the overall tint (bit 7); then times the
++//   colour texture (bit 8). The palette shaders' dirt (3D noise) is left out.
++// - otherwise the colour texture; stone grey without texture.
++// dx, dy: the UV differences to the neighbouring pixels' hits.
++float3 srRtHitAlbedo(uint id, uint4 m, uint4 m1, float2 uv, bool hasUv, float palSrc, float2 dx, float2 dy)
+ {
+ #if defined(SR_VULKAN_BUFFERS) || defined(__spirv__)
+     return float3(0.45, 0.43, 0.40);
+@@ -648,15 +676,25 @@ float3 srRtHitAlbedo(uint id, uint4 m, uint4 m1, float2 uv, bool hasUv, float2 d
+         ByteAddressBuffer materials = g_RtBuffers[SR_RT_MATERIAL_INDEX];
+         float4 mask = srRtHitTexel(m.w, m1.x, uv, hasUv, dx, dy);
+         float3 w = float3(mask[m1.y & 3u], mask[(m1.y >> 2) & 3u], mask[(m1.y >> 4) & 3u]);
++        float sum = saturate(w.x + w.y + w.z);
+         if (m1.y & (1u << 6))
+-        {
+-            float sum = saturate(w.x + w.y + w.z);
+             w = sum > 1.17549435e-38 ? w / sum : 0.0;
+-        }
+         float3 color = w.x * asfloat(materials.Load3(id * 128 + 48)) + w.y * asfloat(materials.Load3(id * 128 + 64)) +
+                        w.z * asfloat(materials.Load3(id * 128 + 80));
+-        if (m1.y & (1u << 7))
+-            color *= asfloat(materials.Load3(id * 128 + 96));
++        float4 t3 = asfloat(materials.Load4(id * 128 + 96));
++        if (m1.y & (1u << 10))
++        {
++            float rest = 1.0 - sum;
++            color += rest * asfloat(materials.Load3(id * 128 + 112));
++            float building = saturate(dot(float4(w, rest), t3));
++            uint n = uint(clamp(floor(palSrc * asfloat(m1.w)), 0.0, 7.0));
++            float3 palette = asfloat(materials.Load3(SR_RT_PALETTE_OFFSET + ((m1.z & 0xFFu) * 8 + n) * 16));
++            color = lerp(color, palette, building);
++        }
++        else if (m1.y & (1u << 7))
++        {
++            color *= t3.rgb;
++        }
+         if (m1.y & (1u << 8))
+             color *= srRtHitTexel(m.y, m.z >> 8, uv, hasUv, dx, dy).rgb;
+         return color;
+@@ -684,7 +722,8 @@ float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData)
+     uint4 m, m1;
+     float2 uv;
+     bool hasUv;
+-    srRtHitMaterial(hit, id, prim, bary, m, m1, uv, hasUv);
++    float palSrc;
++    srRtHitMaterial(hit, id, prim, bary, m, m1, uv, hasUv, palSrc);
+     float2 dx = ddx(uv), dy = ddy(uv);
+     if (!hit)
+     {
+@@ -693,7 +732,7 @@ float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData)
+         return env;
+     }
+     float sun = srRtVisibility(origin + dir * t);
+-    float3 color = srRtHitAlbedo(id, m, m1, uv, hasUv, dx, dy) * (0.45 + 0.9 * sun);
++    float3 color = srRtHitAlbedo(id, m, m1, uv, hasUv, palSrc, dx, dy) * (0.45 + 0.9 * sun);
+     // Debug 7: the hit's path (red: tint blend, green: colour texture, blue: no material),
+     // brighter with texture coordinates.
+     float3 path = (m1.y & (1u << 9)) ? float3(1, 0, 0) : m.y != 0xFFFFFFu ? float3(0, 1, 0) : float3(0, 0, 1);

@@ -256,6 +256,16 @@ REXCVAR_DEFINE_DOUBLE(sr_rt_sun_angle, 0.53, "Superman Returns Native",
                       "Ray-traced shadows: angular diameter of the sun in degrees (0.53 = the real sun; "
                       "larger = softer penumbra)")
     .range(0.0, 10.0);
+REXCVAR_DEFINE_BOOL(sr_rt_reflections, true, "Superman Returns Native",
+                    "With sr_rt_shadows: the buildings' environment reflections (windows) come from rays "
+                    "into the ray-traced scene; the game's sky cube stays where they miss");
+REXCVAR_DEFINE_BOOL(sr_rt_reflection_palette, true, "Superman Returns Native",
+                    "Ray-traced reflections: the city buildings' palette colours (their index is captured "
+                    "from a second interpolant)");
+REXCVAR_DEFINE_BOOL(sr_rt_reflection_detail, false, "Superman Returns Native",
+                    "Ray-traced reflections: sample the hit material's colour texture at its UV instead of "
+                    "the texture's mean colour (experimental: for most city materials that texture is a "
+                    "detail layer, the colour comes from tints)");
 REXCVAR_DEFINE_BOOL(sr_rt_shadows_replace, true, "Superman Returns Native",
                     "With sr_rt_shadows: the sun shadow comes from the ray-traced scene instead of the "
                     "game's cascades (the receivers' shadow map fetches read the ray result; false = "
@@ -263,6 +273,9 @@ REXCVAR_DEFINE_BOOL(sr_rt_shadows_replace, true, "Superman Returns Native",
 REXCVAR_DEFINE_DOUBLE(sr_rt_measure_at_s, 0.0, "Superman Returns Native",
                       "Measurement: after this bench time, dump (sr_native_dump_dir, prefix m<mode>_) one "
                       "frame of each sr_rt_shadow_debug_cycle step");
+REXCVAR_DEFINE_STRING(sr_rt_debug_modes, "0,2,3,4", "Superman Returns Native",
+                      "Measurement: the debug modes sr_rt_shadow_debug_cycle steps through (5 = the game "
+                      "with ray-traced shadows but without ray-traced reflections)");
 REXCVAR_DEFINE_INT32(sr_rt_shadow_debug_cycle, 0, "Superman Returns Native",
                      "Measurement: every N frames switch sr_rt_shadow_debug through 0 (game), 2 (ray-traced "
                      "visibility), 3 (game without shadows), 4 (occluder distance), so a paused frame gives "
@@ -1369,7 +1382,9 @@ bool Renderer::CreateDrawResources() {
     rs_desc.NumParameters = 10;
   }
   rs_desc.pParameters = params;
-  rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+  // Stream output: the ray-traced shadows capture skinned characters (RtCaptureSkinned).
+  rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+                  D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT;
   ComPtr<ID3DBlob> blob, error;
   if (FAILED(D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) ||
       FAILED(device_->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
@@ -1743,8 +1758,21 @@ bool RtGeometryVs(uint64_t hash);  // a vertex shader drawing world geometry (rt
 int32_t Renderer::RtDebugMode() const {
   const int32_t cycle = REXCVAR_GET(sr_rt_shadow_debug_cycle);
   if (cycle <= 0) return REXCVAR_GET(sr_rt_shadow_debug);
-  static constexpr int32_t kModes[4] = {0, 2, 3, 4};
-  return kModes[(swap_number_ / uint64_t(cycle)) % 4];
+  const std::vector<int32_t> modes = RtDebugModes();
+  return modes[(swap_number_ / uint64_t(cycle)) % modes.size()];
+}
+
+std::vector<int32_t> Renderer::RtDebugModes() const {
+  std::vector<int32_t> modes;
+  for (const char* p = REXCVAR_GET(sr_rt_debug_modes).c_str(); *p;) {
+    char* end = nullptr;
+    const long v = std::strtol(p, &end, 10);
+    if (end == p) { ++p; continue; }
+    modes.push_back(int32_t(v));
+    p = end;
+  }
+  if (modes.empty()) modes.push_back(0);
+  return modes;
 }
 
 bool Renderer::SkipGpuDraw() const {
@@ -2361,10 +2389,12 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   const float len = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
   if (len <= 0.0f) return;
   for (float& v : sun) v /= len;
+  std::memcpy(rt_frame_inv_, inv, sizeof(rt_frame_inv_));
   if (REXCVAR_GET(sr_rt_shadows)) {
     // Anchor of the city instance window: the first cascade's centre.
     float anchor[3];
     for (int r = 0; r < 3; ++r) anchor[r] = inv[r * 4] * 0.5f + inv[r * 4 + 1] * 0.5f + inv[r * 4 + 2] * 0.5f + inv[r * 4 + 3];
+    RtBuildSkinnedBlas();
     RtBuildCityTlas(anchor);
   } else {
     EnsureRtScene(inv);
@@ -2380,10 +2410,17 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   data[18] = (REXCVAR_GET(sr_rt_shadows) ? rt_city_ready_ : rt_scene_ready_) ? 1u : 0u;
   const float bias = float(REXCVAR_GET(sr_rt_shadow_bias));
   std::memcpy(&data[19], &bias, 4);
-  data[20] = REXCVAR_GET(sr_rt_shadows) && REXCVAR_GET(sr_rt_shadows_replace) && RtDebugMode() == 0 ? 1u : 0u;
+  const int32_t debug_mode = RtDebugMode();
+  data[20] = REXCVAR_GET(sr_rt_shadows) && REXCVAR_GET(sr_rt_shadows_replace) && (debug_mode == 0 || debug_mode == 5)
+                 ? 1u : 0u;
   data[21] = uint32_t(REXCVAR_GET(sr_rt_shadow_rays));
   const float spread = float(std::tan(REXCVAR_GET(sr_rt_sun_angle) * 0.5 * 3.14159265358979 / 180.0));
   std::memcpy(&data[22], &spread, 4);
+  data[23] = REXCVAR_GET(sr_rt_shadows) && REXCVAR_GET(sr_rt_reflections) && debug_mode == 0 ? 1u : 0u;
+  data[24] = REXCVAR_GET(sr_rt_reflection_detail) ? 1u : 0u;
+  // Bytes 112..143: the city's lighting tone (shadow colour, ramp strength,
+  // ramp colour, valid) for reflection hits.
+  std::memcpy(&data[28], rt_tone_, sizeof(rt_tone_));
   Transition(rt_frame_buffer_.Get(), rt_frame_state_, D3D12_RESOURCE_STATE_COPY_DEST);
   command_list_->CopyBufferRegion(rt_frame_buffer_.Get(), 0, up.resource, up.offset, 256);
   Transition(rt_frame_buffer_.Get(), rt_frame_state_,
@@ -2417,6 +2454,49 @@ uint64_t RtInstanceKey(const Instance& instance) {
   for (float v : instance.transform) k = RtMix(k, uint64_t(int64_t(std::lround(double(v) * 64.0))));
   return k;
 }
+struct AlbedoScalar {
+  int32_t reg;  // pixel shader float constant register, -1 = value
+  uint32_t comp;
+  float value;
+};
+struct AlbedoRegs {
+  uint64_t hash;
+  uint32_t slot;
+  int32_t interp;  // UV interpolant (TEXCOORDn), -1 = none
+  uint32_t cu, cv;
+  AlbedoScalar scale_u, scale_v, offset_u, offset_v;
+};
+constexpr AlbedoRegs kAlbedoRegs[] = {
+#include "rt_albedo_regs.inc"
+};
+struct TintRegs {
+  uint64_t hash;
+  uint32_t mask_slot;
+  int32_t interp;
+  uint32_t cu, cv;
+  AlbedoScalar scale_u, scale_v, offset_u, offset_v;
+  uint32_t channels[3];
+  uint32_t normalised;
+  int32_t tint_regs[4];  // R_tint, G_tint, B_tint, tint; -1 = none
+  int32_t col_slot;      // -1 = none
+};
+constexpr TintRegs kTintRegs[] = {
+#include "rt_tint_regs.inc"
+};
+struct PaletteRegs {
+  uint64_t hash;
+  int32_t a_tint_reg, building_reg;
+  uint32_t building_comps[4];  // gBuildingTint component for the R, G, B mask channels and the rest
+  int32_t interp;
+  uint32_t comp;
+  float scale;
+  uint32_t entries;
+  float colours[8][3];
+  int32_t tone_regs[3];  // gShadCol, ramp_col_exp, Kramp_lo_hi_Kao (-1 = none)
+};
+constexpr PaletteRegs kPaletteRegs[] = {
+#include "rt_palette_regs.inc"
+};
 struct InstancedRegs {
   uint64_t hash;
   uint32_t data, transforms, per_instance;
@@ -2424,6 +2504,42 @@ struct InstancedRegs {
 constexpr InstancedRegs kInstancedRegs[] = {
 #include "rt_instanced_regs.inc"
 };
+// Diagnostic: the draw path of each skinned world vertex shader, once.
+void RtLogSkinnedDraw(uint64_t hash, const char* path, uint32_t prim, int topology, bool quads) {
+  const auto it = std::lower_bound(std::begin(kWorldRegs), std::end(kWorldRegs), hash,
+                                   [](const WorldRegs& e, uint64_t h) { return e.hash < h; });
+  if (it == std::end(kWorldRegs) || it->hash != hash || !it->skinned) return;
+  static std::unordered_set<uint64_t> seen;
+  if (seen.insert(hash ^ (uint64_t(prim) << 48) ^ (uint64_t(path[0]) << 56)).second)
+    REXLOG_INFO("native: rt skinned vs {:016X} drawn {} prim {} topology {} quads {}", hash, path, prim, topology,
+                quads);
+}
+const AlbedoRegs* RtAlbedoFor(uint64_t ps_hash) {
+  const auto it = std::lower_bound(std::begin(kAlbedoRegs), std::end(kAlbedoRegs), ps_hash,
+                                   [](const AlbedoRegs& e, uint64_t h) { return e.hash < h; });
+  return it != std::end(kAlbedoRegs) && it->hash == ps_hash ? &*it : nullptr;
+}
+const TintRegs* RtTintFor(uint64_t ps_hash) {
+  const auto it = std::lower_bound(std::begin(kTintRegs), std::end(kTintRegs), ps_hash,
+                                   [](const TintRegs& e, uint64_t h) { return e.hash < h; });
+  return it != std::end(kTintRegs) && it->hash == ps_hash ? &*it : nullptr;
+}
+const PaletteRegs* RtPaletteFor(uint64_t ps_hash) {
+  const auto it = std::lower_bound(std::begin(kPaletteRegs), std::end(kPaletteRegs), ps_hash,
+                                   [](const PaletteRegs& e, uint64_t h) { return e.hash < h; });
+  return it != std::end(kPaletteRegs) && it->hash == ps_hash ? &*it : nullptr;
+}
+// The interpolant a pixel shader's colour UV comes from (tint blend first).
+int32_t RtUvInterp(uint64_t ps_hash) {
+  if (const TintRegs* t = RtTintFor(ps_hash)) return t->interp;
+  if (const AlbedoRegs* a = RtAlbedoFor(ps_hash)) return a->interp;
+  return -1;
+}
+// The interpolant its building palette index comes from (-1: none).
+int32_t RtPaletteInterp(uint64_t ps_hash) {
+  const PaletteRegs* p = RtPaletteFor(ps_hash);
+  return p && REXCVAR_GET(sr_rt_reflection_palette) ? p->interp : -1;
+}
 bool RtGeometryVs(uint64_t hash) {
   auto in = [hash](const auto& table) {
     const auto it = std::lower_bound(std::begin(table), std::end(table), hash,
@@ -2453,7 +2569,7 @@ DXGI_FORMAT RtPositionFormat(DXGI_FORMAT host) {
 // TLAS instances for the following frames.
 void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd,
                              const BufferEntry* ib, uint32_t start_index, uint32_t index_count,
-                             int32_t base_vertex) {
+                             int32_t base_vertex, bool strip) {
   if (!REXCVAR_GET(sr_rt_shadows)) return;
   static uint64_t calls = 0, no_receiver = 0, no_world = 0, no_pos = 0, bad_args = 0, last_diag = 0;
   ++calls;
@@ -2473,7 +2589,32 @@ void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCm
   const WorldRegs* wit = std::lower_bound(std::begin(kWorldRegs), wend, current_vs_hash_,
                                           [](const WorldRegs& e, uint64_t h) { return e.hash < h; });
   if (wit == wend || wit->hash != current_vs_hash_) { ++no_world; return; }
-  if (wit->skinned) { ++rt_stats_.skip_skinned; return; }
+  if (wit->skinned) {
+    // Stream output writes the draw's triangles as a list: 3 vertices each. A
+    // strip (the characters) has length - 2 per run between restart indices.
+    uint32_t vertices = index_count - index_count % 3;
+    if (strip) {
+      const uint32_t isize = cmd.index32 ? 4 : 2, cut = cmd.index32 ? 0xFFFFFFFFu : 0xFFFFu;
+      const uint8_t* q = GuestPtr(base, 0xA0000000u + cmd.index.address + start_index * isize, index_count * isize);
+      uint32_t triangles = 0, run = 0;
+      for (uint32_t i = 0; i <= index_count; ++i) {
+        const uint32_t index = i == index_count ? cut
+                               : isize == 4 ? (uint32_t(q[4 * i]) << 24) | (uint32_t(q[4 * i + 1]) << 16) |
+                                                  (uint32_t(q[4 * i + 2]) << 8) | q[4 * i + 3]
+                                            : (uint32_t(q[2 * i]) << 8) | q[2 * i + 1];
+        if (index == cut) {
+          triangles += run > 2 ? run - 2 : 0;
+          run = 0;
+        } else {
+          ++run;
+        }
+      }
+      vertices = triangles * 3;
+    }
+    RtCaptureSkinned(base, sit->u, sit->v, sit->z, start_index, index_count, base_vertex, vertices);
+    return;
+  }
+  if (strip) return;  // static geometry: triangle lists only
   // Position element and its stream.
   const StreamPlan* pos_stream = nullptr;
   uint32_t pos_offset = 0;
@@ -2551,7 +2692,30 @@ void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCm
                         uint32_t(base_vertex) * pos_stream->stride + pos_offset,
               pos_stream->stride, idx, instance.transform, ikey);
   }
+  // Reflections: the mesh's texture coordinates, from the first draw whose
+  // pixel shader has a colour texture (the shadow pass draws it first without).
+  if (REXCVAR_GET(sr_rt_reflections))
+    RtCaptureUv(mit->second, base, RtUvInterp(current_ps_hash_), RtPaletteInterp(current_ps_hash_), true,
+                index_count, start_index, base_vertex);
   RtAddInstance(instance);
+}
+
+// The building palettes (kPaletteRegs, 8 colours each) after the material
+// entries: reflection hits look up palette p entry n at kRtMaterialBytes + (p * 8 + n) * 16.
+void Renderer::RtUploadPalettes() {
+  if (!rt_material_buffer_) return;
+  float colours[16 * 8][4] = {};
+  const size_t count = std::min<size_t>(std::size(kPaletteRegs), 16);
+  for (size_t p = 0; p < count; ++p) {
+    for (int n = 0; n < 8; ++n) std::memcpy(colours[p * 8 + n], kPaletteRegs[p].colours[n], 12);
+  }
+  UploadAlloc up;
+  if (!Upload(sizeof(colours), 256, up)) return;
+  std::memcpy(up.cpu, colours, sizeof(colours));
+  Transition(rt_material_buffer_.Get(), rt_material_state_, D3D12_RESOURCE_STATE_COPY_DEST);
+  command_list_->CopyBufferRegion(rt_material_buffer_.Get(), kRtMaterialBytes, up.resource, up.offset, sizeof(colours));
+  Transition(rt_material_buffer_.Get(), rt_material_state_,
+             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 }
 
 // Debug export (sr_rt_dump_obj_swap): a mesh's vertices from guest memory (big
@@ -2599,6 +2763,89 @@ void Renderer::RtAddInstance(const RtInstance& instance) {
   auto [iit, inserted] = rt_city_instances_.try_emplace(RtInstanceKey(instance), instance);
   if (inserted) iit->second.first_swap = swap_number_;
   iit->second.last_swap = swap_number_;
+  // The draw's colour texture (its pixel shader's *col_map slot).
+  // Draws without a colour texture (the shadow pass, which also draws what is
+  // outside the view) leave the material the copy or the mesh already has.
+  const float* pc = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase) + 1024;
+  auto value = [pc](const AlbedoScalar& sc) { return sc.reg < 0 ? sc.value : pc[sc.reg * 4 + sc.comp]; };
+  // A bound 2D texture of this draw: SRV index | 0x8000 for PWL gamma (0 = none).
+  auto texture = [this](int32_t slot) -> uint32_t {
+    if (slot < 0 || slot >= 16) return 0;
+    const uint32_t srv = rt_tex2d_[slot], index = srv & 0x7FFFu;
+    return index > 2 ? index | (srv & 0x80000000u ? 0x8000u : 0u) : 0;
+  };
+  RtMaterial in;
+  bool found = false;
+  if (const TintRegs* t = RtTintFor(current_ps_hash_); t && texture(int32_t(t->mask_slot))) {
+    // Building shaders: mask * tints (* tint * colour texture), all at the mask's UV.
+    in.mask = texture(int32_t(t->mask_slot));
+    in.mask_gen = SrvGeneration(in.mask & 0x7FFFu);
+    in.mask_sampler = rt_samp_[t->mask_slot];
+    in.tint_flags = t->channels[0] | (t->channels[1] << 2) | (t->channels[2] << 4) | (t->normalised << 6) |
+                    (t->tint_regs[3] >= 0 ? 1u << 7 : 0u);
+    for (int k = 0; k < 4; ++k) {
+      if (t->tint_regs[k] >= 0) std::memcpy(in.tints[k], pc + t->tint_regs[k] * 4, 16);
+    }
+    if (const uint32_t col = texture(t->col_slot)) {
+      in.albedo = col;
+      in.albedo_gen = SrvGeneration(col & 0x7FFFu);
+      in.sampler = rt_samp_[t->col_slot];
+      in.tint_flags |= 1u << 8;
+    }
+    if (const PaletteRegs* pal = RtPaletteFor(current_ps_hash_)) {
+      // The rest weight's tint, the building weights in R, G, B, rest order, the palette.
+      in.tint_flags |= 1u << 10;
+      std::memcpy(in.a_tint, pc + pal->a_tint_reg * 4, 16);
+      for (int k = 0; k < 4; ++k) in.tints[3][k] = pc[pal->building_reg * 4 + pal->building_comps[k]];
+      in.palette = int32_t(pal - std::begin(kPaletteRegs));
+      in.palette_interp = pal->interp;
+      in.palette_comp = pal->comp;
+      in.palette_scale = pal->scale;
+      // The city's lighting tone for reflection hits (rt_tone_, frame bytes 112..143).
+      if (pal->tone_regs[0] >= 0 && pal->tone_regs[1] >= 0 && pal->tone_regs[2] >= 0) {
+        std::memcpy(rt_tone_, pc + pal->tone_regs[0] * 4, 12);
+        rt_tone_[3] = pc[pal->tone_regs[2] * 4];
+        std::memcpy(rt_tone_ + 4, pc + pal->tone_regs[1] * 4, 12);
+        rt_tone_[7] = 1.0f;
+      }
+    }
+    if (t->interp >= 0 && mit->second.uv_interp == t->interp) {
+      in.uv_interp = t->interp;
+      in.uv_comps = t->cu | (t->cv << 2);
+      in.uv[0] = value(t->scale_u);
+      in.uv[1] = value(t->scale_v);
+      in.uv[2] = value(t->offset_u);
+      in.uv[3] = value(t->offset_v);
+    }
+    found = true;
+    static std::unordered_set<uint64_t> logged_tint_ps;
+    if (logged_tint_ps.size() < 8 && logged_tint_ps.insert(current_ps_hash_).second) {
+      REXLOG_INFO("native: rt tint material ps {:016X}: R ({:.3f} {:.3f} {:.3f}) G ({:.3f} {:.3f} {:.3f}) "
+                  "B ({:.3f} {:.3f} {:.3f}) tint ({:.3f} {:.3f} {:.3f}) uv x({:.3f} {:.3f}) +({:.3f} {:.3f}) "
+                  "mask {:X} col {:X} flags {:X}", current_ps_hash_, in.tints[0][0], in.tints[0][1], in.tints[0][2],
+                  in.tints[1][0], in.tints[1][1], in.tints[1][2], in.tints[2][0], in.tints[2][1], in.tints[2][2],
+                  in.tints[3][0], in.tints[3][1], in.tints[3][2], in.uv[0], in.uv[1], in.uv[2], in.uv[3], in.mask,
+                  in.albedo, in.tint_flags);
+    }
+  } else if (const AlbedoRegs* ait = RtAlbedoFor(current_ps_hash_); ait && texture(int32_t(ait->slot))) {
+    // Other materials: the colour texture alone.
+    in.albedo = texture(int32_t(ait->slot));
+    in.albedo_gen = SrvGeneration(in.albedo & 0x7FFFu);
+    in.sampler = rt_samp_[ait->slot];
+    if (ait->interp >= 0 && mit->second.uv_interp == ait->interp) {
+      in.uv_interp = ait->interp;
+      in.uv_comps = ait->cu | (ait->cv << 2);
+      in.uv[0] = value(ait->scale_u);
+      in.uv[1] = value(ait->scale_v);
+      in.uv[2] = value(ait->offset_u);
+      in.uv[3] = value(ait->offset_v);
+    }
+    found = true;
+  }
+  if (found) {
+    iit->second.material = in;
+    mit->second.material = in;
+  }
   static uint64_t last_log = 0;
   if (swap_number_ >= last_log + 600) {
     last_log = swap_number_;
@@ -2607,6 +2854,8 @@ void Renderer::RtAddInstance(const RtInstance& instance) {
                 rt_city_instances_.size(), rt_stats_.captured, rt_stats_.new_meshes,
                 rt_stats_.skip_format, rt_stats_.skip_skinned, rt_stats_.skip_budget,
                 rt_stats_.instanced_draws, rt_stats_.instanced_copies, rt_stats_.skip_instanced);
+    REXLOG_INFO("native: rt reflections: {} meshes with texture coordinates, {} of {} pool vertices",
+                rt_stats_.uv_meshes, rt_uv_cursor_, (192ull << 20) / 16);
   }
 }
 
@@ -2723,6 +2972,15 @@ void Renderer::RtCaptureInstanced(uint8_t* base, const WorkBatch& batch, const W
   // Copies covered by this draw (SV_VertexID starts at start_vertex).
   const uint32_t first = uint32_t((double(start_vertex) + 0.5) / per_copy);
   const uint32_t last = uint32_t((double(start_vertex) + vertex_count - 1 + 0.5) / per_copy);
+  // Reflections: the mesh's texture coordinates from the first whole copy in
+  // this draw (its vertices in order are the BLAS triangles' corners).
+  if (REXCVAR_GET(sr_rt_reflections)) {
+    const uint32_t whole = (start_vertex + per_copy - 1) / per_copy;
+    auto mesh_it = rt_meshes_.find(key);
+    if (mesh_it != rt_meshes_.end() && uint64_t(whole + 1) * per_copy <= uint64_t(start_vertex) + vertex_count)
+      RtCaptureUv(mesh_it->second, base, RtUvInterp(current_ps_hash_), RtPaletteInterp(current_ps_hash_), false,
+                  per_copy, whole * per_copy, 0);
+  }
   for (uint32_t i = first; i <= last; ++i) {
     const uint32_t reg = iit->transforms + i * iit->per_instance;
     if (reg + iit->per_instance > 256) break;
@@ -3410,6 +3668,80 @@ const std::vector<uint8_t>* Renderer::LoadShader(uint64_t hash, bool vertex) {
   return result;
 }
 
+// Input layout of a pipeline: the game's declaration (attributes the vertex
+// shader reads) plus zero-stride defaults for the inputs it lacks. Shared by
+// the draw pipelines and the ray-traced shadows' stream-output pipelines.
+void Renderer::BuildInputLayout(uint8_t* base, uint32_t decl, const std::vector<uint8_t>& vs_blob,
+                                std::vector<D3D12_INPUT_ELEMENT_DESC>& elements, PsoRecord* record) {
+  const std::vector<uint8_t>* vs = &vs_blob;
+  uint32_t decl_count = decl ? Load32(base, decl + 0x18) : 0;
+  // The game's declarations describe every attribute of the mesh; a vertex
+  // shader that reads fewer must not be given the rest (D3D12 rejects the
+  // pipeline otherwise).
+  const std::vector<std::pair<std::string, uint32_t>> vs_inputs = VertexShaderInputs(*vs);
+  for (uint32_t i = 0; i < decl_count; ++i) {
+    uint32_t e = decl + 0x34 + 12 * i;
+    uint32_t stream = Load16(base, e);
+    uint32_t offset = Load16(base, e + 2);
+    uint32_t type = Load32(base, e + 4);
+    uint32_t usage = Load8(base, e + 9);
+    uint32_t usage_index = Load8(base, e + 10);
+    if (stream == 0xFF) break;
+    DeclFormat fmt = MapDeclType(type);
+    if (fmt.format == DXGI_FORMAT_UNKNOWN) {
+      LogUnsupportedOnce("vertex element type", type, "not in MapDeclType (the element is dropped)");
+      continue;
+    }
+    if (!vs_inputs.empty() &&
+        std::find(vs_inputs.begin(), vs_inputs.end(),
+                  std::make_pair(std::string(UsageSemantic(usage)), usage_index)) == vs_inputs.end()) {
+      continue;
+    }
+    D3D12_INPUT_ELEMENT_DESC d{};
+    d.SemanticName = UsageSemantic(usage);
+    d.SemanticIndex = usage_index;
+    d.Format = fmt.format;
+    d.InputSlot = stream;
+    d.AlignedByteOffset = offset;
+    d.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+    elements.push_back(d);
+    if (record && record->element_count < PsoRecord::kMaxElements) {
+      auto& re = record->elements[record->element_count++];
+      re.usage = uint8_t(usage);
+      re.usage_index = uint8_t(usage_index);
+      re.slot = uint8_t(stream);
+      re.format = uint32_t(fmt.format);
+      re.offset = offset;
+    }
+  }
+
+  // The XDK patches absent attributes to constants. A zero-stride host
+  // buffer supplies the same value regardless of the draw's vertex index.
+  const auto float_inputs = VertexShaderInputs(*vs, true);
+  for (const auto& input : float_inputs) {
+    if (std::any_of(elements.begin(), elements.end(), [&](const auto& e) {
+          return input.first == e.SemanticName && input.second == e.SemanticIndex;
+        })) continue;
+    uint32_t usage = 0;
+    while (usage < 14 && input.first != UsageSemantic(usage)) ++usage;
+    if (usage == 14) continue;
+    D3D12_INPUT_ELEMENT_DESC e{};
+    e.SemanticName = UsageSemantic(usage);
+    e.SemanticIndex = input.second;
+    e.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    e.InputSlot = 16;
+    e.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+    elements.push_back(e);
+    if (record && record->element_count < PsoRecord::kMaxElements) {
+      auto& re = record->elements[record->element_count++];
+      re.usage = uint8_t(usage);
+      re.usage_index = uint8_t(input.second);
+      re.slot = 16;
+      re.format = uint32_t(e.Format);
+    }
+  }
+}
+
 ID3D12PipelineState* Renderer::GetPipeline(uint8_t* base, uint32_t dev, uint64_t vs_hash,
                                            uint64_t ps_hash, uint32_t decl,
                                            D3D12_PRIMITIVE_TOPOLOGY_TYPE topology_type,
@@ -3528,71 +3860,7 @@ ID3D12PipelineState* Renderer::GetPipeline(uint8_t* base, uint32_t dev, uint64_t
 
   std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
   PsoRecord record;
-  // The game's declarations describe every attribute of the mesh; a vertex
-  // shader that reads fewer must not be given the rest (D3D12 rejects the
-  // pipeline otherwise).
-  const std::vector<std::pair<std::string, uint32_t>> vs_inputs = VertexShaderInputs(*vs);
-  for (uint32_t i = 0; i < decl_count; ++i) {
-    uint32_t e = decl + 0x34 + 12 * i;
-    uint32_t stream = Load16(base, e);
-    uint32_t offset = Load16(base, e + 2);
-    uint32_t type = Load32(base, e + 4);
-    uint32_t usage = Load8(base, e + 9);
-    uint32_t usage_index = Load8(base, e + 10);
-    if (stream == 0xFF) break;
-    DeclFormat fmt = MapDeclType(type);
-    if (fmt.format == DXGI_FORMAT_UNKNOWN) {
-      LogUnsupportedOnce("vertex element type", type, "not in MapDeclType (the element is dropped)");
-      continue;
-    }
-    if (!vs_inputs.empty() &&
-        std::find(vs_inputs.begin(), vs_inputs.end(),
-                  std::make_pair(std::string(UsageSemantic(usage)), usage_index)) == vs_inputs.end()) {
-      continue;
-    }
-    D3D12_INPUT_ELEMENT_DESC d{};
-    d.SemanticName = UsageSemantic(usage);
-    d.SemanticIndex = usage_index;
-    d.Format = fmt.format;
-    d.InputSlot = stream;
-    d.AlignedByteOffset = offset;
-    d.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-    elements.push_back(d);
-    if (record.element_count < PsoRecord::kMaxElements) {
-      auto& re = record.elements[record.element_count++];
-      re.usage = uint8_t(usage);
-      re.usage_index = uint8_t(usage_index);
-      re.slot = uint8_t(stream);
-      re.format = uint32_t(fmt.format);
-      re.offset = offset;
-    }
-  }
-
-  // The XDK patches absent attributes to constants. A zero-stride host
-  // buffer supplies the same value regardless of the draw's vertex index.
-  const auto float_inputs = VertexShaderInputs(*vs, true);
-  for (const auto& input : float_inputs) {
-    if (std::any_of(elements.begin(), elements.end(), [&](const auto& e) {
-          return input.first == e.SemanticName && input.second == e.SemanticIndex;
-        })) continue;
-    uint32_t usage = 0;
-    while (usage < 14 && input.first != UsageSemantic(usage)) ++usage;
-    if (usage == 14) continue;
-    D3D12_INPUT_ELEMENT_DESC e{};
-    e.SemanticName = UsageSemantic(usage);
-    e.SemanticIndex = input.second;
-    e.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-    e.InputSlot = 16;
-    e.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-    elements.push_back(e);
-    if (record.element_count < PsoRecord::kMaxElements) {
-      auto& re = record.elements[record.element_count++];
-      re.usage = uint8_t(usage);
-      re.usage_index = uint8_t(input.second);
-      re.slot = 16;
-      re.format = uint32_t(e.Format);
-    }
-  }
+  BuildInputLayout(base, decl, *vs, elements, &record);
   D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
   desc.pRootSignature = root_signature_.Get();
   desc.VS = {vs->data(), vs->size()};
@@ -3968,6 +4236,8 @@ uint32_t Renderer::GetTextureSrvIndex(uint8_t* base, const uint32_t fetch[6], bo
 
 void Renderer::RetireSrvIndex(uint32_t index) {
   if (index > 2) retired_srvs_.emplace_back(next_fence_value_, index);
+  if (index >= srv_generation_.size()) srv_generation_.resize(index + 1);
+  ++srv_generation_[index];  // ray-traced instances drop their colour texture
 }
 
 std::pair<uint32_t, uint32_t> Renderer::OnPhysicalWrite(void* context, uint32_t start,
@@ -4707,6 +4977,8 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
     // smooth-effects bit of the 2D index must not reach it.
     uint32_t dimension = (fetch[5] >> 9) & 3;
     s[slot] = dimension <= 1 ? srv : 0;
+    rt_tex2d_[slot] = s[slot];
+    rt_samp_[slot] = sampler;
     s[16 + slot] = dimension == 2 && srv ? srv & ~0x10000000u : 1;
     if (dimension <= 1 && srv && slot_cache_[slot].stacked_srv)
       s[16 + slot] = (srv & 0x8FFF0000u) | slot_cache_[slot].stacked_srv | 0x10000000u;
@@ -5298,6 +5570,12 @@ bool Renderer::PrepareDraw(uint8_t* base, uint32_t dev, uint32_t prim,
   }
   ApplyFixedFunctionState(base, dev);
   command_list_->SetPipelineState(pso);
+  rt_so_target_.decl = decl;
+  rt_so_target_.rt_count = rt_count;
+  std::copy(rtv_formats, rtv_formats + 4, rt_so_target_.rtv);
+  rt_so_target_.dsv = dsv_format;
+  rt_so_target_.strip_cut = strip_cut;
+  rt_so_target_.pso = pso;
   const D3D12_VERTEX_BUFFER_VIEW default_view{
       default_vertex_buffer_->GetGPUVirtualAddress(), 16, 0};
   command_list_->IASetVertexBuffers(16, 1, &default_view);
@@ -5876,6 +6154,7 @@ void Renderer::ExecDrawVertices(uint8_t* base, const WorkBatch& batch, const Wor
     ++stats_.draws_skipped; ++stats_.pass_skips[g_current_pass & 31];
     return;
   }
+  RtLogSkinnedDraw(current_vs_hash_, "non-indexed", prim, int(topology), quads);
   if (!REXCVAR_GET(sr_native_debug_vs).empty() &&
       current_vs_hash_ == std::strtoull(REXCVAR_GET(sr_native_debug_vs).c_str(), nullptr, 16)) {
     static int logged = 0;
@@ -5944,6 +6223,7 @@ void Renderer::ExecDrawIndexedVertices(uint8_t* base, const WorkBatch& batch,
     ++stats_.draws_skipped; ++stats_.pass_skips[g_current_pass & 31];
     return;
   }
+  RtLogSkinnedDraw(current_vs_hash_, "indexed", prim, int(topology), quads);
   if (quads) {
     UploadAlloc tris;
     if (!Upload(size_t(quad_indices) * 4, 4, tris)) return;
@@ -5975,8 +6255,9 @@ void Renderer::ExecDrawIndexedVertices(uint8_t* base, const WorkBatch& batch,
   if (!SkipGpuDraw()) command_list_->DrawIndexedInstanced(index_count, 1, start_index, base_vertex, 0);
   ++stats_.draws; ++trace_draws_; Breadcrumb();
   ++stats_.pass_draws[g_current_pass & 31];
-  if (topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
-    RtCaptureDraw(base, batch, cmd, ib, start_index, index_count, base_vertex);
+  if (topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST || topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
+    RtCaptureDraw(base, batch, cmd, ib, start_index, index_count, base_vertex,
+                  topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 }
 
 // Xenos rectangle list: every 3 vertices describe a rectangle. As in Xenia's
@@ -6661,9 +6942,9 @@ void Renderer::EndFrameAndPresent(uint32_t front_buffer_address) {
   if (const int32_t cycle = REXCVAR_GET(sr_rt_shadow_debug_cycle);
       cycle > 0 && REXCVAR_GET(sr_rt_measure_at_s) > 0 &&
       compat::BenchElapsedMs() >= REXCVAR_GET(sr_rt_measure_at_s) * 1000.0) {
-    const uint64_t c = uint64_t(cycle);
-    if (!rt_measure_base_ && swap_number_ % (4 * c) == c / 2) rt_measure_base_ = swap_number_;
-    if (rt_measure_base_ && swap_number_ <= rt_measure_base_ + 3 * c &&
+    const uint64_t c = uint64_t(cycle), n = RtDebugModes().size();
+    if (!rt_measure_base_ && swap_number_ % (n * c) == c / 2) rt_measure_base_ = swap_number_;
+    if (rt_measure_base_ && swap_number_ <= rt_measure_base_ + (n - 1) * c &&
         (swap_number_ - rt_measure_base_) % c == 0) {
       DumpFrameResources("m" + std::to_string(RtDebugMode()) + "_");
       REXLOG_INFO("native: rt measure: dumped swap {} (debug mode {})", swap_number_, RtDebugMode());
