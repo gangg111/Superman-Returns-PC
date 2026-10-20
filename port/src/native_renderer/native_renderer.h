@@ -460,7 +460,8 @@ class Renderer : public NativeFrontend {
   static constexpr uint32_t kRtTlasSrv = kSrvHeapSize - 1;
   static constexpr uint32_t kRtMaterialSrv = kSrvHeapSize - 3;  // per TLAS instance (reflections)
   static constexpr uint32_t kRtUvSrv = kSrvHeapSize - 4;        // mesh texture coordinates (reflections)
-  static constexpr uint32_t kSrvAllocLimit = kSrvHeapSize - 4;
+  static constexpr uint32_t kRtSkinSrv0 = kSrvHeapSize - 5;  // character buffers 0 and 1 (-6)
+  static constexpr uint32_t kSrvAllocLimit = kSrvHeapSize - 6;
   static constexpr uint32_t kSamplerHeapSize = 2048;
   static constexpr uint32_t kRtvHeapSize = 256;
   static constexpr uint32_t kDsvHeapSize = 64;
@@ -555,6 +556,7 @@ class Renderer : public NativeFrontend {
     uint32_t palette_comp = 0;
     float palette_scale = 0.0f;
   };
+  bool RtDrawMaterial(int32_t captured_uv_interp, RtMaterial& out);
   struct RtMesh {
     Microsoft::WRL::ComPtr<ID3D12Resource> blas;
     Microsoft::WRL::ComPtr<ID3D12Resource> indices;  // own index buffer (instanced meshes)
@@ -579,7 +581,8 @@ class Renderer : public NativeFrontend {
   // The city shaders' lighting tone: gShadCol rgb, Kramp_lo_hi_Kao.x, ramp_col_exp rgb, valid.
   float rt_tone_[8] = {};
   ID3D12PipelineState* RtSoPipeline(uint8_t* base, const char* semantic, uint32_t index, uint32_t components,
-                                    int32_t second_texcoord = -2);
+                                    const char* semantic2 = nullptr, uint32_t index2 = 0, uint32_t components2 = 0);
+  int32_t RtDrawUvInterp() const;
   bool RtSoBeginDraw();
   void RtUploadMaterials(const void* data, size_t bytes);
   void RtUploadPalettes();
@@ -619,10 +622,23 @@ class Renderer : public NativeFrontend {
   bool RtBuildSkinnedBlas();
   bool RtEnsureScratch(uint64_t size);
   std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> rt_so_pipelines_;
-  Microsoft::WRL::ComPtr<ID3D12Resource> rt_so_buffer_, rt_so_counters_, rt_skin_blas_;
+  // Character stream output, 32 bytes a vertex (UV interpolant, light-space
+  // position): written in one buffer while the other holds the previous
+  // frame's, which the BLAS was built from and the reflection hits read.
+  Microsoft::WRL::ComPtr<ID3D12Resource> rt_so_buffers_[2];
+  D3D12_RESOURCE_STATES rt_so_states_[2] = {D3D12_RESOURCE_STATE_STREAM_OUT, D3D12_RESOURCE_STATE_STREAM_OUT};
+  uint32_t rt_so_write_ = 0, rt_skin_read_ = 0;
+  Microsoft::WRL::ComPtr<ID3D12Resource> rt_so_counters_, rt_skin_blas_;
   uint64_t rt_skin_blas_size_ = 0, rt_so_cursor_ = 0, rt_so_swap_ = 0;
   uint32_t rt_so_draws_ = 0;
-  std::vector<std::pair<uint64_t, uint32_t>> rt_so_pending_;  // (byte offset, vertices)
+  struct RtSkinDraw {
+    uint64_t offset;  // bytes into the character buffer
+    uint32_t vertices;
+    RtMaterial material;
+    bool has_material;
+  };
+  std::vector<RtSkinDraw> rt_so_pending_;  // this frame's character draws
+  std::vector<RtSkinDraw> rt_skin_draws_;  // the ones the current character BLAS holds
   float rt_skin_transform_[12] = {};  // inverse light rows of the captured frame
   float rt_frame_inv_[12] = {};       // inverse light rows of this frame (light space to world)
   bool rt_skin_ready_ = false;

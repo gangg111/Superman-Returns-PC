@@ -330,14 +330,30 @@ bool Renderer::RtBuildCityTlas(const float anchor[3]) {
     d.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
     d.AccelerationStructure = mesh->second.blas->GetGPUVirtualAddress();
     descs.push_back(d);
-    if (descs.size() >= 32768) break;
+    if (descs.size() >= 31744) break;  // room for the character draws' materials
   }
   if (rt_skin_ready_ && !(excluded & 8)) {
     D3D12_RAYTRACING_INSTANCE_DESC d{};
     std::memcpy(d.Transform, rt_skin_transform_, sizeof(d.Transform));
+    // One material per character draw (the BLAS geometries, GeometryIndex);
+    // their texture coordinates are in the character buffer (tint flag bit 11).
+    // Mask 1: real geometry, nothing duplicates it.
     d.InstanceID = UINT(materials.size());
-    d.InstanceMask = 0x02;
-    materials.push_back(kNone);
+    d.InstanceMask = 0x01;
+    for (const RtSkinDraw& draw : rt_skin_draws_) {
+      Material mat = kNone;
+      const RtMaterial& m = draw.material;
+      if (draw.has_material && m.albedo != kRtNoAlbedo && SrvGeneration(m.albedo & 0x7FFFu) == m.albedo_gen) {
+        mat.texture = m.albedo;
+        mat.comps_sampler = m.uv_comps | (m.sampler << 8);
+        mat.tint_flags = 1u << 11;
+        if (m.uv_interp >= 0) {
+          mat.uv_base = uint32_t(draw.offset / 32);
+          std::memcpy(mat.uv, m.uv, sizeof(mat.uv));
+        }
+      }
+      materials.push_back(mat);
+    }
     d.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
     d.AccelerationStructure = rt_skin_blas_->GetGPUVirtualAddress();
     descs.push_back(d);
@@ -445,7 +461,7 @@ bool Renderer::RtEnsureScratch(uint64_t size) {
 }
 
 namespace {
-constexpr uint64_t kSoBytes = 32ull << 20;          // stream-output soup of one frame
+constexpr uint64_t kSoBytes = 64ull << 20;          // character stream output of one frame (32 B a vertex)
 constexpr uint32_t kSoSlots = 1024, kSoSlotBytes = 16;  // filled-size counter per captured draw
 }  // namespace
 
@@ -470,31 +486,60 @@ void Renderer::RtCaptureSkinned(uint8_t* base, uint32_t u, uint32_t v, uint32_t 
     }
   }
   const uint32_t vertices = so_vertices;
-  if (!vertices || rt_so_cursor_ + uint64_t(vertices) * 12 > kSoBytes) {
+  if (!vertices || rt_so_cursor_ + uint64_t(vertices) * 32 > kSoBytes) {
     ++rt_stats_.skip_skinned;
     return;
   }
-  if (!rt_so_buffer_) {
-    rt_so_buffer_ = MakeBuffer(device_, kSoBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_STREAM_OUT, false);
-    if (!rt_so_buffer_) return;
+  if (!rt_so_buffers_[0]) {
+    for (uint32_t i = 0; i < 2; ++i) {
+      rt_so_buffers_[i] = MakeBuffer(device_, kSoBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_STREAM_OUT,
+                                     false);
+      if (!rt_so_buffers_[i]) {
+        rt_so_buffers_[0].Reset();
+        rt_so_buffers_[1].Reset();
+        return;
+      }
+      rt_so_states_[i] = D3D12_RESOURCE_STATE_STREAM_OUT;
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+      srv.Format = DXGI_FORMAT_R32_TYPELESS;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      srv.Buffer.NumElements = UINT(kSoBytes / 4);
+      srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+      device_->CreateShaderResourceView(
+          rt_so_buffers_[i].Get(), &srv,
+          provider_->OffsetViewDescriptor(srv_heap_->GetCPUDescriptorHandleForHeapStart(), kRtSkinSrv0 - i));
+    }
   }
-  ID3D12PipelineState* pso = RtSoPipeline(base, "SRLIGHT", 0, 3);
+  // Each vertex: the pixel shader's UV interpolant (SV_Position as filler
+  // without one), then SRLIGHT0, the light-space position after skinning.
+  const int32_t uv_interp = RtDrawUvInterp();
+  ID3D12PipelineState* pso = uv_interp >= 0 ? RtSoPipeline(base, "TEXCOORD", uint32_t(uv_interp), 4, "SRLIGHT", 0, 4)
+                                            : RtSoPipeline(base, "SV_Position", 0, 4, "SRLIGHT", 0, 4);
   if (!pso || !RtSoBeginDraw()) return;
+  ID3D12Resource* buffer = rt_so_buffers_[rt_so_write_].Get();
+  Transition(buffer, rt_so_states_[rt_so_write_], D3D12_RESOURCE_STATE_STREAM_OUT);
   if (rt_so_pending_.empty()) std::memcpy(rt_skin_transform_, rt_frame_inv_, sizeof(rt_skin_transform_));
-  RtSoDraw(pso, rt_so_buffer_->GetGPUVirtualAddress() + rt_so_cursor_, uint64_t(vertices) * 12, true,
-           index_count, start_index, base_vertex);
-  rt_so_pending_.emplace_back(rt_so_cursor_, vertices);
-  rt_so_cursor_ += uint64_t(vertices) * 12;
+  RtSoDraw(pso, buffer->GetGPUVirtualAddress() + rt_so_cursor_, uint64_t(vertices) * 32, true, index_count,
+           start_index, base_vertex);
+  RtSkinDraw draw{rt_so_cursor_, vertices, {}, false};
+  draw.has_material = RtDrawMaterial(uv_interp, draw.material);
+  static std::unordered_set<uint64_t> logged_ps;
+  if (logged_ps.size() < 16 && logged_ps.insert(current_ps_hash_).second)
+    REXLOG_INFO("native: rt character ps {:016X}: uv interpolant {}, material {} (texture {:X} uv {})",
+                current_ps_hash_, uv_interp, draw.has_material, draw.material.albedo, draw.material.uv_interp);
+  rt_so_pending_.push_back(draw);
+  rt_so_cursor_ += uint64_t(vertices) * 32;
   ++rt_stats_.skinned_draws;
 }
 
 // The stream-output pipeline repeating the current draw: its vertex shader,
 // input layout and target formats, nothing rasterised, one output element
 // (semantic + index, the first `components` components).
-// second_texcoord: -2 = one element; else a second TEXCOORD<n> element of 4
-// components after it (-1 = a 4-component gap).
+// semantic2: an optional second element after the first (stride = both).
 ID3D12PipelineState* Renderer::RtSoPipeline(uint8_t* base, const char* semantic, uint32_t index,
-                                            uint32_t components, int32_t second_texcoord) {
+                                            uint32_t components, const char* semantic2, uint32_t index2,
+                                            uint32_t components2) {
   const uint32_t decl = rt_so_target_.decl;
   uint64_t key = current_vs_hash_;
   auto mix = [&key](uint64_t x) { key ^= x + 0x9E3779B97F4A7C15ull + (key << 6) + (key >> 2); };
@@ -506,7 +551,8 @@ ID3D12PipelineState* Renderer::RtSoPipeline(uint8_t* base, const char* semantic,
   mix(uint64_t(rt_so_target_.strip_cut));
   for (const char* c = semantic; *c; ++c) mix(uint64_t(uint8_t(*c)));
   mix((uint64_t(index) << 8) | components);
-  mix(uint64_t(int64_t(second_texcoord)));
+  for (const char* c = semantic2 ? semantic2 : ""; *c; ++c) mix(uint64_t(uint8_t(*c)));
+  mix((uint64_t(index2) << 8) | components2);
   auto [pit, fresh] = rt_so_pipelines_.try_emplace(key);
   if (fresh) {
     const std::vector<uint8_t>* vs = LoadShader(current_vs_hash_, true);
@@ -516,17 +562,15 @@ ID3D12PipelineState* Renderer::RtSoPipeline(uint8_t* base, const char* semantic,
     }
     std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
     BuildInputLayout(base, decl, *vs, elements, nullptr);
-    // -1: the second 16 bytes get SV_Position as filler (a gap entry or a stride
-    // larger than the elements hung the GPU on the first stream-output draw).
     const D3D12_SO_DECLARATION_ENTRY so[2] = {
         {0, semantic, index, 0, uint8_t(components), 0},
-        {0, second_texcoord >= 0 ? "TEXCOORD" : "SV_Position", UINT(std::max(second_texcoord, 0)), 0, 4, 0}};
-    const UINT stride = components * 4 + (second_texcoord >= -1 ? 16 : 0);
+        {0, semantic2, index2, 0, uint8_t(components2), 0}};
+    const UINT stride = (components + (semantic2 ? components2 : 0)) * 4;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = root_signature_.Get();
     desc.VS = {vs->data(), vs->size()};
     desc.InputLayout = {elements.data(), uint32_t(elements.size())};
-    desc.StreamOutput = {so, second_texcoord >= -1 ? 2u : 1u, &stride, 1, D3D12_SO_NO_RASTERIZED_STREAM};
+    desc.StreamOutput = {so, semantic2 ? 2u : 1u, &stride, 1, D3D12_SO_NO_RASTERIZED_STREAM};
     for (auto& rt : desc.BlendState.RenderTarget) {
       rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ONE;
       rt.DestBlend = rt.DestBlendAlpha = D3D12_BLEND_ZERO;
@@ -631,7 +675,9 @@ void Renderer::RtCaptureUv(RtMesh& mesh, uint8_t* base, int32_t interp, int32_t 
         rt_uv_pool_.Get(), &srv,
         provider_->OffsetViewDescriptor(srv_heap_->GetCPUDescriptorHandleForHeapStart(), kRtUvSrv));
   }
-  ID3D12PipelineState* pso = RtSoPipeline(base, "TEXCOORD", uint32_t(interp), 4, palette_interp);
+  ID3D12PipelineState* pso =
+      RtSoPipeline(base, "TEXCOORD", uint32_t(interp), 4, palette_interp >= 0 ? "TEXCOORD" : "SV_Position",
+                   uint32_t(std::max(palette_interp, 0)), 4);
   if (!pso || !RtSoBeginDraw()) return;
   Transition(rt_uv_pool_.Get(), rt_uv_state_, D3D12_RESOURCE_STATE_STREAM_OUT);
   RtSoDraw(pso, rt_uv_pool_->GetGPUVirtualAddress() + rt_uv_cursor_ * 32, uint64_t(vertices) * 32, indexed,
@@ -651,7 +697,8 @@ void Renderer::RtCaptureUv(RtMesh& mesh, uint8_t* base, int32_t interp, int32_t 
 // consumed earlier on this queue.
 bool Renderer::RtBuildSkinnedBlas() {
   rt_skin_ready_ = false;
-  if (rt_so_pending_.empty() || !rt_so_buffer_) return false;
+  if (rt_so_pending_.empty() || !rt_so_buffers_[0]) return false;
+  ID3D12Resource* buffer = rt_so_buffers_[rt_so_write_].Get();
   if ((!rt_device_ && FAILED(device_->QueryInterface(IID_PPV_ARGS(&rt_device_)))) ||
       (!rt_list_ && FAILED(command_list_.As(&rt_list_)))) {
     return false;
@@ -662,13 +709,14 @@ bool Renderer::RtBuildSkinnedBlas() {
     D3D12_RAYTRACING_GEOMETRY_DESC& g = geometry[i];
     g.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
     g.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-    g.Triangles.VertexBuffer.StartAddress = rt_so_buffer_->GetGPUVirtualAddress() + rt_so_pending_[i].first;
-    g.Triangles.VertexBuffer.StrideInBytes = 12;
+    g.Triangles.VertexBuffer.StartAddress = buffer->GetGPUVirtualAddress() + rt_so_pending_[i].offset + 16;
+    g.Triangles.VertexBuffer.StrideInBytes = 32;
     g.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-    g.Triangles.VertexCount = rt_so_pending_[i].second;
-    triangles += rt_so_pending_[i].second / 3;
+    g.Triangles.VertexCount = rt_so_pending_[i].vertices;
+    triangles += rt_so_pending_[i].vertices / 3;
   }
   const size_t draws = rt_so_pending_.size();
+  rt_skin_draws_.swap(rt_so_pending_);
   rt_so_pending_.clear();
   rt_so_cursor_ = 0;
   D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
@@ -690,8 +738,9 @@ bool Renderer::RtBuildSkinnedBlas() {
       return false;
     }
   }
-  D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_STREAM_OUT;
-  Transition(rt_so_buffer_.Get(), state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  // Read by the build and, this frame, by the reflection hits (texture coordinates).
+  Transition(buffer, rt_so_states_[rt_so_write_],
+             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
   D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build{};
   build.Inputs = inputs;
   build.DestAccelerationStructureData = rt_skin_blas_->GetGPUVirtualAddress();
@@ -701,7 +750,8 @@ bool Renderer::RtBuildSkinnedBlas() {
   uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
   uav.UAV.pResource = nullptr;  // scratch reuse and the TLAS build
   rt_list_->ResourceBarrier(1, &uav);
-  Transition(rt_so_buffer_.Get(), state, D3D12_RESOURCE_STATE_STREAM_OUT);
+  rt_skin_read_ = rt_so_write_;
+  rt_so_write_ ^= 1u;
   rt_skin_ready_ = true;
   static uint64_t last_log = 0;
   if (swap_number_ >= last_log + 600) {

@@ -2421,6 +2421,7 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   // Bytes 112..143: the city's lighting tone (shadow colour, ramp strength,
   // ramp colour, valid) for reflection hits.
   std::memcpy(&data[28], rt_tone_, sizeof(rt_tone_));
+  data[36] = rt_skin_read_;  // which character buffer the reflection hits read (kRtSkinSrv0 - n)
   Transition(rt_frame_buffer_.Get(), rt_frame_state_, D3D12_RESOURCE_STATE_COPY_DEST);
   command_list_->CopyBufferRegion(rt_frame_buffer_.Get(), 0, up.resource, up.offset, 256);
   Transition(rt_frame_buffer_.Get(), rt_frame_state_,
@@ -2753,19 +2754,11 @@ void Renderer::RtDumpObj(uint8_t* base, uint32_t vertex0, uint32_t stride, const
   std::fflush(obj);
 }
 
-// A TLAS instance of a captured mesh with its world matrix. The same mesh and
-// matrix again keeps when it was first seen (static objects accumulate age;
-// moving ones get a new key every frame).
-void Renderer::RtAddInstance(const RtInstance& instance) {
-  auto mit = rt_meshes_.find(instance.mesh);
-  if (mit == rt_meshes_.end()) return;
-  mit->second.last_swap = swap_number_;
-  auto [iit, inserted] = rt_city_instances_.try_emplace(RtInstanceKey(instance), instance);
-  if (inserted) iit->second.first_swap = swap_number_;
-  iit->second.last_swap = swap_number_;
-  // The draw's colour texture (its pixel shader's *col_map slot).
-  // Draws without a colour texture (the shadow pass, which also draws what is
-  // outside the view) leave the material the copy or the mesh already has.
+// The material of the current draw for reflection hits, from its pixel
+// shader's tables (tint blend with palette, or the colour texture alone);
+// texture coordinates only when captured_uv_interp (the interpolant captured
+// with the mesh) is the one the pixel shader uses. False: no colour texture.
+bool Renderer::RtDrawMaterial(int32_t captured_uv_interp, RtMaterial& in) {
   const float* pc = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase) + 1024;
   auto value = [pc](const AlbedoScalar& sc) { return sc.reg < 0 ? sc.value : pc[sc.reg * 4 + sc.comp]; };
   // A bound 2D texture of this draw: SRV index | 0x8000 for PWL gamma (0 = none).
@@ -2774,7 +2767,6 @@ void Renderer::RtAddInstance(const RtInstance& instance) {
     const uint32_t srv = rt_tex2d_[slot], index = srv & 0x7FFFu;
     return index > 2 ? index | (srv & 0x80000000u ? 0x8000u : 0u) : 0;
   };
-  RtMaterial in;
   bool found = false;
   if (const TintRegs* t = RtTintFor(current_ps_hash_); t && texture(int32_t(t->mask_slot))) {
     // Building shaders: mask * tints (* tint * colour texture), all at the mask's UV.
@@ -2809,7 +2801,7 @@ void Renderer::RtAddInstance(const RtInstance& instance) {
         rt_tone_[7] = 1.0f;
       }
     }
-    if (t->interp >= 0 && mit->second.uv_interp == t->interp) {
+    if (t->interp >= 0 && captured_uv_interp == t->interp) {
       in.uv_interp = t->interp;
       in.uv_comps = t->cu | (t->cv << 2);
       in.uv[0] = value(t->scale_u);
@@ -2818,21 +2810,12 @@ void Renderer::RtAddInstance(const RtInstance& instance) {
       in.uv[3] = value(t->offset_v);
     }
     found = true;
-    static std::unordered_set<uint64_t> logged_tint_ps;
-    if (logged_tint_ps.size() < 8 && logged_tint_ps.insert(current_ps_hash_).second) {
-      REXLOG_INFO("native: rt tint material ps {:016X}: R ({:.3f} {:.3f} {:.3f}) G ({:.3f} {:.3f} {:.3f}) "
-                  "B ({:.3f} {:.3f} {:.3f}) tint ({:.3f} {:.3f} {:.3f}) uv x({:.3f} {:.3f}) +({:.3f} {:.3f}) "
-                  "mask {:X} col {:X} flags {:X}", current_ps_hash_, in.tints[0][0], in.tints[0][1], in.tints[0][2],
-                  in.tints[1][0], in.tints[1][1], in.tints[1][2], in.tints[2][0], in.tints[2][1], in.tints[2][2],
-                  in.tints[3][0], in.tints[3][1], in.tints[3][2], in.uv[0], in.uv[1], in.uv[2], in.uv[3], in.mask,
-                  in.albedo, in.tint_flags);
-    }
   } else if (const AlbedoRegs* ait = RtAlbedoFor(current_ps_hash_); ait && texture(int32_t(ait->slot))) {
     // Other materials: the colour texture alone.
     in.albedo = texture(int32_t(ait->slot));
     in.albedo_gen = SrvGeneration(in.albedo & 0x7FFFu);
     in.sampler = rt_samp_[ait->slot];
-    if (ait->interp >= 0 && mit->second.uv_interp == ait->interp) {
+    if (ait->interp >= 0 && captured_uv_interp == ait->interp) {
       in.uv_interp = ait->interp;
       in.uv_comps = ait->cu | (ait->cv << 2);
       in.uv[0] = value(ait->scale_u);
@@ -2842,7 +2825,26 @@ void Renderer::RtAddInstance(const RtInstance& instance) {
     }
     found = true;
   }
-  if (found) {
+  return found;
+}
+
+// The UV interpolant of the current draw's pixel shader (-1: none).
+int32_t Renderer::RtDrawUvInterp() const { return RtUvInterp(current_ps_hash_); }
+
+// A TLAS instance of a captured mesh with its world matrix. The same mesh and
+// matrix again keeps when it was first seen (static objects accumulate age;
+// moving ones get a new key every frame).
+void Renderer::RtAddInstance(const RtInstance& instance) {
+  auto mit = rt_meshes_.find(instance.mesh);
+  if (mit == rt_meshes_.end()) return;
+  mit->second.last_swap = swap_number_;
+  auto [iit, inserted] = rt_city_instances_.try_emplace(RtInstanceKey(instance), instance);
+  if (inserted) iit->second.first_swap = swap_number_;
+  iit->second.last_swap = swap_number_;
+  // Draws without a colour texture (the shadow pass, which also draws what is
+  // outside the view) leave the material the copy or the mesh already has.
+  RtMaterial in;
+  if (RtDrawMaterial(mit->second.uv_interp, in)) {
     iit->second.material = in;
     mit->second.material = in;
   }

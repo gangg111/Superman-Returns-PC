@@ -1,0 +1,62 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 59e7292..2089ba2 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -242,6 +242,7 @@ ByteAddressBuffer g_RtBuffers[] : register(t0, space9);
+ #define SR_RT_FRAME_INDEX 32766
+ #define SR_RT_MATERIAL_INDEX 32765  // per TLAS instance: uv base, texture, uv comps | sampler, uv scale/offset
+ #define SR_RT_UV_INDEX 32764        // mesh interpolants, 3 x 32 bytes per triangle (BLAS primitive order)
++#define SR_RT_SKIN_INDEX0 32763    // character stream output (buffer 0; buffer 1 at 32762)
+ #define SR_RT_PALETTE_OFFSET (32769 * 128)  // building palettes after the material entries (8 float4 each)
+ uint srRtDebug() { return g_RtBuffers[SR_RT_FRAME_INDEX].Load(68) != 0 ? g_RtBuffers[SR_RT_FRAME_INDEX].Load(64) : 0; }
+ float3 srRtWorldPos(float3 lightCoord)
+@@ -380,7 +381,7 @@ bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id, out u
+     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+     {
+         t = q.CommittedRayT();
+-        id = q.CommittedInstanceID();
++        id = q.CommittedInstanceID() + q.CommittedGeometryIndex();  // one material per BLAS geometry
+         prim = q.CommittedPrimitiveIndex();
+         bary = q.CommittedTriangleBarycentrics();
+         return true;
+@@ -391,7 +392,7 @@ bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id, out u
+     if (q2.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+     {
+         t = q2.CommittedRayT();
+-        id = q2.CommittedInstanceID();
++        id = q2.CommittedInstanceID() + q2.CommittedGeometryIndex();
+         prim = q2.CommittedPrimitiveIndex();
+         bary = q2.CommittedTriangleBarycentrics();
+         return true;
+@@ -629,10 +630,14 @@ void srRtHitMaterial(bool hit, uint id, uint prim, float2 bary, out uint4 m, out
+     ByteAddressBuffer materials = g_RtBuffers[SR_RT_MATERIAL_INDEX];
+     m = materials.Load4(id * 128);
+     m1 = materials.Load4(id * 128 + 16);
+-    bool tinted = (m1.y & (1u << 9)) != 0;
+-    if ((m.y == 0xFFFFFFu && !tinted) || m.x == 0xFFFFFFFFu || (!tinted && !srRtReflectionDetail()))
++    bool tinted = (m1.y & (1u << 9)) != 0, character = (m1.y & (1u << 11)) != 0;
++    if ((m.y == 0xFFFFFFu && !tinted) || m.x == 0xFFFFFFFFu || (!tinted && !character && !srRtReflectionDetail()))
+         return;
+-    ByteAddressBuffer pool = g_RtBuffers[SR_RT_UV_INDEX];
++    // Characters (bit 11): the previous frame's character buffer (byte 144 picks
++    // which), 32 bytes a vertex like the mesh pool.
++    ByteAddressBuffer pool = (m1.y & (1u << 11))
++        ? g_RtBuffers[SR_RT_SKIN_INDEX0 - g_RtBuffers[SR_RT_FRAME_INDEX].Load(144)]
++        : g_RtBuffers[SR_RT_UV_INDEX];
+     uint b = (m.x + prim * 3) * 32;
+     float w0 = 1.0 - bary.x - bary.y;
+     float4 a = asfloat(pool.Load4(b)) * w0 + asfloat(pool.Load4(b + 32)) * bary.x + asfloat(pool.Load4(b + 64)) * bary.y;
+@@ -751,9 +756,11 @@ float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData)
+     }
+     float sun = srRtVisibility(origin + dir * t);
+     float3 color = srRtHitAlbedo(id, m, m1, uv, hasUv, palSrc, dx, dy) * srRtHitLight(sun);
+-    // Debug 7: the hit's path (red: tint blend, green: colour texture, blue: no material),
++    // Debug 7: the hit's path (red: tint blend, green: colour texture, blue: no material
+     // brighter with texture coordinates.
+-    float3 path = (m1.y & (1u << 9)) ? float3(1, 0, 0) : m.y != 0xFFFFFFu ? float3(0, 1, 0) : float3(0, 0, 1);
++    // (yellow: a character)
++    float3 path = (m1.y & (1u << 11)) ? float3(1, 1, 0) : (m1.y & (1u << 9)) ? float3(1, 0, 0)
++                : m.y != 0xFFFFFFu ? float3(0, 1, 0) : float3(0, 0, 1);
+     g_srRtReflectSeen = srRtDebug() == 7 ? path * (hasUv ? 1.0 : 0.5) : color;
+     return float4(color, env.a);
+ }

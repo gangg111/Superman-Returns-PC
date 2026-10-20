@@ -257,6 +257,13 @@ Brakuje: detalu tekstur (UV liczone inaczej w każdej parze shaderów) i taniej 
   danych klatki; trafienie = albedo · 1,35 · lerp(1, rampa, Kramp) · lerp(gShadCol, 1, słońce).
   Pomiar proporcji RGB: fasady 1,16 / 0,95 / 0,89, odbicia 1,28 / 0,94 / 0,78 (wcześniej szare).
   Połowa siły koloru cienia prawie nic nie zmieniła (1,26 / 0,95 / 0,79), więc zostaje wierny wzór.
+- Postacie w odbiciach (łatka 0029): miały maskę 2 i promień, który trafił budynek za nimi,
+  w ogóle ich nie widział. Teraz maska 1, a stream output postaci zapisuje 32 bajty na
+  wierzchołek (interpolant UV shadera, potem SRLIGHT0; BLAS czyta pozycję od +16) do jednego
+  z dwóch buforów na zmianę: z poprzedniej klatki budowany jest BLAS i z niego czytają UV
+  trafienia (kRtSkinSrv0/1, bajt 144). Materiał na każdy draw postaci, wybierany jako
+  InstanceID + GeometryIndex. Pomiar: 16 427 pikseli trafień w postać (tryb 7); w widoku
+  lustra Superman z teksturą kostiumu, w klatce gry jego odbicie w szybie obok.
 - Wynik w grze: szyby odbijają fasady budynków z naprzeciwka z ich wzorem zamiast nieba
   z kostki; zmienia się wyłącznie szkło. Czas GPU z odbiciami około 12,5 ms na kadr
   testowy (bez odbić wcześniej około 9,9 ms, inny przebieg).
