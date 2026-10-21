@@ -589,6 +589,7 @@ ID3D12PipelineState* Renderer::RtSoPipeline(uint8_t* base, const char* semantic,
     for (uint32_t i = 0; i < rt_so_target_.rt_count && i < 4; ++i) {
       desc.RTVFormats[i] = rt_so_target_.rtv[i] != DXGI_FORMAT_UNKNOWN ? rt_so_target_.rtv[i] : rt_so_target_.rtv[0];
     }
+    if (rt_so_target_.rt_count == 5) desc.RTVFormats[4] = kDlssMotionFormat;  // DLSS objects' motion
     desc.SampleDesc.Count = bound_samples_;
     const HRESULT hr = device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pit->second));
     if (FAILED(hr)) {

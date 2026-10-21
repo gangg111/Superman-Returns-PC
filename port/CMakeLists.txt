@@ -212,6 +212,7 @@ if(WIN32 AND EXISTS "${SR_REXGPU_SOURCE_DIR}/src/graphics/d3d12/command_processo
             ${SR_NATIVE_ROOT}/native_graphics_system.cpp
             ${SR_NATIVE_ROOT}/native_renderer.cpp
             ${SR_NATIVE_ROOT}/rt_shadows.cpp
+            ${SR_NATIVE_ROOT}/dlss.cpp
             ${SR_NATIVE_ROOT}/pm4_mirror.cpp
             ${SR_NATIVE_ROOT}/../graphics/guest/draw_state.cpp
             ${SR_NATIVE_ROOT}/../graphics/guest/captured_batch.cpp
@@ -261,6 +262,15 @@ if(WIN32 AND EXISTS "${SR_REXGPU_SOURCE_DIR}/src/graphics/d3d12/command_processo
         endif()
         target_link_libraries(superman_returns PRIVATE sr_native d3d12 dxgi dbghelp)
         target_compile_definitions(superman_returns PRIVATE ${SR_NATIVE_DEFINITIONS})
+
+        # NVIDIA DLSS (NGX SDK, .tools/dlss-sdk: tag v310.9.1 of github.com/NVIDIA/DLSS).
+        # nvngx_dlss.dll is loaded at run time from the executable's folder.
+        set(SR_DLSS_SDK "${CMAKE_CURRENT_SOURCE_DIR}/../.tools/dlss-sdk")
+        target_include_directories(sr_native PRIVATE "${SR_DLSS_SDK}/include")
+        target_link_libraries(superman_returns PRIVATE "${SR_DLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+        add_custom_command(TARGET superman_returns POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${SR_DLSS_SDK}/lib/Windows_x86_64/rel/nvngx_dlss.dll" "$<TARGET_FILE_DIR:superman_returns>")
 
         # Offline shaders packed into one blob (RCDATA 2), as in the kit.
         file(GLOB SR_NATIVE_SHADER_FILES "${SR_NATIVE_SHADER_DIR}/*.dxil")

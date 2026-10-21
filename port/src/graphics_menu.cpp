@@ -54,11 +54,13 @@ struct Row {
   const char* cvar;
   std::vector<int> values;  // empty: a bool
 };
-const std::array<Row, 4> kRows = {{
+const std::array<Row, 5> kRows = {{
     {"sr_rt_shadows", {}},
     {"sr_rt_shadow_rays", {1, 4, 8, 16, 32}},
     {"sr_rt_characters", {}},
     {"sr_rt_reflections", {}},
+    // Off, Performance, Balanced, Quality, DLAA (sr_dlss's own numbering differs).
+    {"sr_dlss", {0, 4, 3, 2, 1}},
 }};
 
 std::string GuestString(uint8_t* base, uint32_t address, size_t max) {
@@ -77,9 +79,11 @@ int RowIndex(const Row& row) {
   const std::string value = rex::cvar::GetFlagByName(row.cvar);
   if (row.values.empty()) return value == "true" ? 1 : 0;
   const int current = std::atoi(value.c_str());
-  // The nearest choice at or below the current value.
+  // The choice with this value, else (a value set by hand) the nearest one
+  // at or below it, the choices being ascending.
   int index = 0;
   for (size_t i = 0; i < row.values.size(); ++i) {
+    if (row.values[i] == current) return int(i);
     if (row.values[i] <= current) index = int(i);
   }
   return index;
@@ -164,7 +168,9 @@ REX_HOOK_RAW(sub_826E83D0) {
   const uint32_t name_at = ctx.r3.u32 + 8;
   const std::string name = GuestString(base, name_at, 256);
   const std::string ours = name + "_sr";
-  if (REX_KERNEL_FS()->ResolvePath(ours + ".AST")) {
+  // Only names on a device (d:\DATA\ui); the game also opens bare names that
+  // the file system cannot resolve (and warns about).
+  if (name.find(':') != std::string::npos && REX_KERNEL_FS()->ResolvePath(ours + ".AST")) {
     std::memcpy(base + name_at, ours.c_str(), ours.size() + 1);
     REXLOG_INFO("graphics menu: {}.AST opened as {}.AST", name, ours);
   } else {

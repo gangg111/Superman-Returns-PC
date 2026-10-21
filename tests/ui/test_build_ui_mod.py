@@ -58,13 +58,14 @@ def test_graphics_screen_rows(built):
         ['ScrGraphicsOpt', 'ScrGraphicsOpt', '__Packages.BistroBaseScreen', '__Packages.ScrGraphicsOpt']
     screen = m.characters()[2]
     rows = [it for it in m.frames(m.u32(screen + 16), m.u32(screen + 20))[0] if it['type'] == 3]
-    assert [r['name'] for r in rows] == ['Gfx0', 'Gfx1', 'Gfx2', 'Gfx3']
-    assert [round(r['pos'][1], 2) for r in rows] == [222.85, 255.65, 288.45, 321.25]
+    # five rows since the DLSS row (2026-10-21), 32.8 apart from Gameplay Options' top row
+    assert [r['name'] for r in rows] == ['Gfx0', 'Gfx1', 'Gfx2', 'Gfx3', 'Gfx4']
+    assert [round(r['pos'][1], 2) for r in rows] == [222.85, 255.65, 288.45, 321.25, 354.05]
     first = strings_pushed(m, rows[0]['events'][0][1])
     assert "'RT Shadows'" in first and "'On'" in first and "'Off'" in first
-    # the tab order: 0..3
+    # the tab order: one a row, top down
     tabs = [strings_pushed(m, r['events'][0][1]) for r in rows]
-    assert [t[t.index("'m_tabIndex'") + 1] for t in tabs] == ['0', '1', '2', '3']
+    assert [t[t.index("'m_tabIndex'") + 1] for t in tabs] == ['0', '1', '2', '3', '4']
 
 
 def test_graphics_screen_methods_use_the_natives(built):
@@ -73,8 +74,8 @@ def test_graphics_screen_methods_use_the_natives(built):
     items = m.frames(*m.header()['frames'])[0]
     ours = [it for it in items if it['type'] == 8 and it['sprite'] == 4][-1]
     texts = strings_pushed(m, ours['code'])
-    assert texts.count("'GetGraphicsOption'") == 4
-    assert texts.count("'SetGraphicsOption'") == 4
+    assert texts.count("'GetGraphicsOption'") == 5  # one a row
+    assert texts.count("'SetGraphicsOption'") == 5
     assert "'InitGui'" in texts and "'HandleInput'" in texts and "'ExitScreen'" in texts
     # no row of Gameplay Options left behind
     assert not any(t in texts for t in ("'YInversion'", "'Vibration'", "'SetRumble'"))
@@ -127,4 +128,5 @@ def test_texts(built):
     values = {e.get('id'): e.get('value') for e in root.iter('uitext')}
     assert values['Label_ScrGraphicsOpt'] == 'GRAPHICS OPTIONS'
     assert values['GFX_OPT_SOFTNESS_LEVELS'].split('|') == ['Hard', 'Low', 'Medium', 'High', 'Ultra']
+    assert values['GFX_OPT_DLSS_MODES'].split('|') == ['Off', 'Performance', 'Balanced', 'Quality', 'DLAA']
     assert values['Label_ScrAudioOpt'] == 'AUDIO OPTIONS'   # the game's own still there

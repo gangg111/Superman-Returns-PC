@@ -43,6 +43,7 @@ ROWS = [
      "Hard|Low|Medium|High|Ultra"),
     ("Gfx2", "GFX_OPT_CHARACTER_SHADOWS", "Character Shadows", "GFX_OPT_OFF_ON", "Off|On"),
     ("Gfx3", "GFX_OPT_RT_REFLECTIONS", "RT Reflections", "GFX_OPT_OFF_ON", "Off|On"),
+    ("Gfx4", "GFX_OPT_DLSS", "NVIDIA DLSS", "GFX_OPT_DLSS_MODES", "Off|Performance|Balanced|Quality|DLAA"),
 ]
 TEXTS = [("Label_ScrGraphicsOpt", "GRAPHICS OPTIONS")] + \
     sorted({(r[1], r[2]) for r in ROWS} | {(r[3], r[4]) for r in ROWS})

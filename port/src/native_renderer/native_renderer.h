@@ -34,6 +34,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <functional>
 #include <string>
@@ -111,6 +112,24 @@ bool ShaderCorpusAvailable(std::string* where);
 // byte arena must not zero memory that is overwritten right away (memcpy).
 using graphics::guest::DefaultInitAllocator;
 using graphics::guest::CaptureRange;
+
+// Inverse of a 4x4 matrix (row-major, 16 floats); false if singular.
+bool Invert4x4(const float m[16], float out[16]);
+
+// Guest pixel coordinate -> host pixel coordinate of a surface rendered at
+// `scale` (possibly fractional), rounded the same way everywhere.
+inline uint32_t HostPx(uint32_t v, float scale) {
+  return uint32_t(std::lround(double(v) * double(scale)));
+}
+
+// DLSS: the objects' motion target, bound as RT slot 4 for the scene's draws
+// (rt_count 5).
+constexpr DXGI_FORMAT kDlssMotionFormat = DXGI_FORMAT_R16G16_FLOAT;
+
+struct DlssState;  // dlss.cpp
+struct DlssDeleter {
+  void operator()(DlssState* state) const;  // dlss.cpp
+};
 
 class Renderer : public NativeFrontend {
  public:
@@ -377,8 +396,10 @@ class Renderer : public NativeFrontend {
     uint32_t edram_tiles = 0;
     uint64_t last_write = 0;
   };
+  // full_scale: the surface at the output scale even where DLSS draws the
+  // scene smaller (the HUD's twin of the scene depth).
   HostSurface* GetSurface(uint8_t* base, uint32_t surface_object, bool depth,
-                          uint32_t min_width = 0, uint32_t min_height = 0);
+                          uint32_t min_width = 0, uint32_t min_height = 0, bool full_scale = false);
   void Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES& state,
                   D3D12_RESOURCE_STATES after);
   bool BindRenderTargets(uint8_t* base, uint32_t dev, DXGI_FORMAT rtv_formats[4],
@@ -796,6 +817,63 @@ class Renderer : public NativeFrontend {
   rex::system::IGraphicsSystem* graphics_ = nullptr;
   uint64_t current_ps_hash_ = 0;
   uint64_t current_vs_hash_ = 0;
+
+  // DLSS (dlss.cpp): the scene is the colour surface resolved right after the
+  // full-size depth resolve that ends the 3D draws (learned each frame); its
+  // draws get a sub-pixel jitter, and at that colour resolve DLSS replaces the
+  // surface's contents before the game's post-processing reads them.
+  void DlssCaptureCamera();
+  void DlssJitter(float half_pixel[2]);
+  void DlssOnDepthResolve(HostSurface& src);
+  void DlssOnColorResolve(HostSurface& src);
+  void DlssEndFrame();
+  // Scene resolution / output resolution of the current mode (1 = off or DLAA).
+  float DlssSceneRatio() const;
+  uint32_t DlssSceneVariant() const;  // the upscaling mode (2..4), 0 at full resolution
+  // Set by DlssOnColorResolve when DLSS made an output-sized scene: the
+  // resolve copies it (its texture at the output scale) instead of the surface.
+  ID3D12Resource* dlss_resolve_source_ = nullptr;
+  // The HUD's output-scale depth twin, cleared once a frame (BindRenderTargets).
+  ID3D12Resource* dlss_twin_ = nullptr;
+  uint64_t dlss_twin_swap_ = ~0ull;
+
+  // Objects' motion (DLSS): every translated vertex shader also runs with the
+  // previous frame's VS constants of the same draw (root CBV b3, XenosRecomp
+  // patch 0030) and the pixel shader writes the difference to SV_Target4,
+  // bound to the object-motion target for the scene's draws. Draws are
+  // matched across frames by a key (shaders, vertex buffer, primitive, count,
+  // occurrence); a draw without a match marks its pixels for the camera's
+  // motion (g_SrMotionValid = 0).
+  bool DlssMotionDraw() const;  // the bound targets are the jittered scene
+  // The object-motion target's RTV, created and cleared for this frame on first
+  // use; nullptr if there is none.
+  const D3D12_CPU_DESCRIPTOR_HANDLE* DlssMotionTarget();
+  void DlssDrawKey(uint64_t vs_hash, uint64_t ps_hash, uint32_t fetch0, uint32_t prim, uint32_t count);
+  // The previous constants of this draw (uploaded) or 0, and whether they are.
+  D3D12_GPU_VIRTUAL_ADDRESS DlssPrevVsConstants(bool& valid);
+  uint32_t dlss_draw_count_ = 0;  // vertex or index count of the draw being prepared
+  uint64_t dlss_draw_key_ = 0;
+  // The draw without its vertex buffer address: a mesh rebuilt every frame in
+  // a new buffer still has the same one (DlssPrevVsConstants).
+  uint64_t dlss_draw_loose_key_ = 0;
+  std::unordered_set<uint64_t> dlss_prev_loose_, dlss_cur_loose_;
+  std::array<uint32_t, 1024> cb_vs_cpu_{};  // the current VS constants as uploaded
+  std::unordered_map<uint64_t, std::array<uint32_t, 1024>> dlss_prev_consts_, dlss_cur_consts_;
+  std::unordered_map<uint64_t, uint32_t> dlss_occurrence_;
+  bool bound_motion_ = false;
+  std::unique_ptr<DlssState, DlssDeleter> dlss_;
+  ID3D12Resource* dlss_scene_ = nullptr;     // learned in the previous frame
+  HostSurface* dlss_scene_depth_ = nullptr;  // this frame's last resolved depth
+  bool dlss_depth_just_resolved_ = false;
+  // The scene is resolved more than once a frame (the game composites its
+  // quarter-resolution particles onto it and resolves again): DLSS runs at
+  // the last one, counted the frame before.
+  int dlss_scene_resolves_ = 0, dlss_scene_resolves_prev_ = 0;
+  bool dlss_scene_done_ = false;  // DLSS ran this frame
+  bool dlss_camera_ = false, dlss_prev_camera_ = false;
+  float dlss_view_proj_[16] = {}, dlss_prev_view_proj_[16] = {};
+  float dlss_jitter_[2] = {};  // this frame's jitter, render pixels (x right, y down)
+  uint32_t dlss_frame_ = 0;
   int draw_calls_in_frame_ = 0;  // draw calls seen this frame (sr_native_dump_before_draw)
   int resolve_in_frame_ = 0;  // resolves seen this frame (sr_native_dump_before_resolve)
   // GPU hang diagnostics: WriteBufferImmediate breadcrumbs after each draw

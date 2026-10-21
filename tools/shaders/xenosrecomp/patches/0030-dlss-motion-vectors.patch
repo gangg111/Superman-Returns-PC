@@ -1,0 +1,189 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 2089ba2..25f6a0d 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -111,6 +111,7 @@ struct PushConstants
+ #define g_SoftParticleTexelScale SR_SHARED_FLOAT(476)
+ #define g_SoftParticleDepth SR_SHARED_UINT(480)
+ #define g_ShadowRange SR_SHARED_FLOAT(484)
++#define g_SrMotionValid SR_SHARED_UINT(488)
+ #define g_ColorRange SR_SHARED_FLOAT4(496)
+ #define g_SpecConstants() g_SpecConstantsRuntime
+ #else
+@@ -143,7 +144,7 @@ struct PushConstants
+     float g_AlphaThreshold : packoffset(c18.w); \
+     uint4 g_VertexFetchArr[224] : packoffset(c32); \
+     uint4 g_LoopConstantsArr[8] : packoffset(c19); \
+-    float4 g_ScreenXform : packoffset(c27);     uint g_SpecConstantsRuntime : packoffset(c28.x); float g_PixelPosScale : packoffset(c28.y); float g_ShadowAtlasTexelScale : packoffset(c28.z); float g_ShadowSoftness : packoffset(c28.w); float2 g_SoftParticleW : packoffset(c29.x); float g_SoftParticleDistance : packoffset(c29.z); float g_SoftParticleTexelScale : packoffset(c29.w); uint g_SoftParticleDepth : packoffset(c30.x); float g_ShadowRange : packoffset(c30.y); float4 g_ColorRange : packoffset(c31);
++    float4 g_ScreenXform : packoffset(c27);     uint g_SpecConstantsRuntime : packoffset(c28.x); float g_PixelPosScale : packoffset(c28.y); float g_ShadowAtlasTexelScale : packoffset(c28.z); float g_ShadowSoftness : packoffset(c28.w); float2 g_SoftParticleW : packoffset(c29.x); float g_SoftParticleDistance : packoffset(c29.z); float g_SoftParticleTexelScale : packoffset(c29.w); uint g_SoftParticleDepth : packoffset(c30.x); float g_ShadowRange : packoffset(c30.y); uint g_SrMotionValid : packoffset(c30.z); float4 g_ColorRange : packoffset(c31);
+ 
+ #define g_Booleans(i) (g_BooleansArr[(i) / 4][(i) % 4])
+ #define g_VertexFetch(i) (g_VertexFetchArr[i])
+@@ -165,6 +166,24 @@ uint g_SpecConstants();
+ #define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
+ #endif
+ 
++#ifdef CONAN_RECOMP
++// Motion vectors for DLSS: the pixel's motion in NDC, previous minus current,
++// from the clip positions the vertex shader computed with the previous and the
++// current constants of its draw. 65000 in x marks "no history of this draw"
++// (g_SrMotionValid = 0: the host found no such draw the frame before, or the
++// pixel was behind the previous camera): the host's camera motion fills it.
++float4 srMotionNdcFor(float4 prev, float4 cur, uint valid)
++{
++    if (valid == 0)
++        return float4(65000.0, 0.0, 0.0, 0.0);
++    // 64000: a previous position behind the camera (also "use the camera").
++    if (prev.w <= 0.0 || cur.w <= 0.0)
++        return float4(64000.0, 0.0, 0.0, 0.0);
++    return float4(prev.xy / prev.w - cur.xy / cur.w, 0.0, 0.0);
++}
++#define srMotionNdc(PREV, CUR) srMotionNdcFor(PREV, CUR, g_SrMotionValid)
++#endif
++
+ #ifdef CONAN_RECOMP
+ // xenos::LoopConstant: aL = start + iteration * step.
+ // Macros take the 32-bit loop constant value: g_LoopConstant(id), or a literal
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 6753a1f..910fc26 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -1435,6 +1435,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                                    "shadowMapOffsetScales") == 0;
+     }
+     srShadowReceiverShader = srShadowReceiver && isPixelShader;
++    // Motion vectors: set by main around its run with the previous constants
++    // (SPIR-V has no previous constants: both runs read the current ones).
++    if (!isPixelShader)
++        out += "static bool srPrevConsts = false;\n\n";
+ #endif
+ 
+     out += "#ifdef __spirv__\n\n";
+@@ -1569,7 +1573,20 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         out += "{\n";
+         println("\tfloat4 g_{}ShaderConstantsArr[256] : packoffset(c0);", stageName);
+         out += "};\n\n";
+-        println("#define CONST_REL(INDEX) select((uint)(INDEX) < 256, g_{}ShaderConstantsArr[min((uint)(INDEX), 255)], 0.0)", stageName);
++        // Motion vectors (DLSS): the vertex shader also runs with the previous
++        // frame's constants of the same draw (b3), chosen by srPrevConsts.
++        // Every constant read below goes through VSC().
++        const char* constArr = isPixelShader ? "g_PixelShaderConstantsArr" : "srVsc";
++        if (!isPixelShader)
++        {
++            out += "cbuffer PrevVertexShaderConstants : register(b3, space4)\n{\n"
++                   "\tfloat4 g_VertexShaderConstantsPrevArr[256] : packoffset(c0);\n};\n\n"
++                   "float4 srVsc(uint i) { return srPrevConsts ? g_VertexShaderConstantsPrevArr[i] : g_VertexShaderConstantsArr[i]; }\n\n";
++        }
++        auto constAt = [&](const std::string& index) {
++            return isPixelShader ? fmt::format("{}[{}]", constArr, index) : fmt::format("srVsc({})", index);
++        };
++        println("#define CONST_REL(INDEX) select((uint)(INDEX) < 256, {}, 0.0)", constAt("min((uint)(INDEX), 255)"));
+         for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
+         {
+             const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
+@@ -1580,9 +1597,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             if (constantInfo->registerCount > 1)
+                 println("#define {}(INDEX) CONST_REL({} + (INDEX))", constantName, constantInfo->registerIndex.get());
+             else if (srShadowReceiverShader && strcmp(constantName, "depthBias_FadeRange_FalloffStart_FalloffRate") == 0)
+-                println("#define {} srRtFade(g_{}ShaderConstantsArr[{}])", constantName, stageName, constantInfo->registerIndex.get());
++                println("#define {} srRtFade({})", constantName, constAt(std::to_string(constantInfo->registerIndex.get())));
+             else
+-                println("#define {} g_{}ShaderConstantsArr[{}]", constantName, stageName, constantInfo->registerIndex.get());
++                println("#define {} {}", constantName, constAt(std::to_string(constantInfo->registerIndex.get())));
+         }
+         out += "\n";
+     }
+@@ -1721,6 +1738,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         }
+ 
+     #ifdef CONAN_RECOMP
++        // Motion vectors: the clip position with the previous and the current
++        // constants, ahead of SRLIGHT0 in every vertex and pixel shader so the
++        // interpolant registers agree in every pair.
++        out += "#if defined(__spirv__) && defined(SR_VULKAN_BUFFERS)\n[[vk::location(21)]]\n#endif\n";
++        out += "\tin float4 iSrMotionPrev : SR_MOTION0,\n";
++        out += "#if defined(__spirv__) && defined(SR_VULKAN_BUFFERS)\n[[vk::location(22)]]\n#endif\n";
++        out += "\tin float4 iSrMotionCur : SR_MOTION1,\n";
+         if (srShadowReceiver)
+         {
+             out += "#if defined(__spirv__) && defined(SR_VULKAN_BUFFERS)\n[[vk::location(20)]]\n#endif\n";
+@@ -1744,6 +1768,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             out += ",\n\tout float4 oC3 : SV_Target3";
+         if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_DEPTH)
+             out += ",\n\tout float oDepth : SV_Depth";
++    #ifdef CONAN_RECOMP
++        // Written only where the host binds a motion-vector target (scene draws).
++        out += ",\n\tout float4 oSrMotion : SV_Target4";
++    #endif
+     }
+     else
+     {
+@@ -1875,6 +1903,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+     out += ")\n";
+     out += "{\n";
++#ifdef CONAN_RECOMP
++    if (isPixelShader)
++        out += "\toSrMotion = srMotionNdc(iSrMotionPrev, iSrMotionCur);\n";
++#endif
+ 
+ #ifdef UNLEASHED_RECOMP
+     if (hasMtxProjection)
+@@ -2888,4 +2920,57 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ #endif
+ 
+     out += "}";
++
++#ifdef CONAN_RECOMP
++    // Motion vectors (DLSS): the body becomes srVsMain; main runs it with the
++    // previous frame's constants (only its position is kept, the compiler
++    // drops the rest) and then as before, and hands both clip positions on.
++    // The half-pixel offset and the jitter go into both alike and cancel out
++    // in the difference.
++    if (!isPixelShader)
++    {
++        const std::string head = "#ifndef __spirv__\n[shader(\"vertex\")]\n#endif\nvoid main(\n";
++        const size_t at = out.find(head);
++        const size_t params_at = at + head.size();
++        const size_t params_end = at == std::string::npos ? std::string::npos : out.find(")\n{\n", params_at);
++        if (params_end != std::string::npos)
++        {
++            const std::string params = out.substr(params_at, params_end - params_at);
++            out.replace(at, head.size(), "void srVsMain(\n");
++            std::string wrapper_params = params;
++            const std::string light = ",\n#if defined(__spirv__) && defined(SR_VULKAN_BUFFERS)\n[[vk::location(20)]]\n#endif\n\tout float4 oSrLight : SRLIGHT0";
++            const size_t light_at = wrapper_params.find(light);
++            const std::string motion =
++                ",\n#if defined(__spirv__) && defined(SR_VULKAN_BUFFERS)\n[[vk::location(21)]]\n#endif\n\tout float4 oSrMotionPrev : SR_MOTION0"
++                ",\n#if defined(__spirv__) && defined(SR_VULKAN_BUFFERS)\n[[vk::location(22)]]\n#endif\n\tout float4 oSrMotionCur : SR_MOTION1";
++            wrapper_params.insert(light_at == std::string::npos ? wrapper_params.size() : light_at, motion);
++            // The parameters' names in order, outputs marked.
++            static const std::regex param(R"(\b(in|out)\s+(?:precise\s+)?\w+\s+(\w+)\s*:)");
++            std::string prev_args, args, temps;
++            for (auto it = std::sregex_iterator(params.begin(), params.end(), param); it != std::sregex_iterator(); ++it)
++            {
++                const std::string name = (*it)[2].str();
++                const bool output = (*it)[1].str() == "out";
++                if (!args.empty())
++                {
++                    args += ", ";
++                    prev_args += ", ";
++                }
++                args += name;
++                prev_args += output ? "srPrev_" + name : name;
++                if (output)
++                    temps += fmt::format("\tfloat4 srPrev_{};\n", name);
++            }
++            out += "\n\n#ifndef __spirv__\n[shader(\"vertex\")]\n#endif\nvoid main(\n" + wrapper_params + ")\n{\n";
++            out += temps;
++            // Only where the host has previous constants for this draw (DLSS
++            // on, a matched draw): otherwise the second run costs for nothing.
++            out += "\tsrPrev_oPos = 0.0;\n";
++            out += "\t[branch] if (g_SrMotionValid != 0)\n\t{\n";
++            out += "\t\tsrPrevConsts = true;\n\t\tsrVsMain(" + prev_args + ");\n\t}\n";
++            out += "\tsrPrevConsts = false;\n\tsrVsMain(" + args + ");\n";
++            out += "\toSrMotionPrev = srPrev_oPos;\n\toSrMotionCur = oPos;\n}";
++        }
++    }
++#endif
+ }
