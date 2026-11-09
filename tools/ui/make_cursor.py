@@ -10,7 +10,7 @@ upper left), the hotspot on the tip.
 import os
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-SIZE = 48
+SIZE = 24  # half the first 48 (the user, 2026-11-09: "zmniejsz kursor o połowę")
 # The shield's tip (its bottom point) turned to the upper left, as an arrow points
 # (the user's request, 2026-11-09): 135 degrees clockwise.
 ROTATE = -135

@@ -238,7 +238,7 @@ void RawInputKbmDriver::ThreadMain() {
 }
 
 namespace {
-// The S shield cursor (tools/ui/make_cursor.py): 48x48 BGRA with alpha.
+// The S shield cursor (tools/ui/make_cursor.py): 24x24 BGRA with alpha.
 #include "input/cursor_s.inc"
 
 HCURSOR ShieldCursor() {
