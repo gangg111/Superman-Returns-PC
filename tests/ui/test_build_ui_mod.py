@@ -48,8 +48,9 @@ def test_game_entries_untouched(built):
     # screens, whose B goes back to OPTIONS
     # since the key icons (2026-11-09, the user's "zamiast przycisków xboxa klawisze") also BUTTONICON
     # and SCRPRESSSTART ("PRESS ENTER" on keyboard and mouse, the user's request 2026-11-09)
+    # and SCRMOVESLIST, SCRSTATISTICS (their scroll arrows clickable, the user's screenshots 2026-11-09)
     changed = {'MAIN', 'SCRCONTROLROOM', 'SCRPAUSEMENU', 'SCRGAMEPLAYOPT', 'SCRCONTROLLEROPT', 'SCRAUDIOOPT',
-               'BUTTONICON', 'SCRPRESSSTART'}
+               'BUTTONICON', 'SCRPRESSSTART', 'SCRMOVESLIST', 'SCRSTATISTICS'}
     for e in orig.entries:
         if e['name'] not in changed:
             assert ui.data(ui.find(e['name'])) == orig.data(e), e['name']
@@ -235,7 +236,8 @@ def test_keys_screen(built):
     m = movie(ui, 'SCRKEYSOPT')
     screen = m.characters()[2]
     rows = [it for it in m.frames(m.u32(screen + 16), m.u32(screen + 20))[0] if it['type'] == 3]
-    assert [r['name'] for r in rows] == ['Key%d' % i for i in range(8)]
+    # and the page arrows' row beside the title (the user 2026-11-09: no arrows to turn 1/3)
+    assert [r['name'] for r in rows] == ['Key%d' % i for i in range(8)] + ['srPageRow']
     items = m.frames(*m.header()['frames'])[0]
     ours = [it for it in items if it['type'] == 8 and it['sprite'] == 4][-1]
     texts = strings_pushed(m, ours['code'])
@@ -422,4 +424,17 @@ def test_smart_camera_set_before_the_game_takes_it(built):
     texts = ' | '.join(t for it in main.frames(*main.header()['frames'])[0] if it['type'] == 1
                        for t in strings_pushed(main, it['code']))
     for t in ("'srCIS'", "'ChangeInterfaceState'", "'srSetAC'"):
+        assert t in texts, t
+
+
+def test_sliders_and_icon_arrows_answer_the_mouse(built):
+    # source: the user's screenshots 2026-11-09: Audio and Mouse Options' sliders took no click on
+    # their arrows or squares; the icon row's arrows both stayed dim (the game's CheckArrows never
+    # lights an arrow again). MAIN's mouse poll then knows a Slider by mMaxValue and sets its value,
+    # and IconMenu gets its own CheckArrows with both alphas.
+    ui, _ = built
+    main = movie(ui, 'MAIN')
+    texts = ' | '.join(t for it in main.frames(*main.header()['frames'])[0] if it['type'] == 1
+                       for t in strings_pushed(main, it['code']))
+    for t in ("'mMaxValue'", "'mStepValue'", "'SetValue'", "'CheckArrows'", "'INACTIVE_ALPHA'", "'ACTIVE_ALPHA'"):
         assert t in texts, t

@@ -115,6 +115,19 @@ SCREEN_BLOCKED, SCREEN_SETTLE = 100000, 20
 # drawn about 40..120 below; the selected icon ~90 wide, at the row's x):
 # a click this far below its origin, within ICON_ROW_HALF of x is the icon.
 ICON_ROW_TOP, ICON_ROW_BOTTOM, ICON_ROW_HALF = 20, 140, 50
+# A Slider (components/Slider, Audio and Mouse Options) in its own units: mSection1..10
+# 17 apart from 489.8, the mirrored left arrow just before them, the right one after
+# (on screen 2026-11-09: left arrow 474..485, squares 490..660, right arrow 668..680).
+# In tenths of a unit: the code pushes whole numbers only.
+SLIDER_FIRST, SLIDER_SECTION, SLIDER_SECTIONS = 4898, 170, 10
+SLIDER_LEFT_END, SLIDER_RIGHT_END = 4550, 7000
+# A click this near (stage units, both axes) an arrow's origin is on the arrow: the
+# scroll arrows of Moves List and Statistics, the page arrows of Keys Mapping.
+ARROW_HIT = 22
+# Keys Mapping's page row: at the title's height (rows' units: the first row's text
+# at stage y 274, the title at 154), the title centred at the row's x 495 (stage 640),
+# about 14 units a character (the user's screenshot 2026-11-09: 27 characters, 384 wide).
+KEY_TITLE_Y, KEY_TITLE_CENTER, KEY_TITLE_CHAR = 103, 495, 14.2
 ICON_PATH = "artassets/MenuIcons/IconGraphicsOpt"
 # Gameplay Options' rows: 32.8 apart from the top one (X-Axis Inversion).
 ROW_X, ROW_FIRST_Y, ROW_STEP = -394.0, 222.85, 32.8
@@ -278,7 +291,36 @@ def edit_main(data, const):
         code.land(ac_wrapped)
         # FlowMgr.ChangeInterfaceState("IG") (a new game, a load, the pause closed)
         # takes the settings into the game: with keyboard and mouse Smart Camera off
-        # first (the value set later in the game is not taken; the user 2026-11-09)
+        # first (the value set later in the game is not taken; the user 2026-11-09).
+        # Not on the front end's screen of icons (FORTRESS, METROPOLIS: an IconMenu
+        # kept on this screen): its METROPOLIS calls ChangeInterfaceState and any
+        # wrap of it crashed the game there (2026-11-09, "Call to invalid ... function
+        # at guest address 0x20"), so the game's own is put back while it is shown
+        code.path(g, "FlowMgr", "CurInterfaceState")
+        code.push("FE")
+        code.op("Equals2")
+        code.op("Not")
+        not_fe = code.branch_if_true()
+        code.path(g, "srIconMenu")
+        code.push(None)
+        code.op("Equals2")
+        no_icons = code.branch_if_true()
+        code.path(g, "srIconMenuGen")
+        code.path(g, "srScreenGen")
+        code.op("Equals2")
+        code.op("Not")
+        icons_gone = code.branch_if_true()
+        code.path(g, "FlowMgr", "srCIS")
+        code.push(None)
+        code.op("Equals2")
+        not_wrapped = code.branch_if_true()
+        code.set_member((g, "FlowMgr"), "ChangeInterfaceState", lambda: code.path(g, "FlowMgr", "srCIS"))
+        code.set_member((g, "FlowMgr"), "srCIS", lambda: code.push(None))
+        code.land(not_wrapped)
+        icons_shown = code.branch()
+        code.land(not_fe)
+        code.land(no_icons)
+        code.land(icons_gone)
         code.path(g, "FlowMgr", "srCIS")
         code.push(None)
         code.op("Equals2")
@@ -292,6 +334,7 @@ def edit_main(data, const):
         code.set_member((g, "FlowMgr"), "ChangeInterfaceState", change_interface_state)
         code.land(cis_missing)
         code.land(cis_wrapped)
+        code.land(icons_shown)
         code.path(g, "SettingsAdapter", "srSetAC")
         code.push(None)
         code.op("Equals2")
@@ -398,6 +441,10 @@ def edit_main(data, const):
         for method, saved in (("SetIcons", "srSetIcons"), ("Next", "srNext"), ("Previous", "srPrev")):
             code.set_member((("r", 3),), saved, lambda m=method: code.path(("r", 3), m))
             code.set_member((("r", 3),), method, lambda s_=saved: noting(s_, "srIconMenu"))
+        # the game's CheckArrows dims the left arrow on the first icon and the right
+        # one on the last but never lights them again, so with two icons (METROPOLIS,
+        # FORTRESS) both stay dim after one turn each way (the user 2026-11-09)
+        code.set_member((("r", 3),), "CheckArrows", check_arrows)
         code.set_member((("r", 3),), "srWrapped", True)
         code.land(menu_wrapped)
         code.land(no_menu)
@@ -413,6 +460,23 @@ def edit_main(data, const):
         code.set_member((("r", 3),), "SetIcon", lambda: code.path(g, "srSetIcon"))
         code.land(same)
         code.land(no_icon)
+        code.end_method(body)
+
+    def check_arrows():
+        # function () { each arrow IconMenu.INACTIVE_ALPHA at its end, else ACTIVE_ALPHA }
+        body = code.begin_method(registers=3)
+        last = lambda: (code.path(("r", 1), "mVisibleIcons"), code.push(1), code.op("Subtract"))
+        for arrow, end in (("mLeftArrow", lambda: code.push(0)), ("mRightArrow", last)):
+            code.path(("r", 1), "mSelectedIndex")
+            end()
+            code.op("Equals2")
+            code.op("Not")
+            active = code.branch_if_true()
+            code.set_member((("r", 1), arrow), "_alpha", lambda: code.path(("r", 2), "IconMenu", "INACTIVE_ALPHA"))
+            done = code.branch()
+            code.land(active)
+            code.set_member((("r", 1), arrow), "_alpha", lambda: code.path(("r", 2), "IconMenu", "ACTIVE_ALPHA"))
+            code.land(done)
         code.end_method(body)
 
     def change_interface_state():
@@ -488,6 +552,9 @@ def edit_main(data, const):
         code.end_method(body)
 
     code.set_member(("_global",), "srMenuPoll", menu_poll)
+    # Moves List's and Statistics' InitGui (edit_scroll_screen): the screen noted for
+    # the mouse poll's scroll arrows, then the game's own
+    code.set_member(("_global",), "srNoteScroll", lambda: noting("srOrigInit", "srScrollScreen"))
     define_set_icon(code)
 
     # Every 33 ms: the mouse in the menus. The item under the cursor (the focus
@@ -577,6 +644,212 @@ def edit_main(data, const):
                 ends.append(code.branch())
                 code.land(other)
                 code.call_method((g_main, "SettingsAdapter"), "PressPad", [1])
+        for e in ends:
+            code.land(e)
+
+    def slider_click():
+        """A click on a Slider (r8, its rectangle r13..r16): its left arrow LEFT,
+        its right arrow RIGHT, a square that square's value (the slider set a step
+        short of it, then one arrow, so the screen takes the value as from a pad).
+        Uses r5 (x in tenths of the slider's units), r6 (the value asked), r7 (the value now)."""
+        it = ("r", 8)
+        sa_ = (("r", 2), "SettingsAdapter")
+        code.push(("r", 3), ("r", 13))
+        code.op("Subtract")
+        code.path(it, "_width")
+        code.op("Multiply")
+        code.push(10)
+        code.op("Multiply")
+        code.push(("r", 15))
+        code.op("Divide")
+        code.set_register(5)
+        ends = []
+        # left of the squares: the left arrow (not the label further left)
+        code.push(("r", 5), SLIDER_FIRST)
+        code.op("LessThan2")
+        code.op("Not")
+        not_left = code.branch_if_true()
+        code.push(SLIDER_LEFT_END, ("r", 5))
+        code.op("LessThan2")
+        code.op("Not")
+        ends.append(code.branch_if_true())
+        code.call_method(sa_, "PressPad", [3])
+        ends.append(code.branch())
+        code.land(not_left)
+        last = SLIDER_FIRST + SLIDER_SECTION * SLIDER_SECTIONS
+        code.push(("r", 5), last)
+        code.op("LessThan2")
+        on_squares = code.branch_if_true()
+        code.push(("r", 5), SLIDER_RIGHT_END)
+        code.op("LessThan2")
+        code.op("Not")
+        ends.append(code.branch_if_true())
+        code.call_method(sa_, "PressPad", [2])
+        ends.append(code.branch())
+        code.land(on_squares)
+        # the square under the cursor: k = 1..10, value min + k * step (at most max)
+        for k in range(1, SLIDER_SECTIONS + 1):
+            code.push(("r", 5), SLIDER_FIRST + SLIDER_SECTION * (k - 1))
+            code.op("LessThan2")
+            before = code.branch_if_true()
+            code.path(it, "mMinValue")
+            code.push(k)
+            code.path(it, "mStepValue")
+            code.op("Multiply")
+            code.op("Add2")
+            code.set_register(6)
+            code.land(before)
+        code.path(it, "mMaxValue")
+        code.push(("r", 6))
+        code.op("LessThan2")
+        code.op("Not")
+        in_range = code.branch_if_true()
+        code.path(it, "mMaxValue")
+        code.set_register(6)
+        code.land(in_range)
+        code.call_method((it,), "GetValue", keep=True)
+        code.set_register(7)
+        for press, toward in ((2, "Subtract"), (3, "Add2")):
+            # RIGHT when now < asked (set a step below), LEFT when asked < now (a step above)
+            if press == 2:
+                code.push(("r", 7), ("r", 6))
+            else:
+                code.push(("r", 6), ("r", 7))
+            code.op("LessThan2")
+            code.op("Not")
+            other = code.branch_if_true()
+            code.call_method((it,), "SetValue", [lambda t=toward: (
+                code.push(("r", 6)), code.path(it, "mStepValue"), code.op(t))])
+            code.call_method(sa_, "PressPad", [press])
+            ends.append(code.branch())
+            code.land(other)
+        for e in ends:
+            code.land(e)
+
+    def near_clip(get_clip):
+        """Branches (to land) taken unless the cursor (r3, r4) is within ARROW_HIT of
+        the clip's origin on the stage and the clip is shown. Uses r5..r7, r9."""
+        skips = []
+        get_clip()
+        code.set_register(5)
+        code.push(("r", 5), None)
+        code.op("Equals2")
+        skips.append(code.branch_if_true())
+        code.path(("r", 5), "_visible")
+        code.op("Not")
+        skips.append(code.branch_if_true())
+        code.path(("r", 5), "_x")
+        code.set_register(6)
+        code.path(("r", 5), "_y")
+        code.set_register(7)
+        code.path(("r", 5), "_parent")
+        code.set_register(9)
+        tops = []
+        for _ in range(MOUSE_DEPTH + 2):
+            code.push(("r", 9), None)
+            code.op("Equals2")
+            tops.append(code.branch_if_true())
+            for pos, scale, at in (("_x", "_xscale", 6), ("_y", "_yscale", 7)):
+                code.push(("r", at))
+                code.path(("r", 9), scale)
+                code.op("Multiply")
+                code.push(100)
+                code.op("Divide")
+                code.path(("r", 9), pos)
+                code.op("Add2")
+                code.set_register(at)
+            code.path(("r", 9), "_parent")
+            code.set_register(9)
+        for t in tops:
+            code.land(t)
+        for mouse, origin in ((3, 6), (4, 7)):
+            for a, b in ((mouse, origin), (origin, mouse)):
+                code.push(("r", a), ("r", b))
+                code.op("Subtract")
+                code.push(ARROW_HIT)
+                code.op("LessThan2")
+                code.op("Not")
+                skips.append(code.branch_if_true())
+        return skips
+
+    def arrow_clicks():
+        """A click on nothing: the scroll arrows of the screen noted as srScrollScreen
+        (Moves List, Statistics: its HandleInput(UP or DOWN), as from a pad) and the
+        page arrows of Keys Mapping (srPageRow: LEFT or RIGHT)."""
+        g_main = ("r", 2)
+        other = same_screen("srScrollScreen")
+        code.path(g_main, "srScrollScreen")
+        code.push(None)
+        code.op("Equals2")
+        none = code.branch_if_true()
+        for arrow, key in (("mUpArrow", "UP"), ("mDownArrow", "DOWN")):
+            skips = near_clip(lambda a=arrow: code.path(g_main, "srScrollScreen", a))
+            code.call_method((g_main, "srScrollScreen"), "HandleInput",
+                             [lambda k=key: code.path(g_main, "INPUTCODE", k)])
+            for s in skips:
+                code.land(s)
+        code.land(none)
+        code.land(other)
+        other = same_screen("srPageRow")
+        code.path(g_main, "srPageRow")
+        code.push(None)
+        code.op("Equals2")
+        none = code.branch_if_true()
+        for arrow, press in (("mLeftArrow", 3), ("mRightArrow", 2)):
+            skips = near_clip(lambda a=arrow: code.path(g_main, "srPageRow", a))
+            code.call_method((g_main, "SettingsAdapter"), "PressPad", [press])
+            for s in skips:
+                code.land(s)
+        code.land(none)
+        code.land(other)
+
+    def option_click():
+        """A click on an option row (a Toggle, it has GetIndex; r8, its rectangle
+        r13..r16): between its label and the middle of its value (halfway between
+        mLeftArrow and mRightArrow) LEFT, else RIGHT (the label too, as before; the
+        user 2026-11-09: the left arrow of Controller Options went right).
+        Uses r5 (x in the row's units), r6 (the middle)."""
+        it = ("r", 8)
+        sa_ = (("r", 2), "SettingsAdapter")
+        ends = []
+        code.path(it, "mLeftArrow")
+        code.push(None)
+        code.op("Equals2")
+        code.path(it, "mRightArrow")
+        code.push(None)
+        code.op("Equals2")
+        code.op("Or")
+        no_arrows = code.branch_if_true()
+        code.push(("r", 3), ("r", 13))
+        code.op("Subtract")
+        code.path(it, "_width")
+        code.op("Multiply")
+        code.push(("r", 15))
+        code.op("Divide")
+        code.set_register(5)
+        code.path(it, "mLeftArrow", "_x")
+        code.path(it, "mRightArrow", "_x")
+        code.op("Add2")
+        code.push(2)
+        code.op("Divide")
+        code.set_register(6)
+        # left of the left arrow by more than its width: the label, RIGHT
+        code.push(("r", 5))
+        code.path(it, "mLeftArrow", "_x")
+        code.path(it, "mLeftArrow", "_width")
+        code.op("Subtract")
+        code.op("LessThan2")
+        label = code.branch_if_true()
+        code.push(("r", 5), ("r", 6))
+        code.op("LessThan2")
+        code.op("Not")
+        right = code.branch_if_true()
+        code.call_method(sa_, "PressPad", [3])
+        ends.append(code.branch())
+        code.land(right)
+        code.land(label)
+        code.land(no_arrows)
+        code.call_method(sa_, "PressPad", [2])
         for e in ends:
             code.land(e)
 
@@ -792,16 +1065,34 @@ def edit_main(data, const):
         code.op("Not")
         no_click = code.branch_if_true()
         code.call_method(sa, "MenuMouseLog", [("r", 3), ("r", 4), ("r", 13), ("r", 14), ("r", 15), ("r", 16)])
+        # a Slider (it has mMaxValue): arrows and squares (slider_click)
+        code.push(("r", 8), "mMaxValue")
+        code.op("GetMember")
+        code.push(None)
+        code.op("Equals2")
+        not_slider = code.branch_if_true()
+        slider_click()
+        slider_done = code.branch()
+        code.land(not_slider)
         code.push(("r", 8), "GetIndex")
         code.op("GetMember")
         code.push(None)
         code.op("Equals2")
         button = code.branch_if_true()
-        code.call_method(sa, "PressPad", [2])
+        # a Keys Mapping row (srKeyRow): A, which waits for a key
+        code.path(("r", 8), "srKeyRow")
+        code.op("Not")
+        not_key = code.branch_if_true()
+        code.call_method(sa, "PressPad", [1])
+        key_done = code.branch()
+        code.land(not_key)
+        option_click()
+        code.land(key_done)
         clicked = code.branch()
         code.land(button)
         code.call_method(sa, "PressPad", [1])
         code.land(clicked)
+        code.land(slider_done)
         code.land(no_click)
         missed = code.branch()
         code.land(no_hit)
@@ -811,6 +1102,7 @@ def edit_main(data, const):
         quiet = code.branch_if_true()
         code.call_method(sa, "MenuMouseLog", [("r", 3), ("r", 4), -1, -1, 0, 0])
         icon_row()
+        arrow_clicks()
         code.land(quiet)
         code.land(missed)
         code.land(outside)
@@ -1662,6 +1954,31 @@ def edit_press_start(data, const):
     return m.write()
 
 
+def edit_scroll_screen(data, const, sprite, cls_name):
+    """After the screen's class init (Moves List, Statistics): InitGui becomes MAIN's
+    _global.srNoteScroll (the screen noted for the mouse poll's arrows), the game's
+    kept as srOrigInit."""
+    m = apt_edit.MovieEdit(data, const)
+    rec, items = m.frame_items(m.root)
+    cls = find_init_action(m, items, sprite)
+    code = m.code()
+    at = code.start()
+    proto = ("_global", cls_name, "prototype")
+    code.path("_global", "srNoteScroll")
+    code.push(None)
+    code.op("Equals2")
+    missing = code.branch_if_true()
+    code.set_member(proto, "srOrigInit", lambda: code.path(*proto, "InitGui"))
+    code.set_member(proto, "InitGui", lambda: code.path("_global", "srNoteScroll"))
+    code.land(missing)
+    code.end()
+    code.finish()
+    new = m.init_action(sprite, at)
+    i = items.index(cls)
+    m.set_frame_items(rec, items[:i + 1] + [new] + items[i + 1:])
+    return m.write()
+
+
 def edit_button_icon(data, const):
     """After the game's class init (which defines SetIcon):
     ButtonIcon.prototype.SetIcon = _global.srSetIcon, when MAIN has set it."""
@@ -1712,9 +2029,25 @@ def make_keys_screen(data, const):
         code.set_variable("m_initiallySelected", i == 0)
         code.set_variable("m_tabIndex", i)
         code.set_variable("m_bVisible", True)
+        code.set_variable("srKeyRow", True)  # a click on it is A (the mouse poll)
         code.end()
         code.finish()
         placed.append(m.place_copy(template, name, 1 + 12 * i, ROW_X, ROW_FIRST_Y + ROW_STEP * i, at))
+    # the page arrows beside the title: one more Toggle, out of the focus manager
+    # (m_tabIndex -1), only its two arrows shown (init_gui, refresh)
+    at = code.start()
+    code.set_variable("mArrowWidth", 200)
+    code.set_variable("mLabel", "")
+    code.set_variable("mOptionsArray", lambda: code.array([""]))
+    code.set_variable("isWrapping", True)
+    code.set_variable("m_bEnabled", True)
+    code.set_variable("m_refFM", "_global.gFM")
+    code.set_variable("m_initiallySelected", False)
+    code.set_variable("m_tabIndex", -1)
+    code.set_variable("m_bVisible", True)
+    code.end()
+    code.finish()
+    placed.append(m.place_copy(template, "srPageRow", 1 + 12 * len(KEY_ROWS), ROW_X, KEY_TITLE_Y, at))
     m.set_frame_items(srec, kept + placed)
 
     rec, items = m.frame_items(m.root)
@@ -1805,6 +2138,10 @@ def make_keys_screen(data, const):
             code.op("Not")
             other = code.branch_if_true()
             code.call_method((g,), "SetScreenTitle", [localized(title_key)])
+            # the page arrows just outside this page's title
+            half = int(len(KEY_PAGES[p][1]) * KEY_TITLE_CHAR / 2)
+            code.set_member(this + ("srPageRow", "mLeftArrow"), "_x", KEY_TITLE_CENTER - half - 24)
+            code.set_member(this + ("srPageRow", "mRightArrow"), "_x", KEY_TITLE_CENTER + half + 12)
             code.set_member(this, "srIds", lambda ids=[b for b, *_ in page_rows]: code.array(ids))
             for row, (binding, label_key, _) in zip(KEY_ROWS, page_rows):
                 code.call_method(this + (row,), "show")
@@ -1855,6 +2192,17 @@ def make_keys_screen(data, const):
         code.land(known)
         code.set_member(this, "srPage", lambda: code.path(g, "KeysPage"))
         code.set_member(this, "srCapturing", False)
+        # the rows' arrows never shown (LEFT/RIGHT turn the page, not a row's value;
+        # the user 2026-11-09), the page row's always: their Show and Hide swapped
+        for row in KEY_ROWS:
+            for arrow in ("mLeftArrow", "mRightArrow"):
+                code.set_member(this + (row, arrow), "Show", lambda r=row, a=arrow: code.path(("r", 1), r, a, "Hide"))
+                code.call_method(this + (row, arrow), "Hide")
+        for arrow in ("mLeftArrow", "mRightArrow"):
+            code.set_member(this + ("srPageRow", arrow), "Hide", lambda a=arrow: code.path(("r", 1), "srPageRow", a, "Show"))
+            code.call_method(this + ("srPageRow", arrow), "Show")
+        code.set_member((g,), "srPageRow", lambda: code.path(("r", 1), "srPageRow"))
+        code.set_member((g,), "srPageRowGen", lambda: code.path(g, "srScreenGen"))
         code.call_method(this, "srRefresh")
         code.end_method(body)
 
@@ -2060,6 +2408,9 @@ def build(data_dir, out_dir):
     replace["SCRPRESSSTART"] = repack(inner, d, c, *edit_press_start(d[1], c[1]))
     inner, d, c = movie_of(ui, "BUTTONICON")
     replace["BUTTONICON"] = repack(inner, d, c, *edit_button_icon(d[1], c[1]))
+    for entry, sprite, cls_name in (("SCRMOVESLIST", 14, "ScrMovesList"), ("SCRSTATISTICS", 26, "ScrStatistics")):
+        inner, d, c = movie_of(ui, entry)
+        replace[entry] = repack(inner, d, c, *edit_scroll_screen(d[1], c[1], sprite, cls_name))
     add += key_icons.entries(ui)
     with open(os.path.join(out_dir, "ui_sr.AST"), "wb") as f:
         f.write(ui.build(replace=replace, add=add))

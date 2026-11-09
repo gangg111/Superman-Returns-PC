@@ -1,0 +1,1198 @@
+[
+ {
+  "name": "01A15D9CFED0EE65_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 26324992,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "f4231584e7eee75cd11d348c993c41ab51aa7f6a2544f4c4391c5d2ebe12b9dc",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "044EFC9F97A3F254_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 82710528,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "e7b8c9827273da9e7dd6e19030a54ab399db2042e83e539238588b775f943c9f",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "073AEEC1B9753022_512x512_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 8413184,
+  "size": 131072,
+  "width": 512,
+  "height": 512,
+  "format": 18,
+  "sha256": "279f27eebd7dc3e8874dd0820d6be69c144456cb786e46670e7a884c1bd02e8a",
+  "window_kenv": [
+   0.25,
+   0.1,
+   0.02
+  ]
+ },
+ {
+  "name": "0AFCCDFC225B5D52_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 94441472,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "941992a3b76db12a6d07824a4d78cb8a88c7bfec9eea1f572a80495f535409e6",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "0E5BEE3D2DAC5543_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 83791872,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "ff3b41c6abbe453d5bca4f22e0f4d04498b493ec2c92570cce86bfd49da59ca9",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "124948B7DCADF64A_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 93491200,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "1e9a13aa045242d643c44decbcebce7c2c046b664db575eb2f442d639983efd5",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "12793D86C96D1F2F_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 94695424,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "cd5c00dad1a750f65dee0e8220047bc23b9317eacda872d2e334093f8539e101",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "156706CC79E11920_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 27209728,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "ad9a4231f72918a7365492fa7541e502e0bbc28a2d42c56a4145626c86257780",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "15B80FE4753002C9_128x128_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 34213888,
+  "size": 8192,
+  "width": 128,
+  "height": 128,
+  "format": 18,
+  "sha256": "ac7468387dbab550767722a2e96c847c69e278ac820e51864d3dbd67fa64d2e4",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "166706BD1E8CF9C1_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 81940480,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "0a13b3ba63bd204ecc71d02c3d9b2f15453f1adb9f140fab2d2161433f863b2a",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "1910B8D80AC9AFAD_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 86446080,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "d7c2193c12a469b46af2b2ba755cf8dad98c66a8ddca782bc219cb235be1ca5e",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "206B1EE9596A4485_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 70119424,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "b7546b9a0faa7c1ee5057827cda50bf179736c8e1bf7a4499c1e94b7168fdcd8",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "247CCFAA83AF5F2D_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 93884416,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "563f3aa65c4e33d176446086f9bd25c5d453e3f0fcf3a4deb7836dccc5463edb",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "25070877A6132587_512x512_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 61501440,
+  "size": 131072,
+  "width": 512,
+  "height": 512,
+  "format": 18,
+  "sha256": "4965e966e3007f7041fedcff1e890b2e66c595dc4e9276786de30e2730b7ea3e",
+  "window_kenv": [
+   0.1,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "2C0508930C10400D_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 69865472,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "485b273fc97746d60ccac1a2ddf3d178140501b87441609615837aa4fb3c209c",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "2CA8E8A921AA78E7_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 25473024,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "afa98fd69e14223ae908a48f61e47b9f7fcfd18a8c3512b9743bb226fc806069",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "2FF42BBAD3F9FF23_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 19742720,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "f8957b3e9ef9d2d56d7eb04d7b36977faec72dc34c5c56c7b1cfd04c125e7a7c",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "32DFDEAD4BBF2B3E_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 22851584,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "4fa1ac3c01ea3d8d7425e208e8b007d22ed009ba0e33f3463f16973ce44293dc",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "33642DC581288034_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 24899584,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "55bc8c1a205eaf23761f662e5c7e349751b00556ba4333ec8d01f939dd8fce02",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "37ECECC39D87E540_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 85495808,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "60f62d54e9116257f6b0f916ea2f222667ca03c7f495b7cce68fc70599c20c19",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "39BB1A54D44C83C2_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 58404864,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "1447477b24003703b81f6c0133db54d1ef28e3f7e60c853da4421115f2937b50",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "39DCA2830D041745_512x512_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 61173760,
+  "size": 131072,
+  "width": 512,
+  "height": 512,
+  "format": 18,
+  "sha256": "d7650bbb22270d69f9efb927a9e84681dbe8b634e83b8d3e194afb591be798be",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "49AD75A2DE1A2E2C_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 69357568,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "b6448771ba3eb04b0b5342f445ec30dc99dc5c17eea64d7a4a1ae6077edbfe20",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "4EA3318ACA46966F_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 9519104,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "171a43725b284a468e5354be3c7426d9ce862b4f00def7fcd5e64c1f4b8d27c1",
+  "window_kenv": [
+   0.25,
+   0.005,
+   0.0
+  ]
+ },
+ {
+  "name": "5250C40A8F4F9B3C_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 25726976,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "741353e25ea030c6e9fe7c0044851b7486ec4c811007959d7eb2478f217acbac",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "536E0A23B98AEE55_512x512_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 22065152,
+  "size": 131072,
+  "width": 512,
+  "height": 512,
+  "format": 18,
+  "sha256": "9595513be8325035382b7557f5cbf042794c2301ea968198a2a2fcc83b71491c",
+  "window_kenv": [
+   0.25,
+   0.1,
+   0.0
+  ]
+ },
+ {
+  "name": "5703A490FA78BDB9_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 68079616,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "d1e557dcf0adcf0b345b31365b6066bc647548161f3b856cfe7f44377770321a",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "5B607AA2EBA886E3_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 94949376,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "9dab9c15e9e64dd862f83a4c8041b8294c0e5052b562f48dbfc99790d87023d6",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "5DB4B8BD88A06513_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 18391040,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "4acbf4c3caa9d76b2ab4254de7a3e09bfbb9f57395582f2787b8b7dff0d3a610",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "5FA27CD8989CA7DC_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 85889024,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "e605feb588ef75cf7a4e373026baffcde9f1e55f4897bf881b373745329b6650",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "60C30A3B76BE46A2_512x512_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 80752640,
+  "size": 131072,
+  "width": 512,
+  "height": 512,
+  "format": 18,
+  "sha256": "b05d4a2ace9606c89158a733d5947114c2f89b3b752691ba6b189ad6ae772522",
+  "window_kenv": [
+   0.25,
+   0.1,
+   0.0
+  ]
+ },
+ {
+  "name": "620797930AB0991A_128x128_f18",
+  "file": "DATA/baseworl.AST",
+  "offset": 2963264,
+  "size": 8192,
+  "width": 128,
+  "height": 128,
+  "format": 18,
+  "sha256": "9f1dcbc35c350d6027f98be0f5c8b43b42ca52b7604459c0c42be3aa88913d47",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "68D4A30523FAE26A_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 21331968,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "36214fef9ed337450575369e1381c40c7fb25ea729fa58e1777f2b5f26f2eda4",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "69ED6EA4D376589F_512x512_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 14213120,
+  "size": 131072,
+  "width": 512,
+  "height": 512,
+  "format": 18,
+  "sha256": "f8da99777822b42a58587b62f4c571b37a481d573cef03670fc19ff6dbad44cb",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "6C00C30AA2EEE8A1_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 58748928,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "8c9585d8830fb17150d7b5f6a441ae34785ab1ae9e5f0e9fff006ab65d097044",
+  "window_kenv": [
+   0.125,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "6CB6ABD73761B9EF_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 85020672,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "0735d9cfd465ee91df020104692fc72bd78a50b7ab025f2f0d4665267c740d9e",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "76B186CC37F7C0C5_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 60190720,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "ce4e93a34854e70bf3b174bd0d9f02e1863c5eaa9e675740135e3d395f7913f6",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "7B4A0CF556A2E18B_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 84635648,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "b8638c3838a8ebba81b01368ef0f201482eeb2d3429d7e20edcaa9f36842af2d",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "7C013EC345270C83_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 95203328,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "f0fb15dfa31a259ad0506c0fb6d7b82b8bec07d88f95d7378e0a60c44149fe1f",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "7F1641D0664BA592_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 10608640,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "f7ea1557474ff4d5756b7e4fc720781edd984b6e03af5e49e92703cdf8751d07",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "80AD2E9AA2510FA0_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 18776064,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "849d8b229a9c529de2e114a566d3a49d8b76919313a0ea77d4aa8a6d8bb90e1a",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "82969343048A29BF_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 23810048,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "0c91e21e32ed55424accfb4188b9aae00016e33be38620a721bc1dc13e8ed5ca",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "834D20A3EFD6ED2F_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 19251200,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "e339f8f29efab8b3c6f161bb993c1dc9235917e62d7de887700b4506d317039a",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "84976E6686FF9810_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 16867328,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "0b5a423f2c88dcd322074f10b5e0445d10520888fbc1821652a932da592d03eb",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "87218D8C139408EA_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 11182080,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "7bc5bb0c568380fc0e664b6d78f23383051c3da4d3ff01c2e064f22b2ae01867",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "8955B1ACB37206B2_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 83537920,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "09da842f30a7b9ab3719302c37665e84fca531c670e40cf916bfb2d89ead3696",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "8E6C65F75FEA3D55_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 57520128,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "22bf49995ed6eb9449b9ad24160d3bd40dcfaf63aefb73d04af2c33bdcd06341",
+  "window_kenv": [
+   0.005,
+   0.1,
+   0.0
+  ]
+ },
+ {
+  "name": "96D305DF851EA996_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 83283968,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "96e3bb955caa8ebe4945e90063b710be2be7dbcf99312c6c8aafa231f28e9260",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "988A8A887BE76A8B_1024x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 77533184,
+  "size": 131072,
+  "width": 1024,
+  "height": 256,
+  "format": 18,
+  "sha256": "b6f156877b4ab671991f7434abd1c3585d66f2f3fa9218ee45abbb8a4af3832f",
+  "window_kenv": [
+   0.05,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "99D5DE566A6B4C6C_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 27463680,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "4f78056486f6dda501cc48e0bf7adcfc703808d5606c6590412c433454f83ee9",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "9EBFA31281B8F06B_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 25980928,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "9dcb83ff54453e398656e5cbf3873ffec4b9f32b1480cdff9a4f10ee4c4059f6",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "A7317932A79DE7DB_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 23244800,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "c66729c32e971f426e85696bf9d16cbe391841b5d9c2e55b932f0f117e596ceb",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "A7A606E933B690AC_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 19996672,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "ba3ae1fbb800090743a139a84f7013fa1aa42f62087494876fe16e96bf5c883c",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "A918A603318BE57D_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 69054464,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "f93c41a78f9db978ce9316281cf4d6393694a36724f64ad627c706b06dd937a8",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "AB7A8DD42233390E_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 67162112,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "de188406d4ac6ce7d37f26100249df26d2adb36026501a6d5c77600456f4b743",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "B114C1A6B7AF6625_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 76976128,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "447c3520599bb325b3096131a48f3dbaaf9c0e55cb29ba11862d878fd805b977",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "B669AEAC77C5A8B0_512x512_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 8085504,
+  "size": 131072,
+  "width": 512,
+  "height": 512,
+  "format": 18,
+  "sha256": "ada2701606d0ad7ea9bf27ca1f746ae2c7ed30a9deca0bad71cd667f02379c8f",
+  "window_kenv": [
+   0.25,
+   0.1,
+   0.02
+  ]
+ },
+ {
+  "name": "BABD344E97BD2CB0_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 86192128,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "b3426e7a3b84e19419f93e71e6e7a1d09e7f95879eb584af56abd2e5cca4679e",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "BE868090ECDA29C2_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 56430592,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "9bba70f59ff0c2901764b812858807ac6809c6dcb3af6cb637bc746aebb3cd7c",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "C2F8AA46E396CEFE_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 10092544,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "05077a40f37e5209295c38c2c5a59157ec41d5a8868d0ebbb420fb3eede5a440",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "C345378F48CBCFD8_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 81498112,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "66f214033e5baffbc95a0f5b580ca74fb44d5d71a4d569bfea2249e5b31787f5",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "C656DF25317AD22D_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 26718208,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "2b04ad198664873d2eadca52a2c13a8fbdacd8f8d86b46c33a7774c8d65ba908",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "C9349A47C1AD2A63_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 67735552,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "2e41c04a501a85fe4310aeb1170cbd90016490e79d1fbe1698dda27b54a61e42",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "C9A2A24D64F4E3A4_512x512_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 13950976,
+  "size": 131072,
+  "width": 512,
+  "height": 512,
+  "format": 18,
+  "sha256": "a8ae9e239e29131732314dae619a2d192bb36260f7ff1c04245e71b1fcb87d11",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "CBB8113984183078_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 17121280,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "f20b5df44cf2bf9712f3f963a2d1332703dee82228d14a3aa441370da8748b42",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "D3717C72062CD04D_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 57176064,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "3075a7a1154a00014372950779912855d9ee04d49c5e5d7a88c35c3752d4f340",
+  "window_kenv": [
+   0.0,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "D4488A2EEAFF523A_512x512_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 66662400,
+  "size": 131072,
+  "width": 512,
+  "height": 512,
+  "format": 18,
+  "sha256": "4d7054b068c7fc602eda2df248b7fa710fb2dcc9f99e9071c89adefaa5259394",
+  "window_kenv": [
+   0.1,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "D4FAD7EB325DF5ED_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 81244160,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "fc79b0593871de4f9cb3843fa59cf0833bf8f9a7ad98f8a02644f246d50be38a",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "D4FF09ABA5380F8F_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 21585920,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "a42d4db1355636349fc777fd5885888866e5bc0a7ca95b13e3a5d692c3a9cdae",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "D5A4CEDBE65BEB74_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 24383488,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "fda3e0ca9d1f69c18495ef7f3e3aa6424a1a5db9e06b9e29a79717286a6d9578",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "D6B9E4B919FED16F_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 22458368,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "c243f6fc7864674c17c22a2abf87c4c8a2bb6500cb2e0126521507003482a209",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "DBF07D6E350B3EC2_256x512_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 15458304,
+  "size": 65536,
+  "width": 256,
+  "height": 512,
+  "format": 18,
+  "sha256": "a428640ff6353c88a1504e9d1224e491f4eaf42a26bbfd8ddd78c1d86204b0b9",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "DC6F46976DF88A96_512x512_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 8675328,
+  "size": 131072,
+  "width": 512,
+  "height": 512,
+  "format": 18,
+  "sha256": "dc299e964c1176c160a73d10c7b10f138065c6d860a14cf77c32a4ba8cb11b66",
+  "window_kenv": [
+   0.1,
+   0.2,
+   0.02
+  ]
+ },
+ {
+  "name": "E5775A682D90D543_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 11624448,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "316c9720859caf1df4ea83e6991d206489db6ccddefcdf52e380399eae591c11",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "E7768DCAA2369A0E_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 69611520,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "dae59508a163811328ccb4dcaa03cbba66e327dc5a6018317296f8485706e979",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "E957A5464C0A0CB2_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 20250624,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "47a1c6141deeb0daf386353b1ef2e764408c4169229eea5e951b090ffbf9d24f",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "EA4A8BC906AA9D06_1024x512_f20",
+  "file": "DATA/objtiv.AST",
+  "offset": 232542208,
+  "size": 524288,
+  "width": 1024,
+  "height": 512,
+  "format": 20,
+  "sha256": "481527e7cda4ff9e90d4fa38fd3c257bc7505282dc853eaca59ac55bd7ad82fe",
+  "sky_diff": true
+ },
+ {
+  "name": "F4B79D4C849FD14F_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 57913344,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "df8754ba0c520ff89cbdf273187f957a8e3d121fb4b1492e6579ea7729cf6cff",
+  "window_kenv": [
+   0.25,
+   0.05,
+   0.0
+  ]
+ },
+ {
+  "name": "F4FBB63A47DCA147_512x512_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 66400256,
+  "size": 131072,
+  "width": 512,
+  "height": 512,
+  "format": 18,
+  "sha256": "b5a545979ab3a459fa9969ae7c5ebc8132b2d61478e37ca72da316b117203ba2",
+  "window_kenv": [
+   0.1,
+   0.0,
+   0.0
+  ]
+ },
+ {
+  "name": "FC06A1EBF7DFE994_256x256_f18",
+  "file": "DATA/metropol.AST",
+  "offset": 95457280,
+  "size": 32768,
+  "width": 256,
+  "height": 256,
+  "format": 18,
+  "sha256": "9c0ce6b31aed1bd4cb84d87a596c137def01a69cfbf279696f9fa117a764f212",
+  "window_kenv": [
+   0.25,
+   0.0,
+   0.0
+  ]
+ }
+]
