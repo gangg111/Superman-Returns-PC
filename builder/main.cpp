@@ -32,7 +32,8 @@ int g_lang = 0;  // 0 English, 1 Polish
 
 const std::map<std::string, std::pair<const wchar_t*, const wchar_t*>> kWords = {
     {"subtitle", {L"NATIVE PC PORT", L"NATYWNY PORT NA PC"}},
-    {"source", {L"Xbox 360 disc image (.iso) or game folder", L"Obraz płyty Xbox 360 (.iso) albo folder gry"}},
+    {"source", {L"Superman Returns (USA), Xbox 360: disc image (.iso) or game folder",
+                L"Superman Returns (USA), Xbox 360: obraz płyty (.iso) albo folder gry"}},
     {"output", {L"Folder for the finished game", L"Folder na gotową grę"}},
     {"choose", {L"Choose", L"Wybierz"}},
     {"folder", {L"Folder", L"Folder"}},
@@ -41,10 +42,10 @@ const std::map<std::string, std::pair<const wchar_t*, const wchar_t*>> kWords = 
     {"open", {L"Open folder", L"Otwórz folder"}},
     {"none", {L"not chosen", L"nie wybrano"}},
     {"checking", {L"checking…", L"sprawdzam…"}},
-    {"recognized", {L"Superman Returns (USA), Xbox 360", L"Superman Returns (USA), Xbox 360"}},
-    {"not_game", {L"not an Xbox 360 disc image or game folder", L"to nie obraz płyty Xbox 360 ani folder gry"}},
-    {"wrong_release", {L"another release: the port needs Superman Returns (USA)",
-                       L"inne wydanie: port wymaga Superman Returns (USA)"}},
+    // short: shown at the right of the source's label, which names the release
+    {"recognized", {L"recognized", L"rozpoznano"}},
+    {"not_game", {L"not an Xbox 360 game", L"to nie gra z Xbox 360"}},
+    {"wrong_release", {L"another release", L"inne wydanie"}},
     {"step_check", {L"Checking the game", L"Sprawdzam grę"}},
     {"step_port", {L"Writing the port", L"Zapisuję port"}},
     {"step_game", {L"Copying the game", L"Kopiuję grę"}},
