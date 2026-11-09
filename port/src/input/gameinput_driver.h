@@ -16,6 +16,12 @@ namespace superman_returns::input {
 using rex::X_RESULT;
 using rex::X_STATUS;
 
+// Connected GameInput controllers, and when one was last used (steady clock ms;
+// 0 = never): the cursor hides while a pad is the input in use.
+int ConnectedPads();
+int64_t LastPadUseMs();
+int64_t NowMs();
+
 class GameInputDriver final : public rex::input::InputDriver {
  public:
   GameInputDriver();

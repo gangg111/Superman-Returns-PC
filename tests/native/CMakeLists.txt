@@ -16,6 +16,7 @@ add_executable(sr_native_tests
     test_frame_generation_policy.cpp
     test_guest_hash.cpp
     test_shared_constants_cache.cpp
+    test_range_allocator.cpp
     test_texture_content.cpp
     test_texture_capture_cache.cpp
     test_texture_ranges.cpp

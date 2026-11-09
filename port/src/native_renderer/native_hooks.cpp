@@ -437,6 +437,9 @@ void superman_returns::native::ObserveTextureValidationForUnlockAudit(const uint
 #define SR_ORIGINAL_(addr) __imp__sub_##addr
 #define SR_ORIGINAL(addr) SR_ORIGINAL_(addr)
 
+REXCVAR_DEFINE_BOOL(sr_xdk_native_constant_copy, true, "Superman Returns",
+                    "Native copy for the XDK SetVertex/PixelShaderConstantF leaf (instead of the generated vector code)");
+
 namespace {
 bool NativeBulkConstantsEnabled() {
   static const bool enabled=[] {
@@ -445,17 +448,68 @@ bool NativeBulkConstantsEnabled() {
   }();
   return enabled;
 }
+// SR_XDK_CONST_COPY_CHECK=1: every native copy is also run by the generated
+// original on the same memory; the results are compared, then the native
+// result is kept.
+bool ConstantCopyCheck() {
+  static const bool enabled=[] {
+    const char* value=std::getenv("SR_XDK_CONST_COPY_CHECK");
+    return value && *value=='1';
+  }();
+  return enabled;
+}
+void CopyConstants(PPCContext& ctx,uint8_t* base,bool pixel,void (*original)(PPCContext&,uint8_t*)) {
+  const native::ConstantCopyArgs a{ctx.r3.u64,ctx.r4.u64,ctx.r5.u64,ctx.r6.u64,ctx.r7.u64,ctx.r1.u32};
+  uint64_t destination=0;
+  if(!REXCVAR_GET(sr_xdk_native_constant_copy) || !base || !native::ConstantCopyEligible(a,pixel,destination)) {
+    if(NativeBulkConstantsEnabled() && native::Enabled()) native::TryCopyConstantPrefix(ctx,base,pixel);
+    original(ctx,base);
+    return;
+  }
+  if(!ConstantCopyCheck()) {
+    native::ConstantCopyNative(ctx,base,a,pixel,destination);
+    return;
+  }
+  // Regions both versions write: destination, dirty mask, the two stack slots.
+  const size_t bytes=size_t(a.count*16);
+  const uint32_t mask_at=uint32_t(a.device)+(pixel?8:0),stack=uint32_t(a.stack);
+  std::vector<uint8_t> before(bytes+20),after_original(bytes+20),after_native(bytes+20);
+  auto save=[&](std::vector<uint8_t>& v) {
+    std::memcpy(v.data(),base+destination,bytes);
+    std::memcpy(v.data()+bytes,base+mask_at,8);
+    std::memcpy(v.data()+bytes+8,base+stack-32,4);
+    std::memcpy(v.data()+bytes+12,base+stack+48,8);
+  };
+  auto restore=[&](const std::vector<uint8_t>& v) {
+    std::memcpy(base+destination,v.data(),bytes);
+    std::memcpy(base+mask_at,v.data()+bytes,8);
+    std::memcpy(base+stack-32,v.data()+bytes+8,4);
+    std::memcpy(base+stack+48,v.data()+bytes+12,8);
+  };
+  save(before);
+  PPCContext reference=ctx;
+  original(reference,base);
+  save(after_original);
+  restore(before);
+  native::ConstantCopyNative(ctx,base,a,pixel,destination);
+  save(after_native);
+  static std::atomic<uint64_t> checked{0},mismatched{0};
+  const bool same=after_original==after_native && reference.r9.u64==ctx.r9.u64 &&
+                  reference.r10.u64==ctx.r10.u64 && reference.r11.u64==ctx.r11.u64;
+  if(!same && mismatched.fetch_add(1)<8)
+    REXLOG_WARN("xdk constant copy: native differs from original (pixel {} start {} count {})",pixel,a.start,a.count);
+  const uint64_t n=checked.fetch_add(1)+1;
+  if((n&0xFFFF)==0) REXLOG_INFO("xdk constant copy: {} native copies checked, {} differed",n,mismatched.load());
+}
 }
 #if SR_HOOK_ENABLED(FLOAT_COPY_VS)
 SR_DEFINE_HOOK(SR_ADDR_FLOAT_COPY_VS) {
-  if(NativeBulkConstantsEnabled() && native::Enabled()) native::TryCopyConstantPrefix(ctx,base,false);
-  SR_ORIGINAL(SR_ADDR_FLOAT_COPY_VS)(ctx,base);
+  CopyConstants(ctx,base,false,&SR_ORIGINAL(SR_ADDR_FLOAT_COPY_VS));
 }
 #endif
 #if SR_HOOK_ENABLED(FLOAT_COPY_PS)
 SR_DEFINE_HOOK(SR_ADDR_FLOAT_COPY_PS) {
-  if(NativeBulkConstantsEnabled() && native::Enabled()) native::TryCopyConstantPrefix(ctx,base,true);
-  SR_ORIGINAL(SR_ADDR_FLOAT_COPY_PS)(ctx,base);
+  CopyConstants(ctx,base,true,&SR_ORIGINAL(SR_ADDR_FLOAT_COPY_PS));
 }
 #endif
 

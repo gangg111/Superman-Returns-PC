@@ -1,0 +1,379 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index acee680..af0ad5d 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -273,6 +273,45 @@ float3 srRtWorldPos(float3 lightCoord)
+     float4 p = float4(lightCoord, 1.0);
+     return float3(dot(asfloat(b.Load4(0)), p), dot(asfloat(b.Load4(16)), p), dot(asfloat(b.Load4(32)), p));
+ }
++// Night street lamps (frame data bytes 160..: count, reach, light colour,
++// the night's ambient light; 256..: one lamp head per 16 bytes): light added
++// to a lit pixel's colour, scaled by the colour it would have under white light.
++// A pixel's world position from its depth: the inverse view-projection the
++// lamps' shader drew with (bytes 192..255, rows) and its viewport (1280..1295).
++float3 srLampWorldPos(float4 pos)
++{
++    ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
++    if (b.Load(160) == 0)
++        return 0.0;
++    float4 vp = asfloat(b.Load4(1280));
++    float4 clip = float4((pos.x - vp.x) / vp.z * 2.0 - 1.0, 1.0 - (pos.y - vp.y) / vp.w * 2.0, pos.z, 1.0);
++    float4 p = float4(dot(asfloat(b.Load4(192)), clip), dot(asfloat(b.Load4(208)), clip),
++                      dot(asfloat(b.Load4(224)), clip), dot(asfloat(b.Load4(240)), clip));
++    return p.xyz / p.w;
++}
++float3 srLampLight(float3 worldPos, float3 color)
++{
++    ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
++    uint n = min(b.Load(160), 64u);
++    if (n == 0)
++        return 0.0;
++    float reach = asfloat(b.Load(164));
++    float3 light = asfloat(b.Load3(168));
++    float3 ambient = asfloat(b.Load3(180));
++    float sum = 0.0, glow = 0.0;
++    for (uint i = 0; i < n; i++)
++    {
++        float3 d = asfloat(b.Load3(256 + i * 16)) - worldPos;
++        float dd = dot(d, d);
++        float f = saturate(1.0 - dd / (reach * reach));
++        // Mostly downwards (a shaded head): full under it, a tenth sideways.
++        sum += f * f * (0.1 + 0.9 * saturate(d.y * rsqrt(max(dd, 1e-4))));
++        // The lamp itself: its head glows (within 2 units of the light).
++        glow += saturate(1.0 - dd * 0.25);
++    }
++    float lum = max(dot(ambient, float3(0.2126, 0.7152, 0.0722)), 0.05);
++    return color / lum * light * sum + light * glow * 4.0;
++}
+ // TLAS at the last heap entry (bytes 48-59 of the frame data: direction towards
+ // the sun; 72: scene valid). 1 = sun visible, 0 = an occluder is hit.
+ #if __SHADER_TARGET_MAJOR > 6 || (__SHADER_TARGET_MAJOR == 6 && __SHADER_TARGET_MINOR >= 5)
+@@ -434,6 +473,8 @@ bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id, out u
+ #else
+ uint srRtDebug() { return 0; }
+ float3 srRtWorldPos(float3 lightCoord) { return lightCoord; }
++float3 srLampLight(float3 worldPos, float3 color) { return 0.0; }
++float3 srLampWorldPos(float4 pos) { return 0.0; }
+ float srRtVisibility(float3 worldPos) { return 1.0; }
+ float srRtHitDistance(float3 worldPos) { return -1.0; }
+ bool srRtShadowsReplace() { return false; }
+@@ -446,6 +487,12 @@ bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id, out u
+ static float g_srRtShadowVis = -1.0;  // this pixel's sun visibility, -1 = use the shadow map
+ static float3 g_srRtPixelPos = 0.0;   // this pixel's world position (receivers)
+ static float3 g_srRtReflectSeen = 0.0;  // debug 6: the last reflection colour of this pixel (7: frac of the hit UV, blue = has UV)
++static float4 g_srMat = 0.0;    // buildings: this pixel's mat_map sample (layer weights R, G, B)
++static float4 g_srMatCoarse = 0.0;  // and the whole texture's mean (curtain walls)
++static float4 g_srMatMid = 0.0;     // and over about 8 x 8 texels (3 mips up): the lit panes
++static float3 g_srWinDebug = 0.0;   // debug 14: window light from the texture, the curtain grid, curtain weight
++static float g_srWinGlass = 0.0;    // debug 15: the glass weight the window light reads
++static float2 g_srMatUV = 0.0;  // and its UV
+ // The receivers turn a fetch into shadow as saturate((receiver - fetched) * K),
+ // K = depthBias_FadeRange_FalloffStart_FalloffRate.y. With srRtFade making K
+ // 0.001, fetched = -1000 * (1 - visibility) gives shadow = 1 - visibility
+@@ -501,6 +548,159 @@ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float
+     return conanGamma(resourceDescriptorIndex, texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getGuestTexture2DDimensions(resourceDescriptorIndex, texture)));
+ }
+ 
++// Night windows (patch 0034). The material map's mean 4 mips up: a facade whose
++// glass layer covers nearly everything is a curtain wall, one with windows
++// drawn in the texture has a much lower mean.
++// The window light itself follows the map 2 mips up (about 4 x 4 texels): the
++// glass layer's fine pattern (dirt, bright frames) would light the panes in
++// blotches and outlines; blurred, a pane lights evenly and its frame stays dark.
++// The whole texture's mean (its last mip): a curtain wall is glass all over,
++// a facade with framed panes is not, however big a single pane is (a local
++// mean inside a big pane is 1 too, which put the curtain grid inside panes).
++float4 srMatMean(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[TEX_INDEX(resourceDescriptorIndex)];
++    return conanGamma(resourceDescriptorIndex, texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord, 16.0));
++}
++float4 srMatCoarse(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float bias)
++{
++    Texture2D<float4> texture = g_Texture2DDescriptorHeap[TEX_INDEX(resourceDescriptorIndex)];
++    return conanGamma(resourceDescriptorIndex, texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord, bias));
++}
++
++float srWindowHash(float3 c) { return frac(sin(dot(c, float3(12.9898, 78.233, 37.719))) * 43758.5453); }
++
++// The far city's low-detail buildings (gLowLOD_col, no textures) at night: the
++// curtain-wall window grid of srWindowLight laid on them. Host constants: the
++// draw's viewport, its inverse view-projection rows, the windows' brightness.
++float srWindowLight(float3 p, bool hasPos, float glass, float glassCoarse, float2 uv, out float tone);
++float3 srLodCityWindows(float4 pos, float4 vp, float4 r0, float4 r1, float4 r2, float4 r3, float brightness)
++{
++    float4 clip = float4((pos.x - vp.x) / vp.z * 2.0 - 1.0, 1.0 - (pos.y - vp.y) / vp.w * 2.0, pos.z, 1.0);
++    float4 p = float4(dot(r0, clip), dot(r1, clip), dot(r2, clip), dot(r3, clip));
++    float tone;
++    float a = srWindowLight(p.xyz / p.w, true, 1.0, 1.0, 0.0, tone);
++    return lerp(float3(1.0, 0.72, 0.42), float3(0.85, 0.92, 1.0), tone * tone) * a * brightness;
++}
++
++// The sun and the moon on the sky backdrop (patch 0034), from host constants:
++// sun / moon (direction, brightness), the draw's viewport, its inverse
++// view-projection rows, the camera, the sun's colour.
++#define SR_SKY_MOON_INDEX 32761  // the host's moon texture (kSkyMoonSrv), premultiplied RGBA
++float3 srSkyBodies(float4 pos, float4 sun, float4 moon, float4 vp, float4 r0, float4 r1, float4 r2, float4 r3,
++                   float3 cam, float4 sunColour, uint samplerIndex)
++{
++    float4 clip = float4((pos.x - vp.x) / vp.z * 2.0 - 1.0, 1.0 - (pos.y - vp.y) / vp.w * 2.0, 0.5, 1.0);
++    float4 p = float4(dot(r0, clip), dot(r1, clip), dot(r2, clip), dot(r3, clip));
++    float3 dir = normalize(p.xyz / p.w - cam);
++    float pixelAngle = max(length(fwidth(dir)), 1e-6);  // outside the branches: derivatives need all lanes
++    float3 c = 0.0;
++    // Sun: a disc of about 1.4 degrees with a soft edge, a tight corona and a wide haze.
++    float ds = dot(dir, sun.xyz);
++    float disc = smoothstep(0.99970, 0.99982, ds);
++    float corona = pow(saturate(ds), 600.0) * 0.8 + pow(saturate(ds), 60.0) * 0.18 + pow(saturate(ds), 8.0) * 0.05;
++    c += sunColour.rgb * sun.w * (disc * 5.0 + corona);
++    // Stars at night: a sparse field on a direction grid (about 1 cell in 30 lit),
++    // mostly faint, a few brighter, slowly twinkling; the cloud dome drawn over
++    // the backdrop hides them where it is thick, and they fade near the horizon.
++    [branch] if (moon.w > 0.0 && dir.y > 0.0)
++    {
++        float3 sd = dir * 260.0;
++        float3 cell = floor(sd);
++        float h = srWindowHash(cell + 17.0);
++        if (h < 0.035)
++        {
++            float3 at = cell + 0.5 + (float3(srWindowHash(cell + 3.1), srWindowHash(cell + 5.7), srWindowHash(cell + 9.3)) - 0.5) * 0.6;
++            float d = length(sd - at);
++            float size = max(pixelAngle * 260.0 * 1.2, 0.08);  // about a pixel and a bit
++            float star = saturate(1.0 - d / size);
++            float mag = pow(srWindowHash(cell + 41.0), 6.0) * 7.0 + 0.9;
++            float3 tint = lerp(float3(0.8, 0.88, 1.0), float3(1.0, 0.9, 0.78), srWindowHash(cell + 23.0));
++            c += tint * star * star * mag * moon.w * smoothstep(0.02, 0.25, dir.y);
++        }
++    }
++    // Moon: a pale disc, darker towards its rim, with faint seas; a little glow.
++    float dm = dot(dir, moon.xyz);
++    [branch] if (moon.w > 0.0 && dm > 0.997)
++    {
++        float3 up = abs(moon.y) < 0.99 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
++        float3 ax = normalize(cross(up, moon.xyz)), ay = cross(moon.xyz, ax);
++        float2 q = float2(dot(dir, ax), dot(dir, ay)) / 0.0480;  // disc radius about 2.75 degrees
++        float rr = dot(q, q);
++        [branch] if (sunColour.w > 0.0)
++        {
++            // The painted moon (textures/sky_moon.dds): premultiplied, its own rim.
++            // The mip whose texels match the disc's pixels (512 texels over its diameter).
++            float lod = max(log2(512.0 * pixelAngle / (2.0 * 0.0480)), 0.0);
++            float4 t = rr < 1.0 ? g_Texture2DDescriptorHeap[SR_SKY_MOON_INDEX].SampleLevel(
++                                      g_SamplerDescriptorHeap[samplerIndex], float2(0.5 + 0.5 * q.x, 0.5 - 0.5 * q.y), lod)
++                                : 0.0;
++            c += t.rgb * float3(0.95, 0.97, 1.03) * moon.w * 2.8;
++            c += float3(0.55, 0.62, 0.8) * moon.w * (pow(saturate(dm), 2000.0) * 0.15 + pow(saturate(dm), 150.0) * 0.06);
++            return c;
++        }
++        float inside = 1.0 - smoothstep(0.90, 1.0, rr);
++        float limb = sqrt(saturate(1.0 - rr));
++        // Seas: smooth dark blotches (a few crossed waves), brighter highlands between.
++        float n = sin(q.x * 3.1 + 1.7) * sin(q.y * 2.6 + 0.4) + 0.6 * sin(q.x * 5.3 - q.y * 4.1 + 2.2) +
++                  0.35 * sin(q.x * 9.7 + q.y * 7.9 + 0.9);
++        float seas = 1.0 - 0.32 * smoothstep(0.2, 0.9, n);
++        c += float3(0.86, 0.88, 0.94) * moon.w * inside * (0.6 + 0.4 * limb) * seas * 0.9;
++    }
++    c += float3(0.55, 0.62, 0.8) * moon.w * (pow(saturate(dm), 2000.0) * 0.15 + pow(saturate(dm), 150.0) * 0.06);
++    return c;
++}
++
++// How much a building pixel glows at night (0..1) and the warmth key of its
++// room (tone). glass: the glass layer's weight here, glassCoarse: its mean
++// around; p: the world position (hasPos), else uv places the rooms.
++// Windows drawn in the texture: the glass mask is the window, rooms are 3.2 x
++// 3.6 world cells, four in ten lit. Curtain walls: a window grid laid on the
++// facade itself (axes from the surface normal, 2-unit bays, 3.6-unit floors,
++// frames between the panes, rooms three bays wide, whole floors mostly dark),
++// fading to its mean where the panes are smaller than a pixel.
++float srWindowLight(float3 p, bool hasPos, float glass, float glassCoarse, float2 uv, out float tone)
++{
++    // Rooms by the material map's tile (whole UV repeats): a facade texture repeats per bay or
++    // floor, so a tile's panes light together and no pane is cut in two.
++    float3 cell = float3(floor(uv), 7.0);
++    float h = srWindowHash(cell);
++    tone = frac(h * 17.31);
++    float amount = smoothstep(0.25, 0.55, glass) * (h < 0.42 ? 0.6 + 0.4 * tone : 0.0);
++    // A room lit from its ceiling: a little brighter at the top of the window.
++    if (hasPos) amount *= 0.7 + 0.3 * frac(p.y / 3.6);
++    // Curtain walls only where glass covers nearly everything; facades with framed panes
++    // (mean around 0.6-0.85) keep the windows of their texture.
++    float curtain = hasPos ? smoothstep(0.9, 0.97, glassCoarse) : 0.0;
++    [branch] if (curtain > 0.0)
++    {
++        // The pixel normal from position derivatives is noisy: only its dominant
++        // horizontal axis is used (city facades are mostly axis-aligned), so the
++        // grid and the facade's identity hold steady across the wall.
++        float3 n = normalize(cross(ddx(p), ddy(p)) + 1e-6);
++        float wall = 1.0 - smoothstep(0.5, 0.8, abs(n.y));
++        bool alongZ = abs(n.x) > abs(n.z);  // the wall faces x: it runs along z
++        float2 g = float2((alongZ ? p.z : p.x) / 2.0, p.y / 3.6);
++        float2 f = frac(g);
++        float2 w = max(fwidth(g), 1e-4);
++        float open = saturate(min(f.x - 0.12, 0.88 - f.x) / w.x + 0.5) * saturate(min(f.y - 0.22, 0.86 - f.y) / w.y + 0.5);
++        open = lerp(open, 0.76 * 0.64, saturate(max(w.x, w.y) * 2.0 - 0.5));
++        // The facade: its direction and its plane, so neighbours differ.
++        float facade = (alongZ ? 1.0 : 2.0) * 131.0 + floor((alongZ ? p.x : p.z) / 6.0 + 0.5);
++        float hr = srWindowHash(float3(floor(g.x / 3.0), floor(g.y), facade));
++        float hf = srWindowHash(float3(floor(g.y), facade, 3.7));
++        float lit = hr < (hf < 0.35 ? 0.08 : 0.32) ? 1.0 : 0.0;
++        float roomTone = frac(hr * 17.31);
++        float curtainAmount = wall * open * lit * (0.5 + 0.5 * frac(hr * 31.7)) * saturate(glassCoarse * 1.5);
++        g_srWinDebug = float3(amount, curtainAmount, curtain);
++        amount = lerp(amount, curtainAmount, curtain);
++        tone = lerp(tone, roomTone, curtain);
++    }
++    else
++        g_srWinDebug = float3(amount, 0.0, 0.0);
++    return amount;
++}
++
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[TEX_INDEX(resourceDescriptorIndex)];
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 5672bff..7b0033a 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -405,6 +405,26 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     }
+ #endif
+ 
++#ifdef CONAN_RECOMP
++    // Buildings: the whole material sample and its UV, before the fetch
++    // statement overwrites the UV register (night windows read them).
++    if (srWindowShader && instr.opcode == FetchOpcode::TextureFetch &&
++        instr.dimension == TextureDimension::Texture2D && strcmp(constNamePtr, "mat_map") == 0)
++    {
++        indent();
++        out += "g_srMatUV = ";
++        printSrcRegister(2);
++        out += ";\n";
++        indent();
++        print("g_srMat = tfetch2D(mat_map_Texture2DDescriptorIndex, mat_map_SamplerDescriptorIndex, g_srMatUV, float2({}, {}));\n",
++            instr.offsetX * 0.5f, instr.offsetY * 0.5f);
++        indent();
++        out += "g_srMatCoarse = srMatMean(mat_map_Texture2DDescriptorIndex, mat_map_SamplerDescriptorIndex, g_srMatUV);\n";
++        indent();
++        out += "g_srMatMid = srMatCoarse(mat_map_Texture2DDescriptorIndex, mat_map_SamplerDescriptorIndex, g_srMatUV, 3.0);\n";
++    }
++#endif
++
+ #ifdef REBLUE_RECOMP
+     // Stashed before the fetch statement: the kernel reuses UV registers as
+     // fetch destinations (r6.y = tfetch2D(..., r6.yw)).
+@@ -1502,6 +1522,40 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         // sprites, smoke, fire; the host tints only alpha-blended draws.
+         const bool particle = particleColor && particleDepth && particleTile;
+         srDayNightTintShader = sky || (fog && !light && !water) || water || flare || particle;
++        srSkyBackdropShader = fog && !light && !water && !sky;
++        srLodCityShader = false;
++        for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
++        {
++            const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
++                constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
++            srLodCityShader |= strcmp(reinterpret_cast<const char*>(constantTableData + constantInfo->name), "gLowLOD_col") == 0;
++        }
++    }
++    // Night windows: the city's building shaders weigh their material layers
++    // (mat_map R, G, B) with per-layer constants, the environment reflection
++    // among them (Kenv): the glass. Same rule as tools/shaders/gen_light_regs.py.
++    srWindowShader = false;
++    srLampLitShader = false;
++    if (isPixelShader)
++    {
++        bool kenv = false, matMap = false, key = false, building = false;
++        for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
++        {
++            const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
++                constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
++            const char* name = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
++            kenv |= strcmp(name, "Kenv") == 0;
++            building |= strcmp(name, "gBuildingTint") == 0;
++            matMap |= strcmp(name, "mat_map") == 0;
++            key |= strcmp(name, "gKey1") == 0 || strcmp(name, "gShadCol") == 0 ||
++                   strcmp(name, "shadowMapOffsetScales") == 0;
++        }
++        // Buildings only (gBuildingTint): props and vehicles (boats) share the
++        // glass layer but must not get windows.
++        srWindowShader = kenv && matMap && building;
++        // Night street lamps light the world's lit surfaces (gKey1, gShadCol,
++        // the sun shadow receivers: buildings, terrain, roads, pavements, props).
++        srLampLitShader = key;
+     }
+     // Motion vectors: set by main around its run with the previous constants
+     // (SPIR-V has no previous constants: both runs read the current ones).
+@@ -2879,6 +2933,34 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                                "else if (srRtDebug() == 9) { oC0 = float4(frac(g_srRtPixelPos / 1000.0), 1.0); } "
+                                "else if (srRtDebug() == 10) { oC0 = float4(frac(g_srRtCameraPos / 1000.0), 1.0); }";
+                     }
++                    // Night street lamps: light pools on lit surfaces.
++                    if (srLampLitShader && (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_COLOR0))
++                    {
++                        indent();
++                        out += "oC0.rgb += srLampLight(srLampWorldPos(iPos), oC0.rgb);\n";
++                    }
++                    // Night windows, debug views: 11 the material sample,
++                    // 12 its layers weighted by Kenv, 13 the total weight.
++                    if (srWindowShader && (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_COLOR0))
++                    {
++                        indent();
++                        out += "[branch] if (srRtDebug() == 11) { oC0 = float4(g_srMat.xyz, 1.0); } "
++                               "else if (srRtDebug() == 12) { oC0 = float4(g_srMat.xyz * Kenv.xyz, 1.0); } "
++                               "else if (srRtDebug() == 13) { oC0 = float4(dot(g_srMat.xyz, Kenv.xyz).xxx, 1.0); }\n";
++                        // The glass: the weight of the material's most reflective
++                        // layer (the windows are its red layer), here and around;
++                        // srWindowLight (shader_common.h) places the lit rooms.
++                        indent();
++                        out += "{ float4 srWin = CONST_REL(201); if (srWin.w == 12345.0 && any(srWin.rgb > 0.0)) { "
++                               "float3 srK = max(Kenv.xyz, 0.0); float srKmax = max(max(srK.x, srK.y), max(srK.z, 1e-3)); "
++                               "float srTk; float srA = srWindowLight(";
++                        out += srShadowReceiver ? "srRtWorldPos(iSrLight.xyz), true, " : "float3(0.0, 0.0, 0.0), false, ";
++                        out += "dot(g_srMatMid.xyz, srK) / srKmax, dot(g_srMatCoarse.xyz, srK) / srKmax, g_srMatUV, srTk); "
++                               "float3 srTone = lerp(float3(1.0, 0.72, 0.42), float3(0.85, 0.92, 1.0), srTk * srTk); "
++                               "oC0.rgb += srWin.rgb * srTone * srA; "
++                               "if (srRtDebug() == 14) oC0 = float4(g_srWinDebug, 1.0); "
++                               "else if (srRtDebug() == 15) oC0 = float4(dot(g_srMatMid.xyz, srK) / srKmax, dot(g_srMat.xyz, srK) / srKmax, 0.0, 1.0); } }\n";
++                    }
+                     // Day and night: the host's tint for colour the game's
+                     // lights do not reach (c200, valid with w = 12345).
+                     if (srDayNightTintShader && (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_COLOR0))
+@@ -2886,6 +2968,24 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                         indent();
+                         out += "{ float4 srDayNight = CONST_REL(200); if (srDayNight.w == 12345.0) oC0.rgb *= srDayNight.rgb; }\n";
+                     }
++                    // The far city's low-detail buildings: night windows (host
++                    // constants c201-c206, valid with c206.w = 12345).
++                    if (srLodCityShader && (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_COLOR0))
++                    {
++                        indent();
++                        out += "{ float4 srLodTag = CONST_REL(206); if (srLodTag.w == 12345.0 && srLodTag.x > 0.0) oC0.rgb += "
++                               "srLodCityWindows(iPos, CONST_REL(201), CONST_REL(202), CONST_REL(203), CONST_REL(204), "
++                               "CONST_REL(205), srLodTag.x); }\n";
++                    }
++                    // The sun and the moon on the sky backdrop (host constants
++                    // c201-c209, valid with c208.w = 12345).
++                    if (srSkyBackdropShader && (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_COLOR0))
++                    {
++                        indent();
++                        out += "{ float4 srSkyTag = CONST_REL(208); if (srSkyTag.w == 12345.0) oC0.rgb += srSkyBodies(iPos, "
++                               "CONST_REL(201), CONST_REL(202), CONST_REL(203), CONST_REL(204), CONST_REL(205), CONST_REL(206), "
++                               "CONST_REL(207), srSkyTag.xyz, CONST_REL(209), L0_col_map_SamplerDescriptorIndex); }\n";
++                    }
+                     // Xenos fixed-point render targets (k_16_16, k_16_16_16_16)
+                     // store -32..32: every write clamps there. The host keeps
+                     // them as float targets and clamps here (g_ColorRange,
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index 6de9f71..3d73d7a 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -64,6 +64,10 @@ struct ShaderRecompiler : StringBuffer
+     bool srWaterShader = false;  // gWaterSpec: ray-traced reflections from TEXCOORD4
+     bool srWaterVertexShader = false;
+     bool srDayNightTintShader = false;  // sky, backdrop, water, sun flare: oC0.rgb *= c200 when tagged  // gerstner_wave_amp: ocean waves move its position input
++    bool srWindowShader = false;  // buildings (mat_map + Kenv): night window light from c201
++    bool srLampLitShader = false;
++    bool srSkyBackdropShader = false;
++    bool srLodCityShader = false;  // the far city's low-detail buildings (gLowLOD_col): night windows (c201-c206)  // the distant sky backdrop: our sun and moon (c201-c209)  // world lit surfaces (gKey1): night street lamps
+ #endif
+ 
+ #ifdef REBLUE_RECOMP

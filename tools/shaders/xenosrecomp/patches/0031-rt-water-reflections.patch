@@ -1,0 +1,194 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 25f6a0d..7dea8d4 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -254,6 +254,7 @@ Texture2DArray<float4> g_Texture2DArrayDescriptorHeap[] : register(t0, space6);
+ #define TEX_STACKED_BIT 0x10000000u
+ // Ray-traced sun shadows (docs/cienie-rt-projekt.md): per-frame data in a raw
+ // buffer at a fixed descriptor (the host reserves the last heap entries).
++static float g_srRtReflectTMax = 4000.0;  // reflection ray length; water: 16000 (the skyline across the bay)
+ // Bytes 0-47: rows of the inverse cascade-0 light matrix (light-space shadow
+ // coordinate iTexCoord7 -> world); 64: debug mode; 68: valid.
+ #if !defined(SR_VULKAN_BUFFERS) && !defined(__spirv__)
+@@ -389,7 +390,7 @@ bool srRtReflectTrace(float3 origin, float3 dir, out float t, out uint id, out u
+     ray.Origin = origin;
+     ray.TMin = 0.5;
+     ray.Direction = dir;
+-    ray.TMax = 4000.0;
++    ray.TMax = g_srRtReflectTMax;
+     // Instance mask 1: copies with a material; 2: without (the shadow pass's
+     // copies of the same buildings, characters). The same triangles exist in
+     // both, so the material ones go first and the others only where they miss.
+@@ -747,20 +748,21 @@ float3 srRtHitLight(float sun)
+     return 0.45 + 0.9 * sun;
+ }
+ 
+-// A receiver's environment sample (env_map) replaced by what a ray from the
+-// pixel along the cube direction hits; the sky cube stays where it misses.
+-// Every pixel of the quad gets to the derivatives (misses with uv 0).
+-float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData)
++// The reflection ray from this pixel along dir (offset: start distance; swapRB:
++// the colour in the B, G, R order the caller's swizzle undoes): the sky cube
++// sample stays where it misses. Every pixel of the quad gets to the
++// derivatives (misses with uv 0).
++float4 srRtReflectAlong(float4 env, float3 dir, float offset, bool swapRB)
+ {
+-    if (!srRtReflections() && srRtDebug() != 6 && srRtDebug() != 7)
+-        return env;
+-    float3 dir = normalize(cubeMapData.cubeMapDirections[texCoord.z]);
+     g_srRtReflectSeen = env.rgb;
+-    float3 origin = g_srRtPixelPos + dir * 0.3;
++    float3 origin = g_srRtPixelPos + dir * offset;
+     float t;
+     uint id, prim;
+     float2 bary;
+     bool hit = srRtReflectTrace(origin, dir, t, id, prim, bary);
++    // Debug 8: green = hit (red: its distance / 3000), blue = miss (red: dir.y).
++    if (srRtDebug() == 8)
++        g_srRtReflectSeen = hit ? float3(saturate(t / 3000.0), 1.0, 0.0) : float3(saturate(dir.y), 0.0, 1.0);
+     uint4 m, m1;
+     float2 uv;
+     bool hasUv;
+@@ -780,8 +782,38 @@ float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData)
+     // (yellow: a character)
+     float3 path = (m1.y & (1u << 11)) ? float3(1, 1, 0) : (m1.y & (1u << 9)) ? float3(1, 0, 0)
+                 : m.y != 0xFFFFFFu ? float3(0, 1, 0) : float3(0, 0, 1);
+-    g_srRtReflectSeen = srRtDebug() == 7 ? path * (hasUv ? 1.0 : 0.5) : color;
+-    return float4(color, env.a);
++    if (srRtDebug() != 8)
++        g_srRtReflectSeen = srRtDebug() == 7 ? path * (hasUv ? 1.0 : 0.5) : color;
++    return float4(swapRB ? color.zyx : color, env.a);
++}
++// A receiver's environment sample (env_map) replaced by what a ray from the
++// pixel along the cube direction hits.
++float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData, bool swapRB)
++{
++    if (!srRtReflections() && srRtDebug() != 6 && srRtDebug() != 7)
++        return env;
++    return srRtReflectAlong(env, normalize(cubeMapData.cubeMapDirections[texCoord.z]), 0.3, swapRB);
++}
++// Water (pixel shaders with gWaterSpec): its sky sample becomes what a ray
++// along the reflection hits, then the game's own Fresnel and water colours mix
++// it as they mixed the sky. The game reads that cube with coordinates its
++// ripples move (the cube direction is a constant), so the ray is the view
++// direction from the camera (g_srRtCameraPos, from ViewInvMat) mirrored on the
++// water plane, tilted by the ripples through the sky sample's brightness.
++// Rays below the horizon are lifted to graze it: they would only find the
++// water itself.
++static float3 g_srRtCameraPos = 0.0;  // water: the camera's world position
++float4 srRtReflectWater(float4 env, float3 texCoord, inout CubeMapData cubeMapData, bool swapRB)
++{
++    if (!srRtReflections() && srRtDebug() != 6 && srRtDebug() != 7 && srRtDebug() != 8)
++        return env;
++    float3 view = normalize(g_srRtPixelPos - g_srRtCameraPos);
++    float3 dir = float3(view.x, -view.y, view.z);
++    float ripple = dot(env.rgb, 1.0 / 3.0) - 0.5;
++    dir.xz += ripple * 0.08;
++    dir = normalize(float3(dir.x, max(dir.y, 0.02), dir.z));
++    g_srRtReflectTMax = 16000.0;  // the skyline across the bay is past the receivers' 4000
++    return srRtReflectAlong(env, dir, 1.0, swapRB);
+ }
+ 
+ #ifdef CONAN_RECOMP
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 910fc26..68a707e 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -431,10 +431,14 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+         out += "srRtShadowDepth(";
+     // Ray-traced reflections: the receivers' environment cube sample becomes
+     // what a ray along the same direction hits (the sky cube where it misses).
+-    const bool srRtReflectFetch = srShadowReceiverShader && instr.opcode == FetchOpcode::TextureFetch &&
+-        instr.dimension == TextureDimension::TextureCube && strcmp(constNamePtr, "env_map") == 0;
++    // Water: its sky cube (samp_env) the same way.
++    const bool srRtWaterFetch = srWaterShader && instr.opcode == FetchOpcode::TextureFetch &&
++        instr.dimension == TextureDimension::TextureCube && strcmp(constNamePtr, "samp_env") == 0;
++    const bool srRtReflectFetch = srRtWaterFetch || (srShadowReceiverShader &&
++        instr.opcode == FetchOpcode::TextureFetch && instr.dimension == TextureDimension::TextureCube &&
++        strcmp(constNamePtr, "env_map") == 0);
+     if (srRtReflectFetch)
+-        out += "srRtReflect(";
++        out += srRtWaterFetch ? "srRtReflectWater(" : "srRtReflect(";
+ #endif
+     switch (instr.opcode)
+     {
+@@ -506,7 +510,19 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     {
+         out += ", ";
+         printSrcRegister(3);
+-        out += ", cubeMapData)";
++        // The game reads some sky cubes with red and blue swapped (.zyx, its
++        // data layout): the ray's colour is returned in that order so that
++        // the swizzle turns it back into RGB.
++        // The fetched components in the order the written ones take them:
++        // "zyx" whatever the destination mask (r3.xyz or r1.yzw).
++        std::string fetched;
++        for (size_t i = 0; i < 4; i++)
++        {
++            const auto swizzle = getDestSwizzle(instr.dstSwizzle, i);
++            if (swizzle >= FetchDestinationSwizzle::X && swizzle <= FetchDestinationSwizzle::W)
++                fetched += SWIZZLES[uint32_t(swizzle)];
++        }
++        out += fetched.rfind("zyx", 0) == 0 ? ", cubeMapData, true)" : ", cubeMapData, false)";
+     }
+ #endif
+     out += ".";
+@@ -1435,6 +1451,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                                    "shadowMapOffsetScales") == 0;
+     }
+     srShadowReceiverShader = srShadowReceiver && isPixelShader;
++    // Water pixel shaders (constant gWaterSpec): ray-traced reflections of the
++    // scene; both read their world position from TEXCOORD4 (Mobj * position).
++    srWaterShader = false;
++    for (uint32_t i = 0; i < constantTableContainer->constantTable.constants && isPixelShader; i++)
++    {
++        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
++            constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
++        srWaterShader |= strcmp(reinterpret_cast<const char*>(constantTableData + constantInfo->name),
++                                "gWaterSpec") == 0;
++    }
+     // Motion vectors: set by main around its run with the previous constants
+     // (SPIR-V has no previous constants: both runs read the current ones).
+     if (!isPixelShader)
+@@ -2177,6 +2203,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         if (srShadowReceiverShader)
+             out += "\tg_srRtPixelPos = srRtWorldPos(iSrLight.xyz);\n"
+                    "\tg_srRtShadowVis = srRtShadowsReplace() ? srRtVisibilitySoft(g_srRtPixelPos) : -1.0;\n";
++        else if (srWaterShader)
++            out += "\tg_srRtPixelPos = iTexCoord4.xyz;\n"
++                   "\tg_srRtCameraPos = float3(ViewInvMat(0).w, ViewInvMat(1).w, ViewInvMat(2).w);\n";
+ #endif
+ #if defined(UNLEASHED_RECOMP) || defined(CONAN_RECOMP)
+         out += "\tfloat2 pixelCoord = 0.0;\n";
+@@ -2794,7 +2823,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                                "else if (srRtDebug() == 4) { float d = srRtHitDistance(srRtWorldPos(iSrLight.xyz)); "
+                                "oC0 = float4(max(d, 0.0) / 100.0, d >= 0.0 ? 1.0 : 0.0, "
+                                "all(iSrLight.xyz == saturate(iSrLight.xyz)) ? 1.0 : 0.0, 1.0); } "
+-                               "else if (srRtDebug() == 6 || srRtDebug() == 7) { oC0 = float4(g_srRtReflectSeen, 1.0); }";
++                               "else if (srRtDebug() == 6 || srRtDebug() == 7) { oC0 = float4(g_srRtReflectSeen, 1.0); } "
++                               "else if (srRtDebug() == 9) { oC0 = float4(frac(srRtWorldPos(iSrLight.xyz) / 1000.0), 1.0); }";
++                    }
++                    // Water: the reflection views (6, 7, 8), its world position (1, 9)
++                    // and the camera position (10).
++                    else if (srWaterShader && (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_COLOR0))
++                    {
++                        indent();
++                        out += "[branch] if (srRtDebug() == 6 || srRtDebug() == 7 || srRtDebug() == 8) { oC0 = float4(g_srRtReflectSeen, 1.0); } "
++                               "else if (srRtDebug() == 1) { oC0 = float4(frac(g_srRtPixelPos / 10.0), 1.0); } "
++                               "else if (srRtDebug() == 9) { oC0 = float4(frac(g_srRtPixelPos / 1000.0), 1.0); } "
++                               "else if (srRtDebug() == 10) { oC0 = float4(frac(g_srRtCameraPos / 1000.0), 1.0); }";
+                     }
+                     // Xenos fixed-point render targets (k_16_16, k_16_16_16_16)
+                     // store -32..32: every write clamps there. The host keeps
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index 6c7e906..c47fc34 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -61,6 +61,7 @@ struct ShaderRecompiler : StringBuffer
+     // A sun shadow receiver pixel shader: its samp_depth fetches go through
+     // srRtShadowDepth (ray-traced shadows replace the cascades).
+     bool srShadowReceiverShader = false;
++    bool srWaterShader = false;  // gWaterSpec: ray-traced reflections from TEXCOORD4
+ #endif
+ 
+ #ifdef REBLUE_RECOMP

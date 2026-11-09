@@ -1,0 +1,68 @@
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index d05f038..5672bff 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -1474,6 +1474,35 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         srWaterVertexShader |= strcmp(reinterpret_cast<const char*>(constantTableData + constantInfo->name),
+                                       "gerstner_wave_amp") == 0;
+     }
++    // Day and night: pixel shaders whose colour comes from textures rather than
++    // the game's lights get a tint the host writes to c200 (the sky dome:
++    // TopFogColor / gContinentLight; the sky backdrop: gHorizFogCol_KFog without
++    // gLightPos; water: gWaterSpec; the sun's flare: flareSampler). Same rule as
++    // tools/shaders/gen_light_regs.py.
++    srDayNightTintShader = false;
++    if (isPixelShader)
++    {
++        bool sky = false, fog = false, light = false, water = false, flare = false;
++        bool particleColor = false, particleDepth = false, particleTile = false;
++        for (uint32_t i = 0; i < constantTableContainer->constantTable.constants; i++)
++        {
++            const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
++                constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
++            const char* name = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
++            sky |= strcmp(name, "TopFogColor") == 0 || strcmp(name, "gContinentLight") == 0;
++            fog |= strcmp(name, "gHorizFogCol_KFog") == 0;
++            light |= strcmp(name, "gLightPos") == 0;
++            water |= strcmp(name, "gWaterSpec") == 0;
++            flare |= strcmp(name, "flareSampler") == 0;
++            particleColor |= strcmp(name, "colorMap") == 0;
++            particleDepth |= strcmp(name, "depthMap") == 0;
++            particleTile |= strcmp(name, "tileScaleOffset") == 0;
++        }
++        // Soft particles (colorMap, depthMap, tileScaleOffset): the sky's cloud
++        // sprites, smoke, fire; the host tints only alpha-blended draws.
++        const bool particle = particleColor && particleDepth && particleTile;
++        srDayNightTintShader = sky || (fog && !light && !water) || water || flare || particle;
++    }
+     // Motion vectors: set by main around its run with the previous constants
+     // (SPIR-V has no previous constants: both runs read the current ones).
+     if (!isPixelShader)
+@@ -2850,6 +2879,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                                "else if (srRtDebug() == 9) { oC0 = float4(frac(g_srRtPixelPos / 1000.0), 1.0); } "
+                                "else if (srRtDebug() == 10) { oC0 = float4(frac(g_srRtCameraPos / 1000.0), 1.0); }";
+                     }
++                    // Day and night: the host's tint for colour the game's
++                    // lights do not reach (c200, valid with w = 12345).
++                    if (srDayNightTintShader && (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_COLOR0))
++                    {
++                        indent();
++                        out += "{ float4 srDayNight = CONST_REL(200); if (srDayNight.w == 12345.0) oC0.rgb *= srDayNight.rgb; }\n";
++                    }
+                     // Xenos fixed-point render targets (k_16_16, k_16_16_16_16)
+                     // store -32..32: every write clamps there. The host keeps
+                     // them as float targets and clamps here (g_ColorRange,
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index 3c64a0d..6de9f71 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -62,7 +62,8 @@ struct ShaderRecompiler : StringBuffer
+     // srRtShadowDepth (ray-traced shadows replace the cascades).
+     bool srShadowReceiverShader = false;
+     bool srWaterShader = false;  // gWaterSpec: ray-traced reflections from TEXCOORD4
+-    bool srWaterVertexShader = false;  // gerstner_wave_amp: ocean waves move its position input
++    bool srWaterVertexShader = false;
++    bool srDayNightTintShader = false;  // sky, backdrop, water, sun flare: oC0.rgb *= c200 when tagged  // gerstner_wave_amp: ocean waves move its position input
+ #endif
+ 
+ #ifdef REBLUE_RECOMP

@@ -11,4 +11,12 @@ namespace superman_returns::native {
 // Called once per guest swap; starts the watchdog thread on first use.
 void HangWatchdogBeat();
 
+// Called by the render worker thread at start: sr_native_sample_worker_at_s
+// samples it like the swap thread.
+void RegisterWorkerThreadForSampling();
+
+// Keeps the calling thread on the CPU's performance cores (hybrid CPUs, e.g. i9-12900K:
+// 8 P-cores + 8 E-cores) and out of power throttling (sr_pin_performance_cores).
+void PreferPerformanceCores(const char* name);
+
 }  // namespace superman_returns::native

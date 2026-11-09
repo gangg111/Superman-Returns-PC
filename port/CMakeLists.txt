@@ -45,6 +45,7 @@ set(SUPERMANRETURNS_SOURCES
     src/audio_api_log.cpp
     src/shadow_range.cpp
     src/graphics_menu.cpp
+    src/launcher_settings.cpp
     src/native_audio/sample_bank.cpp
     src/native_audio/resampler.cpp
     src/native_audio/dsp.cpp
@@ -62,11 +63,18 @@ set(SUPERMANRETURNS_SOURCES
     src/input/native_input.cpp
     src/input/gameinput_driver.cpp
     src/input/rawinput_kbm_driver.cpp
+    src/input/key_capture.cpp
+    src/input/input_recorder.cpp
     src/audio_out/xaudio2_output.cpp
     src/sr_settings.cpp
     src/graphics/backend_selection.cpp
     src/sr_preset.cpp
     src/skip_intro.cpp
+    src/flight_tuning.cpp
+    src/daynight.cpp
+    src/prop_streaming.cpp
+    src/world_streamer.cpp
+  src/water_physics.cpp
     src/renderdoc_capture.cpp
     src/render_scale.cpp
     src/lsfg_settings.cpp
@@ -81,7 +89,7 @@ endif()
 rexglue_setup_target(superman_returns GPU_PLUGINS xenos)
 if(WIN32)
     # Native input: GameInput (Windows SDK gameinput.lib) for controllers.
-    target_link_libraries(superman_returns PRIVATE gameinput xaudio2)
+    target_link_libraries(superman_returns PRIVATE gameinput xaudio2 comctl32)
 endif()
 
 # Application icon (resources/superman_returns.ico, local and optional). It is the
@@ -212,7 +220,11 @@ if(WIN32 AND EXISTS "${SR_REXGPU_SOURCE_DIR}/src/graphics/d3d12/command_processo
             ${SR_NATIVE_ROOT}/native_graphics_system.cpp
             ${SR_NATIVE_ROOT}/native_renderer.cpp
             ${SR_NATIVE_ROOT}/rt_shadows.cpp
+            ${SR_NATIVE_ROOT}/water.cpp
             ${SR_NATIVE_ROOT}/dlss.cpp
+            ${SR_NATIVE_ROOT}/frame_pacing.cpp
+            ${SR_NATIVE_ROOT}/buffer_stock.cpp
+            ${SR_NATIVE_ROOT}/precompile_screen.cpp
             ${SR_NATIVE_ROOT}/pm4_mirror.cpp
             ${SR_NATIVE_ROOT}/../graphics/guest/draw_state.cpp
             ${SR_NATIVE_ROOT}/../graphics/guest/captured_batch.cpp
@@ -291,8 +303,16 @@ if(WIN32 AND EXISTS "${SR_REXGPU_SOURCE_DIR}/src/graphics/d3d12/command_processo
                 COMMENT "Packing native renderer shaders")
             set(SR_NATIVE_SHADERS_RC "${CMAKE_CURRENT_BINARY_DIR}/superman_returns_shaders.rc")
             file(WRITE "${SR_NATIVE_SHADERS_RC}" "2 RCDATA \"${SR_NATIVE_SHADER_PAK}\"\n")
+            # Recorded pipelines precompiled at the first start (RCDATA 3,
+            # tools/shaders/build_pipeline_db.py merges recordings into it).
+            set(SR_NATIVE_RC_DEPENDS "${SR_NATIVE_SHADER_PAK}")
+            set(SR_NATIVE_PIPELINE_DB "${CMAKE_CURRENT_SOURCE_DIR}/resources/superman_returns_pipelines.bin")
+            if(EXISTS "${SR_NATIVE_PIPELINE_DB}")
+                file(APPEND "${SR_NATIVE_SHADERS_RC}" "3 RCDATA \"${SR_NATIVE_PIPELINE_DB}\"\n")
+                list(APPEND SR_NATIVE_RC_DEPENDS "${SR_NATIVE_PIPELINE_DB}")
+            endif()
             set_source_files_properties("${SR_NATIVE_SHADERS_RC}" PROPERTIES
-                OBJECT_DEPENDS "${SR_NATIVE_SHADER_PAK}")
+                OBJECT_DEPENDS "${SR_NATIVE_RC_DEPENDS}")
             target_sources(superman_returns PRIVATE "${SR_NATIVE_SHADERS_RC}")
         elseif(SR_NATIVE STREQUAL "RENDERER")
             message(STATUS "No DXIL in ${SR_NATIVE_SHADER_DIR}: the native renderer will "
@@ -337,6 +357,13 @@ endif()
 
 # Experimental Release build for profiling cross-file guest/native call costs.
 # Keep the ordinary instruction and floating-point settings unchanged.
+# Linker map next to the exe: the stack sampler (hang_watchdog.cpp) prints renderer
+# frames as exe offsets, resolved against this map (the Release build has no PDB).
+option(SR_LINK_MAP "Write superman_returns.map with the linker" OFF)
+if(SR_LINK_MAP AND WIN32)
+    target_link_options(superman_returns PRIVATE "-Wl,/MAP:${CMAKE_CURRENT_BINARY_DIR}/superman_returns.map")
+endif()
+
 option(SR_THIN_LTO "Enable Clang ThinLTO for Release guest/native/Vulkan code" OFF)
 if(SR_THIN_LTO)
     if(NOT WIN32 OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")

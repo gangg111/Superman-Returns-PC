@@ -12,6 +12,7 @@
 #include <rex/cvar.h>
 
 #include "frame_stats.h"
+#include "launcher_settings.h"
 #include "input/native_input.h"
 #include "audio_out/xaudio2_output.h"
 
@@ -146,6 +147,12 @@ class SupermanReturnsApp : public rex::ReXApp {
   // std::unique_ptr<rex::ui::AchievementNotificationDialog>
   // CreateAchievementNotificationDialog() override;
   // void OnShutdown() override {}
-  // void OnConfigurePaths(rex::PathConfig& paths) override {}
+  // Started without the launcher: the game folder next to the executable, and
+  // the launcher's last settings carried into the config once (launcher_settings.h).
+  void OnConfigurePaths(rex::PathConfig& paths) override {
+    superman_returns::WaitForPreviousInstance();
+    if (paths.game_data_root.empty()) paths.game_data_root = superman_returns::DefaultGameDataRoot();
+    superman_returns::MigrateLauncherSettings(paths.config_path);
+  }
 };
 

@@ -26,6 +26,15 @@
 
 REXCVAR_DECLARE(int32_t, sr_native_fps_limit);
 
+// The game's limiter loops sleep through KeDelayExecutionThread -> Sleep(ms).
+// Without a raised timer resolution Windows 11 rounds such a sleep up to the
+// process default (15.6 ms), so a 1 ms wait could turn a 16 ms frame into 31.
+// 1 ms for the process, as the game had on the console.
+REXCVAR_DEFINE_BOOL(sr_timer_resolution_1ms, true, "Superman Returns",
+                    "Raise the Windows timer resolution to 1 ms for the game's sleeps (frame limiter)");
+#pragma comment(lib, "winmm.lib")
+extern "C" __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned int);
+
 namespace {
 
 // Period of the game's 30 Hz loops in its clock (nanoseconds).
@@ -57,6 +66,13 @@ void LogLimiter(uint8_t* base) {
 }  // namespace
 
 REX_HOOK_RAW(sub_82720B50) {
+  static const bool timer = [] {
+    if (!REXCVAR_GET(sr_timer_resolution_1ms)) return false;
+    const unsigned int r = timeBeginPeriod(1);
+    REXLOG_INFO("frame limiter: timer resolution 1 ms ({})", r == 0 ? "set" : "refused");
+    return r == 0;
+  }();
+  (void)timer;
   static const bool log = [] {
     const char* v = std::getenv("SR_LOG_FRAME_LIMITER");
     return v && *v && *v != '0';

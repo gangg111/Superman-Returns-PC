@@ -35,11 +35,17 @@ class RawInputKbmDriver final : public rex::input::InputDriver {
 
   // From the Raw Input thread.
   void OnRawInput(const void* raw);
+  // UI thread: the cursor is visible (not mouse-looking, no pad in use).
+  bool CursorShown() const;
 
  private:
   bool Enabled() const;
   bool GameInForeground() const;
   void UpdateMouseCapture(bool capture);
+  void ApplyCursor();  // UI thread: hidden while mouse-looking or while a pad is connected
+ public:
+  void OnCursorTimer();  // Raw Input thread, every 250 ms
+ private:
   void ThreadMain();
 
   std::mutex mutex_;
@@ -57,6 +63,8 @@ class RawInputKbmDriver final : public rex::input::InputDriver {
   std::thread thread_;
   std::atomic<bool> requested_capture_{false};  // last state sent to the UI thread
   bool mouse_captured_ = false;                 // UI thread
+  std::atomic<bool> pad_hides_cursor_{false};   // a pad is the input in use (sr_hide_cursor_with_pad)
+  std::atomic<int64_t> last_kbm_use_ms_{0};      // last key, click or mouse move (NowMs)
 };
 
 }  // namespace superman_returns::input

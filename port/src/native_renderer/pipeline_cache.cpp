@@ -234,8 +234,22 @@ void PipelineCache::Start(ID3D12Device* device, ID3D12RootSignature* root_signat
   for (unsigned i = 0; i < threads; ++i) threads_.emplace_back([this] { Worker(); });
 }
 
-void PipelineCache::Worker() {
-  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+void PipelineCache::StartupProgress(size_t& done, size_t& total) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  total = queue_.size();
+  // Dispatched (or skipped as made by the renderer) and no longer compiling.
+  size_t in_flight = 0;
+  for (size_t i = 0; i < next_ && i < queue_.size(); ++i) in_flight += pending_.count(queue_[i].key);
+  done = std::min(next_, queue_.size()) - in_flight;
+}
+
+void PipelineCache::AddStartupThreads(unsigned count) {
+  for (unsigned i = 0; i < count; ++i) threads_.emplace_back([this] { Worker(true); });
+}
+
+void PipelineCache::Worker(bool startup_only) {
+  SetThreadPriority(GetCurrentThread(),
+                    startup_only ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_BELOW_NORMAL);
   SetThreadDescription(GetCurrentThread(), L"Native PSO precompile");
   std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
   while (true) {
@@ -258,7 +272,9 @@ void PipelineCache::Worker() {
                     "driver compile time)",
                     compiled_, wall, compile_ms_);
       }
-      // Idle workers stay alive for pipelines requested during play.
+      // Idle workers stay alive for pipelines requested during play; the extra
+      // startup threads leave.
+      if (startup_only && next_ >= queue_.size()) break;
       work_cv_.wait(lock, [&] {
         skip_done();
         return stop_ || !urgent_.empty() || next_ < queue_.size();

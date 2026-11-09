@@ -5,7 +5,10 @@
 // docs/native-port-plan.md section 2.
 //
 #include "native_renderer.h"
+#include "../daynight.h"
+#include "../prop_streaming.h"
 #include "guest_cpu_profile.h"
+#include "hang_watchdog.h"
 #include "checked_guest_memory.h"
 #include "guest_hash.h"
 #include "cpu_features.h"
@@ -30,11 +33,15 @@
 #include <dxgi1_4.h>
 
 #include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
 #include <array>
 #include <immintrin.h>
 #include <chrono>
 #include <atomic>
 #include <set>
+#include <map>
+#include <tuple>
 #include <thread>
 #include <cmath>
 #include <cstdio>
@@ -182,7 +189,87 @@ REXCVAR_DEFINE_BOOL(sr_native_debug_no_present, false, "Superman Returns Native"
 REXCVAR_DEFINE_BOOL(sr_native_own_queue, true, "Superman Returns Native",
                     "Native renderer submits on its own D3D12 direct queue");
 REXCVAR_DEFINE_STRING(sr_native_skip_ps, "", "Superman Returns Native",
-                      "Debug: skip draws using this pixel shader (hex container hash)");
+                      "Debug: skip draws using this pixel shader (hex container hash; <hash>:<count> = only draws of that index count)");
+REXCVAR_DEFINE_DOUBLE(sr_lamp_height, 20.0, "Superman Returns",
+                      "Night street lamps: height of the lamp head above the post's base (world units)");
+REXCVAR_DEFINE_DOUBLE(sr_lamp_arm, 0.0, "Superman Returns",
+                      "Night street lamps: reach of the arm from the post along the lamp's local axis");
+REXCVAR_DEFINE_DOUBLE(sr_lamp_radius, 40.0, "Superman Returns", "Night street lamps: reach of the light");
+REXCVAR_DEFINE_DOUBLE(sr_lamp_power, 2.0, "Superman Returns", "Night street lamps: brightness (0 = off)");
+REXCVAR_DEFINE_BOOL(sr_sky_bodies, true, "Superman Returns",
+                    "Day and night: draw the sun (where the light comes from) and the moon on the sky backdrop");
+REXCVAR_DEFINE_BOOL(sr_water_modern, true, "Superman Returns",
+                    "Open water: small ripples from Crest's wave normal map (textures/water/crest_wave_normals.dds) "
+                    "on the game's own water");
+REXCVAR_DEFINE_DOUBLE(sr_water_detail, 1.0, "Superman Returns", "Open water: strength of the ripples (1 = Crest's)");
+REXCVAR_DEFINE_DOUBLE(sr_water_split, 0.0, "Superman Returns",
+                      "Debug: modern open water only left of this share of the screen width (0 = everywhere)");
+REXCVAR_DEFINE_BOOL(sr_window_rooms, true, "Superman Returns",
+                    "Night windows: rooms behind each window (interior mapping, Gaxil's atlas, textures/windows/)");
+REXCVAR_DEFINE_BOOL(sr_window_log, false, "Superman Returns",
+                    "Debug: log each building draw with night windows (shader, texture names, c0-c31) once");
+REXCVAR_DEFINE_STRING(sr_glow_textures, "2B4E2A34C08C7EEA_512x128_f18", "Superman Returns",
+                      "Textures (content names, comma-separated) that glow at night: the Daily Planet letters");
+REXCVAR_DEFINE_DOUBLE(sr_glow_strength, 2.5, "Superman Returns",
+                      "Night glow of sr_glow_textures (emission = texture colour x this x night); 0 = off");
+REXCVAR_DEFINE_STRING(sr_glow_flat_textures, "D9813AB829D6C496_512x512_f18", "Superman Returns",
+                      "Colour maps (slot 1, PS 3A7A1A60DE39C81F) whose sr_glow_flat_uv area glows at night in "
+                      "one colour: the big Daily Planet globe's atlas (globe and letters are one mesh)");
+REXCVAR_DEFINE_STRING(sr_glow_flat_uv, "0.58 0 1 1", "Superman Returns",
+                      "UV rectangle (u0 v0 u1 v1) of sr_glow_flat_textures that glows: the letters' part "
+                      "(measured: globe u 0-0.3, letters u 0.6-0.95)");
+REXCVAR_DEFINE_BOOL(sr_glow_uvview, false, "Superman Returns",
+                    "Debug: sr_glow_flat_textures draws show their colour-map UV as red/green");
+REXCVAR_DEFINE_DOUBLE(sr_glow_flat_strength, 0.9, "Superman Returns",
+                      "Night glow of sr_glow_flat_textures objects (warm emission x this x night); 0 = off");
+REXCVAR_DEFINE_BOOL(sr_draw_idview, false, "Superman Returns",
+                    "Debug: paint every draw as a colour barcode of its id (3 digits, palette red orange "
+                    "yellow green cyan blue violet magenta white grey, black separator); ids logged as idview");
+REXCVAR_DEFINE_BOOL(sr_glow_probe, false, "Superman Returns",
+                    "Debug: draws given the night glow turn bright magenta");
+REXCVAR_DEFINE_STRING(sr_texture_draw_log, "", "Superman Returns",
+                      "Debug: log the shaders and slots of draws using this texture content name");
+REXCVAR_DEFINE_BOOL(sr_player_log, false, "Superman Returns",
+                    "Measurement: log Superman's world position and speed (from his skinned draws) every 0.25 s");
+REXCVAR_DEFINE_BOOL(sr_far_log, false, "Superman Returns",
+                    "Debug: log how far the city's full-detail instances reach and the district blocks drawn");
+REXCVAR_DEFINE_STRING(sr_lamp_cache, "lamp_cache.bin", "Superman Returns",
+                      "Night street lamps: file keeping every lamp seen so far (whole city lit once flown over; "
+                      "empty = off)");
+REXCVAR_DEFINE_BOOL(sr_lamp_log, false, "Superman Returns", "Log the street lamps' transforms");
+REXCVAR_DEFINE_DOUBLE(sr_lod_distance_scale, 1.0, "Superman Returns",
+                      "Distance of the city's full-detail objects, times the game's 1384 units (1 = original; "
+                      "14 puts the edge past the far clip plane at 18000, so nothing in view is simplified, but "
+                      "fast flight then drops to ~47 fps on the CPU; 3 keeps ~55 fps)")
+    .range(0.5, 20.0);
+REXCVAR_DEFINE_STRING(sr_probe_pair, "", "Superman Returns Native",
+                      "Debug: 'a,b,gap' find big-endian floats a and b within gap bytes in guest memory");
+REXCVAR_DEFINE_STRING(sr_probe_image_value, "", "Superman Returns Native",
+                      "Debug: 'v1,v2' list the game image's addresses holding these big-endian floats");
+REXCVAR_DEFINE_STRING(sr_probe_image_dump, "", "Superman Returns Native",
+                      "Debug: 'ADDR:count,...' log that many 32-bit words of guest memory");
+REXCVAR_DEFINE_STRING(sr_probe_poke, "", "Superman Returns Native",
+                      "Debug: 'ADDR=value,...' big-endian floats written into guest memory every frame");
+REXCVAR_DEFINE_INT32(sr_probe_pair_swap, 0, "Superman Returns Native", "Debug: the swap of the sr_probe_pair scan");
+// Both cuts raised together draw the islands' real buildings. That overran two Xbox-sized limits,
+// both fixed in prop_streaming.cpp: the per-level instance buffers (sr_lod_instance_room) and the
+// 7 MB command ring (sr_command_ring_mb); with them the game froze 11-43 s in.
+REXCVAR_DEFINE_DOUBLE(sr_lod_far_scale, 1.0, "Superman Returns",
+                      "Distance beyond which the city's buildings give way to low-detail district blocks, times "
+                      "the game's 4536 units (1 = original; 4 puts it past the far clip plane at 18000)")
+    .range(1.0, 10.0);
+REXCVAR_DEFINE_DOUBLE(sr_lod_small_scale, 1.0, "Superman Returns",
+                      "Smallest on-screen size (radius over distance, the game's 0.01148 times this) below which "
+                      "a city object gives way to its district's low-detail block (1 = original; with "
+                      "sr_lod_far_scale 4 no district block is left over the bay)")
+    .range(0.01, 1.0);
+REXCVAR_DEFINE_DOUBLE(sr_rt_instance_range, 2100.0, "Superman Returns",
+                      "Ray tracing takes the city's copies within this distance of the camera (0 = all)");
+REXCVAR_DEFINE_INT32(sr_lod_distance_scale_from_swap, 0, "Superman Returns",
+                     "Debug: the original distance before this frame, sr_lod_distance_scale from it (A/B in one run)");
+REXCVAR_DEFINE_BOOL(sr_lod_log, false, "Superman Returns",
+                    "Debug: log static objects (world matrix origin) whose drawn index total changes between "
+                    "frames, with the camera distance (level-of-detail switches)");
 REXCVAR_DEFINE_DOUBLE(sr_native_edram_alias_alpha, 0.0, "Superman Returns Native",
                       "Alpha written into color surfaces whose EDRAM was clobbered by aliasing");
 REXCVAR_DEFINE_BOOL(sr_native_edram_reinterpret, true, "Superman Returns Native",
@@ -199,6 +286,10 @@ REXCVAR_DEFINE_BOOL(sr_native_worker, true, "Superman Returns Native",
                     "requires sr_native_pm4_mirror)");
 REXCVAR_DEFINE_BOOL(sr_native_worker_lag, true, "Superman Returns Native",
                     "Let the recording worker finish a frame while the guest starts the next one");
+REXCVAR_DEFINE_INT32(sr_native_worker_lag_frames, 1, "Superman Returns Native",
+                     "With sr_native_worker_lag: how many frames the recording worker may be behind the "
+                     "guest (2 absorbs a single slow worker frame instead of holding the game)")
+    .range(1, 2);
 REXCVAR_DEFINE_BOOL(sr_native_async_pipelines, true, "Superman Returns Native",
                     "Pipelines missing from the cache compile in the background for passes the game "
                     "redraws every frame (scene geometry, shadows, transparents): the draw is skipped "
@@ -221,6 +312,11 @@ REXCVAR_DEFINE_INT32(sr_native_debug_texture_format, -1, "Superman Returns Nativ
                      "Debug: log every created texture of this Xenos format");
 REXCVAR_DEFINE_BOOL(sr_native_debug_buffers_always_dirty, false, "Superman Returns Native",
                     "Debug: re-upload every draw's vertex/index range (ignores Unlock tracking)");
+REXCVAR_DEFINE_BOOL(sr_native_const_range, false, "Superman Returns Native",
+                    "Upload only the float constants a shader can read (const_range.inc) instead of the whole bank");
+REXCVAR_DEFINE_BOOL(sr_native_persistent_raw_srv, false, "Superman Returns Native",
+                    "Keep a guest vertex buffer's raw SRV (shader vertex fetch) across frames instead of "
+                    "creating it again every frame");
 REXCVAR_DEFINE_BOOL(sr_native_debug_clears, false, "Superman Returns Native", "Debug: log resolve depth clears");
 REXCVAR_DEFINE_BOOL(sr_native_debug_no_ztest, false, "Superman Returns Native", "Debug: disable all depth tests");
 REXCVAR_DEFINE_DOUBLE(sr_native_render_scale, 0.0, "Superman Returns Native",
@@ -263,13 +359,41 @@ REXCVAR_DEFINE_DOUBLE(sr_rt_sun_angle, 0.53, "Superman Returns Native",
 REXCVAR_DEFINE_BOOL(sr_rt_reflections, true, "Superman Returns Native",
                     "With sr_rt_shadows: the buildings' environment reflections (windows) come from rays "
                     "into the ray-traced scene; the game's sky cube stays where they miss");
+REXCVAR_DEFINE_INT32(sr_rt_builds_per_frame, 24, "Superman Returns Native",
+                     "Ray-traced scene: new meshes built per frame (bottom-level structures); the rest wait "
+                     "for the next frames. 64 made the GPU spike when fast flight reached a dense district")
+    .range(4, 256);
+REXCVAR_DEFINE_BOOL(sr_rt_alpha_test, true, "Superman Returns Native",
+                    "Ray-traced scene: alpha-tested geometry (tree leaves, fences) lets rays through where "
+                    "its colour texture's alpha fails the game's test, and the shadow pass's solid copy of "
+                    "it (the game's caster shader ignores alpha) is left out");
+REXCVAR_DEFINE_BOOL(sr_rt_full_scene, false, "Superman Returns Native",
+                    "Ray-traced scene: static world geometry that does not receive the sun shadow (cars, "
+                    "props, far lit buildings, foliage) is captured too, not only the shadow receivers");
+REXCVAR_DEFINE_INT32(sr_rt_full_scene_hide_swap, 0, "Superman Returns Native",
+                     "Debug A/B: on this swap the ray-traced scene renders as before the full scene: no "
+                     "sr_rt_full_scene geometry and mean-colour hits (sr_rt_reflection_detail off), so a "
+                     "dump of it and of the next swap compare the same view");
+REXCVAR_DEFINE_INT32(sr_rt_ab_period, 0, "Superman Returns Native",
+                     "Debug A/B: repeat the sr_rt_full_scene_hide_swap swap every N swaps (0 = once)");
+REXCVAR_DEFINE_STRING(sr_rt_ab_vs, "", "Superman Returns Native",
+                      "Debug A/B: on the A/B swaps leave out only the full-scene geometry of these vertex "
+                      "shaders (hex hashes, comma-separated) instead of all of it");
 REXCVAR_DEFINE_BOOL(sr_rt_reflection_palette, true, "Superman Returns Native",
                     "Ray-traced reflections: the city buildings' palette colours (their index is captured "
                     "from a second interpolant)");
+REXCVAR_DEFINE_DOUBLE(sr_rt_reflection_bump, 0.15, "Superman Returns Native",
+                      "Ray-traced reflections: how much of the surface's bump (normal map) bends the "
+                      "reflection ray; 0 = a mirror from the smooth surface, 1 = the game's bumped "
+                      "direction (with a sharp scene that turns into grain)")
+    .range(0.0, 1.0);
 REXCVAR_DEFINE_BOOL(sr_rt_reflection_detail, false, "Superman Returns Native",
                     "Ray-traced reflections: sample the hit material's colour texture at its UV instead of "
                     "the texture's mean colour (experimental: for most city materials that texture is a "
                     "detail layer, the colour comes from tints)");
+REXCVAR_DEFINE_INT32(sr_rt_shadow_map_quality, 1, "Superman Returns Native",
+                     "Shadow map resolution multiplier while ray-traced shadows replace the "
+                     "cascades (at most sr_native_shadow_quality)");
 REXCVAR_DEFINE_BOOL(sr_rt_shadows_replace, true, "Superman Returns Native",
                     "With sr_rt_shadows: the sun shadow comes from the ray-traced scene instead of the "
                     "game's cascades (the receivers' shadow map fetches read the ray result; false = "
@@ -328,7 +452,10 @@ REXCVAR_DEFINE_INT32(sr_native_anisotropic_filtering, 16, "Superman Returns Nati
                      "Anisotropic filtering for filtered textures (-1 = game, 1 = off, 2, 4, 8, 16); "
                      "the game asks for none, 16 is the remaster default")
     .range(-1, 16);
-REXCVAR_DEFINE_INT32(sr_native_aniso_from_swap, 0, "Superman Returns Native",
+REXCVAR_DEFINE_DOUBLE(sr_texture_mip_bias, 99.0, "Superman Returns Native",
+                      "Texture mip bias (negative = sharper at a distance); 99 = auto: log2(scene / output "
+                      "width) while DLSS upscales, so textures keep the output resolution's detail")
+    .range(-3.0, 99.0);REXCVAR_DEFINE_INT32(sr_native_aniso_from_swap, 0, "Superman Returns Native",
                      "Debug A/B: the game's filtering until this guest swap, then "
                      "sr_native_anisotropic_filtering (samplers recreated); 0 = from the start");
 REXCVAR_DEFINE_INT32(sr_native_debug_rs_salt, 0, "Superman Returns Native",
@@ -343,6 +470,11 @@ REXCVAR_DEFINE_BOOL(sr_native_pipeline_cache, true, "Superman Returns Native",
 REXCVAR_DEFINE_INT32(sr_native_shadow_pcf_mode, 0, "Superman Returns Native",
                      "Debug: shadow atlas PCF at shadow_quality > 1 (0 = kernel on the host texel "
                      "grid, 1 = EXP-038 guest-texel kernel)");
+REXCVAR_DEFINE_STRING(sr_native_log_ps_consts, "", "Superman Returns Native",
+                      "Debug: log this pixel shader's (container hash) constants c0-c19 once per second");
+REXCVAR_DEFINE_BOOL(sr_native_resolve_exp_bias, true, "Superman Returns Native",
+                    "Apply the resolve exponent bias (RB_COPY_DEST_INFO copy_dest_exp_bias) like "
+                    "Xenos: the sun's shadow map copies scale by 1/32 (off = the old raw copy)");
 REXCVAR_DEFINE_BOOL(sr_native_stacked_textures, true, "Superman Returns Native",
                     "Debug: read stacked 2D textures fetched by tfetch3D through 2D array views "
                     "(the sun's shadow map); off binds the null volume as before");
@@ -371,6 +503,7 @@ namespace reg = rex::graphics::reg;
 
 int g_current_pass = 0;
 int g_guest_pass = 0;
+float g_dlss_mip_bias = 0.0f;  // log2(scene / output width) while DLSS upscales (dlss.cpp)
 
 std::atomic<uint32_t> g_guest_device{0};
 void NoteGuestDevice(uint32_t dev) {
@@ -1101,6 +1234,7 @@ inline std::vector<D3D12_RECT> ScaleRects(const std::vector<D3D12_RECT>& rs, flo
 #include "shaders/edram_alias_ms_ps.h"
 #include "shaders/edram_alias_ps.h"
 #include "shaders/edram_alias_vs.h"
+#include "shaders/resolve_scale_ps.h"
 
 }  // namespace
 
@@ -1149,6 +1283,8 @@ void Renderer::ShutdownWorker() {
     if(batch_) batch_->Clear();
   }
   if(worker_.joinable()) worker_.join();
+  StopPresentThread();
+  buffer_stock_.Stop();
   packet_sink_={};cancel_packet_sink_={};
 }
 
@@ -1179,6 +1315,14 @@ bool Renderer::EnsureInitialized() {
     REXLOG_INFO("native: automatic render scale {} from a {}-line display", render_scale_, height);
   }
   shadow_scale_ = float(std::clamp(REXCVAR_GET(sr_native_shadow_quality), 1, 4));
+  // Ray-traced shadows replace what the receivers read from the cascades, so
+  // their resolution buys nothing there: at 4 they cost 6.3 ms of GPU time per
+  // frame in the city flight (15.05 -> 8.75 ms at 1). Chosen at start: the
+  // surfaces keep their scale, so RT shadows switched off later keep these maps.
+  if (REXCVAR_GET(sr_rt_shadows) && REXCVAR_GET(sr_rt_shadows_replace)) {
+    shadow_scale_ = std::min(shadow_scale_,
+                             float(std::clamp(REXCVAR_GET(sr_rt_shadow_map_quality), 1, 4)));
+  }
   shadow_mul_ = float(std::clamp(REXCVAR_GET(sr_native_shadow_scale_mul), 0.25, 1.0));
   {
     int32_t m = REXCVAR_GET(sr_native_msaa_samples);
@@ -1314,6 +1458,7 @@ bool Renderer::EnsureInitialized() {
     REXLOG_INFO("native: renderer initialized, shaders from {}", where);
   }
   init_failed_ = false;
+  RunPrecompileScreen();
   initialized_ = true;
   return true;
 }
@@ -1666,6 +1811,8 @@ bool Renderer::CreateDrawResources() {
     }
     REXLOG_INFO("native: driver shader cache disabled: {:08X}", uint32_t(hr));
   }
+  buffer_stock_.Start(device_);
+  texture_heap_.Start(device_);
   if (REXCVAR_GET(sr_native_pipeline_cache)) {
     // Sample count the renderer uses on the surfaces the game multisamples
     // (msaa_samples 0 = the game's own 4x), and whether foliage antialiasing
@@ -1688,7 +1835,7 @@ void Renderer::Retire(ComPtr<ID3D12Resource> resource) {
 uint32_t Renderer::AllocSrvIndex() {
   if (!retired_srvs_.empty() && retired_srvs_.front().first <= fence_->GetCompletedValue()) {
     uint32_t index = retired_srvs_.front().second;
-    retired_srvs_.erase(retired_srvs_.begin());
+    retired_srvs_.pop_front();
     return index;
   }
   return srv_heap_next_ < kSrvAllocLimit ? srv_heap_next_++ : 0;
@@ -1761,6 +1908,29 @@ void Renderer::Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES& state
 namespace {
 bool RtGeometryVs(uint64_t hash);  // a vertex shader drawing world geometry (rt_world/instanced tables)
 }  // namespace
+
+bool Renderer::RtAbOldSwap() const {
+  const int64_t first = REXCVAR_GET(sr_rt_full_scene_hide_swap), period = REXCVAR_GET(sr_rt_ab_period);
+  const int64_t swap = int64_t(swap_number_);
+  if (first <= 0 || swap < first) return false;
+  return period > 0 ? (swap - first) % period == 0 : swap == first;
+}
+
+bool Renderer::RtAbAll() const { return RtAbOldSwap() && REXCVAR_GET(sr_rt_ab_vs).empty(); }
+
+bool Renderer::RtAbHidesVs(uint64_t vs) const {
+  if (!(RtAbOldSwap() && REXCVAR_GET(sr_rt_ab_vs).empty())) return false;
+  const std::string& list = REXCVAR_GET(sr_rt_ab_vs);
+  if (list.empty()) return true;
+  for (const char* p = list.c_str(); *p;) {
+    char* end = nullptr;
+    const unsigned long long h = std::strtoull(p, &end, 16);
+    if (end == p) { ++p; continue; }
+    if (h == vs) return true;
+    p = end;
+  }
+  return false;
+}
 
 int32_t Renderer::RtDebugMode() const {
   const int32_t cycle = REXCVAR_GET(sr_rt_shadow_debug_cycle);
@@ -1957,6 +2127,7 @@ void Renderer::BeginFrameTimestamp() {
     uint32_t n = ts_count_[frame_index_];
     if (n >= 2 && t[n - 1] > t[0]) {
       ts_accum_ms_ += double(t[n - 1] - t[0]) * 1000.0 / double(ts_frequency_);
+      RecordGpuEnd(frame_index_, t[n - 1]);
       graphics::FrameTimeline::Global().RecordBusy(
           graphics::TimelineStage::kGpu, ts_frame_[frame_index_],
           uint64_t(double(t[n - 1] - t[0]) * 1e9 / double(ts_frequency_)));
@@ -2062,6 +2233,9 @@ bool Renderer::BeginFrame() {
       WaitForSingleObject(fence_event_, INFINITE);
     }
   }
+  // The present thread has issued this slot's previous present (its copy of
+  // the output target is behind present_fence_values_).
+  WaitPacedPresent(frame_index_);
   if (present_fence_ && present_fence_values_[frame_index_] &&
       present_fence_->GetCompletedValue() < present_fence_values_[frame_index_]) {
     graphics::TimelineBlockScope present_blocked;
@@ -2080,6 +2254,7 @@ bool Renderer::BeginFrame() {
     overflow_offset_ = overflow_size_ = 0;
   }
   uint64_t completed = fence_->GetCompletedValue();
+  buffer_stock_.Collect(completed);
   retired_.erase(std::remove_if(retired_.begin(), retired_.end(),
                                 [completed](const auto& r) { return r.first <= completed; }),
                  retired_.end());
@@ -2330,13 +2505,282 @@ struct ShadowRegs {
 constexpr ShadowRegs kShadowRegs[] = {
 #include "shadow_regs.inc"
 };
+// Day and night (daynight.h): the game's lighting and sky constants per shader
+// (tools/shaders/gen_light_regs.py). Roles: 0 sun position, 1 key light colour,
+// 2 ambient / fill colour, 3 fog / sky colour.
+struct LightRegs {
+  uint64_t hash;
+  uint32_t ps;
+  uint32_t count;
+  struct {
+    uint32_t reg, role;
+  } entries[16];
+};
+constexpr LightRegs kLightRegs[] = {
+#include "light_regs.inc"
+};
+
+daynight::LightingFrame g_daynight_light;
+
+// Night street lamps: the posts (vertex shader DF1EB503, pixel shader F2BB7B65,
+// 816 indices per instance) are instanced; each instance's rows sit at
+// c100 + 4 i (c103 + 4 i: its position), c4.x the indices per instance.
+// Collected while the frame draws, sent with the next frame's data.
+constexpr uint64_t kLampVs = 0xDF1EB50388CC2563ull, kLampPs = 0xF2BB7B6551646033ull;
+constexpr uint32_t kLampIndices = 816, kLampFarIndices = 438, kMaxLamps = 4096;  // Renderer::kLampMax
+std::vector<std::array<float, 4>> g_lamps_drawing, g_lamps_ready;
+std::unordered_set<uint64_t> g_lamp_keys_drawing;  // this frame's lamps, by position on a 4-unit lattice
+// Lamps seen lately: the game draws only those in view, but one just outside it still
+// lights the street in view. Kept until seen missing in view, or for kLampKeepSwaps.
+struct KnownLamp {
+  float p[3];
+  uint64_t seen;
+};
+std::unordered_map<uint64_t, KnownLamp> g_lamps_known;
+float g_lamp_view_proj[16] = {};  // the lamps' shader's gViewProjectionXform rows (c232-c235)
+constexpr uint64_t kLampKeepSwaps = 600;
+uint64_t LampKey(const float* p) {
+  auto q = [](float v) { return uint64_t(uint32_t(int32_t(std::floor(v / 4.0f + 0.5f))) & 0x1FFFFF); };
+  return q(p[0]) | q(p[1]) << 21 | q(p[2]) << 42;
+}
+float g_lamp_camera[3] = {};  // the camera (gViewInverse c229-c231 .w of the lamps' shader)
+float g_player_pos[3] = {};  // Superman (his skinned draw's gWorldXform .w), for sr_lod_log
+const std::unordered_map<uint64_t, std::array<float, 4>>* g_lod_spheres = nullptr;  // sr_lod_log
+float g_lod_view_dir[3] = {};                                                         // sr_lod_log
+float g_lod_vp[16] = {};                                                              // sr_lod_log
+float g_view_camera[3] = {};  // the camera from any shader known to carry gViewInverse (night rooms)
+bool g_view_camera_valid = false;
+float g_lamp_inv_vp[16] = {};  // its inverse view-projection (gViewProjectionXform c232-c235)
+float g_lamp_vp[4] = {};       // and the viewport it drew with
+float g_draw_vp[4] = {};       // the current draw's host viewport (x, y, width, height)
+
+void CollectLamps(const float* c, uint32_t index_count) {
+  const float per = c[4 * 4];
+  if (!(per > 0.0f)) return;
+  // The camera and view-projection come from the first city draw of the frame (see the draw path).
+  const uint32_t instances = std::min<uint32_t>(uint32_t(float(index_count) / per + 0.5f), 38);
+  const float height = float(REXCVAR_GET(sr_lamp_height)), arm = float(REXCVAR_GET(sr_lamp_arm));
+  for (uint32_t i = 0; i < instances; ++i) {
+    const float* r = c + (100 + 4 * i) * 4;  // rows x, y, z, position
+    float p[3];
+    for (int k = 0; k < 3; ++k) p[k] = r[12 + k] + r[4 + k] * height + r[k] * arm;
+    if (REXCVAR_GET(sr_lamp_log)) {
+      static int logged = 0;
+      if (logged++ < 40)
+        REXLOG_INFO("lamp {} of {} (per {}): x ({:.3f} {:.3f} {:.3f} {:.3f}) y ({:.3f} {:.3f} {:.3f} {:.3f}) "
+                    "z ({:.3f} {:.3f} {:.3f} {:.3f}) pos ({:.2f} {:.2f} {:.2f} {:.2f})", i, instances, per,
+                    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12], r[13],
+                    r[14], r[15]);
+    }
+    if (g_lamps_drawing.size() < kMaxLamps && g_lamp_keys_drawing.insert(LampKey(p)).second)
+      g_lamps_drawing.push_back({p[0], p[1], p[2], 0.0f});
+  }
+}
+
+// sr_lamp_log: every model the lamps' instancing shader draws (pixel shader, indices per
+// instance), how many instances, their distance from the camera, and how many stand where a
+// known lamp stands (x/z within 2 units): a lamp's far-away model shows up there.
+void LampModelProbe(const float* c, uint64_t ps, uint32_t index_count, uint64_t swap) {
+  struct Stat { uint64_t draws = 0, instances = 0, at_lamp = 0; float dmin = 1e30f, dmax = 0.0f; };
+  static std::map<std::pair<uint64_t, uint32_t>, Stat> stats;
+  static uint64_t last_dump = 0;
+  const float per = c[4 * 4];
+  if (per > 0.0f) {
+    Stat& s = stats[{ps, uint32_t(per)}];
+    ++s.draws;
+    const uint32_t instances = std::min<uint32_t>(uint32_t(float(index_count) / per + 0.5f), 38);
+    for (uint32_t i = 0; i < instances; ++i) {
+      const float* r = c + (100 + 4 * i) * 4;
+      const float dx = r[12] - g_lamp_camera[0], dy = r[13] - g_lamp_camera[1], dz = r[14] - g_lamp_camera[2];
+      const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+      s.dmin = std::min(s.dmin, d);
+      s.dmax = std::max(s.dmax, d);
+      ++s.instances;
+      // Every place each model stood, once (x/z on a 2-unit lattice), logged as the run goes.
+      static std::set<std::tuple<uint32_t, int32_t, int32_t>> placed;
+      if (placed.emplace(uint32_t(per), int32_t(std::floor(r[12] / 2.0f)), int32_t(std::floor(r[14] / 2.0f))).second &&
+          placed.size() < 20000)
+        REXLOG_INFO("lamp place: ps {:016X} per {} at ({:.2f} {:.2f} {:.2f}) up ({:.3f} {:.3f} {:.3f})", ps,
+                    uint32_t(per), r[12], r[13], r[14], r[4], r[5], r[6]);
+      for (const auto& [key, l] : g_lamps_known)
+        if (std::fabs(l.p[0] - r[12]) < 2.0f && std::fabs(l.p[2] - r[14]) < 2.0f) { ++s.at_lamp; break; }
+    }
+  }
+  if (swap >= last_dump + 300) {
+    last_dump = swap;
+    for (const auto& [k, s] : stats)
+      REXLOG_INFO("lamp models: ps {:016X} per {} draws {} instances {} at known lamps {} dist {:.0f}..{:.0f}",
+                  k.first, k.second, s.draws, s.instances, s.at_lamp, s.dmin, s.dmax);
+    stats.clear();
+  }
+}
+
+// This shader's lighting registers when the day/night cycle is on this frame.
+const LightRegs* DayNightRegs(uint64_t hash, bool pixel, uint64_t frame) {
+  static uint64_t cached_frame = ~0ull;
+  static bool active = false;
+  if (cached_frame != frame) {
+    cached_frame = frame;
+    g_daynight_light = {};
+    active = daynight::CurrentLighting(g_daynight_light);
+  }
+  if (!active) return nullptr;
+  const LightRegs* end = std::end(kLightRegs);
+  for (const LightRegs* it = std::lower_bound(std::begin(kLightRegs), end, hash,
+                                              [](const LightRegs& e, uint64_t h) { return e.hash < h; });
+       it != end && it->hash == hash; ++it) {
+    if (bool(it->ps) == pixel) return it;
+  }
+  return nullptr;
+}
+
+// Rewrites the lighting constants (1024 floats, host order) of `it` for the hour.
+// The sky backdrop (vertex shader 7E38230C: gWorldXform c0-c3,
+// gWorldViewProjectionXform c8-c11, gViewInverse c16-c18; pixel shader
+// 19F27210): our sun and moon (patch 0034 srSkyBodies). Its texture's painted
+// sun is replaced (textures/EA4A8BC906AA9D06_1024x512_f20.dds), so the sun is
+// drawn here even on the game's own hour, where it stands at gLightPos.
+constexpr uint64_t kSkyBackdropVs = 0x7E38230C98052438ull, kSkyBackdropPs = 0x19F2721057EAECADull;
+void SkyBodies(const float* vs, const float viewport[4], bool moon_texture, uint32_t* ps_consts) {
+  float inv_wvp[16];
+  if (!Invert4x4(vs + 8 * 4, inv_wvp)) return;
+  float m[16];  // world <- clip: gWorldXform x inverse(gWorldViewProjectionXform)
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) {
+      float s = 0.0f;
+      for (int k = 0; k < 4; ++k) s += vs[r * 4 + k] * inv_wvp[k * 4 + c];
+      m[r * 4 + c] = s;
+    }
+  daynight::LightingFrame light;
+  const bool active = daynight::CurrentLighting(light);
+  float sun[3] = {-100000.0f, 38880.0f, 31000.0f};  // the game's gLightPos
+  if (active) daynight::MoveSunPosition(light, sun);
+  const float len = std::sqrt(sun[0] * sun[0] + sun[1] * sun[1] + sun[2] * sun[2]);
+  float v[11 * 4] = {};  // c201..c209 (index 0 = c201)
+  for (int k = 0; k < 3; ++k) {
+    v[k] = sun[k] / len;
+    v[4 + k] = -sun[k] / len;  // the moon: opposite the sun
+  }
+  v[3] = active ? light.sun_visibility : 1.0f;
+  v[7] = active ? light.night : 0.0f;
+  std::memcpy(&v[8], viewport, 16);
+  std::memcpy(&v[12], m, sizeof(m));
+  v[28] = vs[16 * 4 + 3];  // the camera: gViewInverse .w
+  v[29] = vs[17 * 4 + 3];
+  v[30] = vs[18 * 4 + 3];
+  v[31] = 12345.0f;
+  for (int k = 0; k < 3; ++k) v[32 + k] = active ? light.key[k] : 1.0f;
+  v[35] = moon_texture ? 1.0f : 0.0f;  // c209.w: the moon from textures/sky_moon.dds (kSkyMoonSrv)
+  std::memcpy(ps_consts + 201 * 4, v, 9 * 16);
+}
+
+// The far city's low-detail buildings (vertex shaders C79CC997 / 29C1ACD9:
+// gViewProjectionXform c0-c3; pixel shaders E3656F63 / 91111A32): night
+// windows (patch 0034 srLodCityWindows) from c201 viewport, c202-c205 the
+// inverse view-projection, c206 (brightness, -, -, 12345).
+bool IsLodCity(uint64_t ps) { return ps == 0xE3656F63B9C43547ull || ps == 0x91111A326A89010Aull; }
+void LodCityWindows(const float* vs, const float viewport[4], uint32_t* ps_consts) {
+  float inv[16];
+  if (!Invert4x4(vs, inv)) return;
+  daynight::LightingFrame light;
+  const float windows = daynight::CurrentLighting(light) ? light.windows : 0.0f;
+  float v[6 * 4] = {};
+  std::memcpy(&v[0], viewport, 16);
+  std::memcpy(&v[4], inv, sizeof(inv));
+  v[20] = windows * 1.5f;  // far and fogged: a little brighter than the near windows
+  v[23] = 12345.0f;
+  std::memcpy(ps_consts + 201 * 4, v, sizeof(v));
+}
+
+void ApplyDayNight(const LightRegs* it, uint32_t* consts, bool additive = false) {
+  const daynight::LightingFrame& light = g_daynight_light;
+  {
+    for (uint32_t i = 0; i < it->count; ++i) {
+      const uint32_t reg = it->entries[i].reg;
+      if (reg >= 256) continue;
+      float v[4];
+      std::memcpy(v, consts + reg * 4, 16);
+      switch (it->entries[i].role) {
+        case 0: daynight::MoveSunPosition(light, v); break;
+        case 1: for (int k = 0; k < 3; ++k) v[k] *= light.key[k]; break;
+        case 2: for (int k = 0; k < 3; ++k) v[k] *= light.ambient[k]; break;
+        case 3: for (int k = 0; k < 3; ++k) v[k] *= light.fog[k]; break;
+        // Output tints (c200, patch 0033): w = 12345 marks them valid.
+        case 4: v[0] = light.fog[0]; v[1] = light.fog[1]; v[2] = light.fog[2]; v[3] = 12345.0f; break;
+        case 6: v[0] *= light.exposure; break;
+        case 7: v[0] = light.ambient[0]; v[1] = light.ambient[1]; v[2] = light.ambient[2]; v[3] = 12345.0f; break;
+        // Soft particles: clouds and smoke dim with the sky's light; additive
+        // ones (fire, glows) keep their own light.
+        case 8:
+          for (int k = 0; k < 3; ++k) v[k] = additive ? 1.0f : light.ambient[k];
+          v[3] = 12345.0f;
+          break;
+        // Buildings: the night windows' light (patch 0034, c201).
+        case 9:
+          for (int k = 0; k < 3; ++k) v[k] = light.windows;
+          v[3] = 12345.0f;
+          break;
+        default: v[0] = v[1] = v[2] = light.sun_visibility; v[3] = 12345.0f; break;
+      }
+      std::memcpy(consts + reg * 4, v, 16);
+    }
+  }
+}
 }  // namespace
 
 // Ray-traced shadows: once per frame, from the first draw whose vertex shader
 // carries the sun light matrix rows (shadowMapU/V/Z; oTexCoord7 = M * world),
 // upload the inverse so the receivers map iTexCoord7 back to world space.
+namespace {
+// Float-constant registers each translated shader can read (const_range.inc,
+// tools/shaders/gen_const_range.py): only those are copied into a draw's
+// upload (the 4 KB copies per draw were a tenth of the render worker).
+struct ConstRange {
+  uint64_t hash;
+  uint32_t pixel, regs;
+};
+constexpr ConstRange kConstRanges[] = {
+#include "const_range.inc"
+};
+uint32_t ConstRegs(uint64_t hash, bool pixel) {
+  // Off by default: menu text read constants past the generated range and showed
+  // stale values (magenta / green, broken letters, 2026-11-08).
+  if (!REXCVAR_GET(sr_native_const_range)) return 256;
+  const auto it = std::lower_bound(std::begin(kConstRanges), std::end(kConstRanges), hash,
+                                   [](const ConstRange& e, uint64_t h) { return e.hash < h; });
+  for (auto i = it; i != std::end(kConstRanges) && i->hash == hash; ++i)
+    if (i->pixel == uint32_t(pixel)) return std::max<uint32_t>(i->regs, 1);
+  return 256;
+}
+}  // namespace
+
+namespace {
+struct ViewInverseReg {
+  uint64_t hash;
+  uint32_t reg;
+};
+constexpr ViewInverseReg kViewInverseRegs[] = {
+#include "rt_view_inverse_regs.inc"
+};
+}  // namespace
+
 void Renderer::UpdateRtFrame(uint8_t* base) {
   (void)base;
+  // The camera position: the translation column of gViewInverse, from any
+  // vertex shader that declares it (the receivers too, before the upload below).
+  {
+    const auto vit = std::lower_bound(std::begin(kViewInverseRegs), std::end(kViewInverseRegs), current_vs_hash_,
+                                      [](const ViewInverseReg& e, uint64_t h) { return e.hash < h; });
+    if (vit != std::end(kViewInverseRegs) && vit->hash == current_vs_hash_ && vit->reg + 3 < 256) {
+      const float* c = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase) + vit->reg * 4;
+      if (std::isfinite(c[3]) && std::isfinite(c[7]) && std::isfinite(c[11])) {
+        rt_camera_[0] = c[3];
+        rt_camera_[1] = c[7];
+        rt_camera_[2] = c[11];
+        rt_camera_valid_ = true;
+      }
+    }
+  }
   const ShadowRegs* end = std::end(kShadowRegs);
   const ShadowRegs* it = std::lower_bound(std::begin(kShadowRegs), end, current_vs_hash_,
                                           [](const ShadowRegs& e, uint64_t h) { return e.hash < h; });
@@ -2366,7 +2810,7 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = 256;
+    desc.Width = kRtFrameBytes;
     desc.Height = 1;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;
@@ -2381,7 +2825,7 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
     srv.Format = DXGI_FORMAT_R32_TYPELESS;
     srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Buffer.NumElements = 64;
+    srv.Buffer.NumElements = kRtFrameBytes / 4;
     srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     device_->CreateShaderResourceView(
         rt_frame_buffer_.Get(), &srv,
@@ -2414,9 +2858,9 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
     EnsureRtScene(inv);
   }
   UploadAlloc up;
-  if (!Upload(256, 256, up)) return;
+  if (!Upload(kRtFrameBytes, 256, up)) return;
   uint32_t* data = reinterpret_cast<uint32_t*>(up.cpu);
-  std::memset(data, 0, 256);
+  std::memset(data, 0, kRtFrameBytes);
   std::memcpy(data, inv, 48);
   std::memcpy(&data[12], sun, 12);
   data[16] = uint32_t(RtDebugMode());
@@ -2430,14 +2874,187 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   data[21] = uint32_t(REXCVAR_GET(sr_rt_shadow_rays));
   const float spread = float(std::tan(REXCVAR_GET(sr_rt_sun_angle) * 0.5 * 3.14159265358979 / 180.0));
   std::memcpy(&data[22], &spread, 4);
-  data[23] = REXCVAR_GET(sr_rt_shadows) && REXCVAR_GET(sr_rt_reflections) && debug_mode == 0 ? 1u : 0u;
-  data[24] = REXCVAR_GET(sr_rt_reflection_detail) ? 1u : 0u;
+  // Reflections in the game view and in their own debug views (6 seen colour, 7 hit path, 8).
+  data[23] = REXCVAR_GET(sr_rt_shadows) && REXCVAR_GET(sr_rt_reflections) &&
+                     (debug_mode == 0 || (debug_mode >= 6 && debug_mode <= 8))
+                 ? 1u
+                 : 0u;
+  data[24] = REXCVAR_GET(sr_rt_reflection_detail) &&
+                     !(RtAbOldSwap() && REXCVAR_GET(sr_rt_ab_vs).empty())
+                 ? 1u
+                 : 0u;
   // Bytes 112..143: the city's lighting tone (shadow colour, ramp strength,
   // ramp colour, valid) for reflection hits.
   std::memcpy(&data[28], rt_tone_, sizeof(rt_tone_));
+  // Bytes 148..159: the camera position; byte 100: the reflection bump weight
+  // (sr_rt_reflection_bump; on the A/B swap the game's bumped direction).
+  if (rt_camera_valid_) {
+    std::memcpy(&data[37], rt_camera_, 12);
+    const float bump = RtAbOldSwap() && REXCVAR_GET(sr_rt_ab_vs).empty()
+                           ? 1.0f
+                           : float(REXCVAR_GET(sr_rt_reflection_bump));
+    std::memcpy(&data[25], &bump, 4);  // byte 100
+  }
   data[36] = rt_skin_read_;  // which character buffer the reflection hits read (kRtSkinSrv0 - n)
+  // Night street lamps (bytes 160..175: count, reach, light colour x night; 176..191:
+  // the night's ambient light, to recover the surface colour; 256..: xyz per lamp).
+  // This frame's lamps join the known ones; a known lamp the camera looks at but the game
+  // no longer draws (knocked down, unloaded) is dropped at once, one out of view after
+  // kLampKeepSwaps.
+  const size_t drawn_now = g_lamps_drawing.size();
+  for (const auto& l : g_lamps_drawing) g_lamps_known[LampKey(l.data())] = {{l[0], l[1], l[2]}, swap_number_};
+  g_lamps_drawing.clear();
+  g_lamp_keys_drawing.clear();
+  for (auto it = g_lamps_known.begin(); it != g_lamps_known.end();) {
+    bool keep = it->second.seen == swap_number_;
+    if (!keep && swap_number_ - it->second.seen < kLampKeepSwaps) {
+      const float* r = g_lamp_view_proj;
+      const float* p = it->second.p;
+      float clip[4];
+      for (int k = 0; k < 4; ++k) clip[k] = r[k * 4] * p[0] + r[k * 4 + 1] * p[1] + r[k * 4 + 2] * p[2] + r[k * 4 + 3];
+      const bool in_view = clip[3] > 0.0f && std::fabs(clip[0]) < clip[3] * 0.95f && std::fabs(clip[1]) < clip[3] * 0.95f;
+      keep = !in_view;
+    }
+    it = keep ? std::next(it) : g_lamps_known.erase(it);
+  }
+  g_lamps_ready.clear();
+  std::unordered_set<uint64_t> ready_keys;
+  for (const auto& [key, l] : g_lamps_known) {
+    const float dx = l.p[0] - g_lamp_camera[0], dy = l.p[1] - g_lamp_camera[1], dz = l.p[2] - g_lamp_camera[2];
+    g_lamps_ready.push_back({l.p[0], l.p[1], l.p[2], dx * dx + dy * dy + dz * dz});
+    ready_keys.insert(key);
+  }
+  // Lamps the game has not created (beyond its prop radius, or in cells it does not update):
+  // the prop managers' lists hold every lamp's spot (prop_streaming.cpp). The lamps' kind is
+  // learnt from the entries standing where the game draws a lamp.
+  {
+    static std::vector<PropEntry> entries;
+    // Street lamps' prop type (a name hash, the same every run) starts known: flying high, no
+    // lamp is drawn near enough to vote, and nothing would be learnt.
+    static std::unordered_map<uint32_t, uint32_t> lamp_votes{{0xD190586Au, 1000u}};
+    static uint64_t entries_swap = 0;
+    const float height = float(REXCVAR_GET(sr_lamp_height));
+    if (swap_number_ - entries_swap >= 30) {
+      entries_swap = swap_number_;
+      entries = PropEntries();
+      for (const auto& e : entries) {
+        const float head[3] = {e.pos[0], e.pos[1] + height, e.pos[2]};
+        if (g_lamps_known.count(LampKey(head))) ++lamp_votes[e.kind];
+      }
+    }
+    // A kind counts as lamps when it has a quarter of the best kind's votes (a signal or a bin
+    // standing within a few units of a lamp collects a vote or two).
+    uint32_t best = 0;
+    for (const auto& [k, n] : lamp_votes) best = std::max(best, n);
+    // Every lamp ever seen in a loaded sector stays known (the game keeps only the sectors near
+    // the camera), and the list is kept on disk, so the whole city lights up from the start once
+    // it has been flown over.
+    static std::unordered_map<uint64_t, std::array<float, 3>> cache;
+    static bool cache_loaded = false, cache_dirty = false;
+    static uint64_t cache_saved_swap = 0;
+    const std::string cache_path = REXCVAR_GET(sr_lamp_cache);
+    if (!cache_loaded) {
+      cache_loaded = true;
+      if (std::FILE* f = cache_path.empty() ? nullptr : std::fopen(cache_path.c_str(), "rb")) {
+        float p[3];
+        while (std::fread(p, sizeof(p), 1, f) == 1)
+          if (std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2])) cache[LampKey(p)] = {p[0], p[1], p[2]};
+        std::fclose(f);
+        REXLOG_INFO("lamps: {} lamps from {}", cache.size(), cache_path);
+      }
+    }
+    if (swap_number_ == entries_swap) {
+      for (const auto& e : entries) {
+        auto v = lamp_votes.find(e.kind);
+        if (v == lamp_votes.end() || v->second < 3 || v->second * 4 < best) continue;
+        const float head[3] = {e.pos[0], e.pos[1] + height, e.pos[2]};
+        cache_dirty |= cache.try_emplace(LampKey(head), std::array<float, 3>{head[0], head[1], head[2]}).second;
+      }
+    }
+    if (cache_dirty && !cache_path.empty() && swap_number_ - cache_saved_swap >= 600) {
+      cache_saved_swap = swap_number_;
+      cache_dirty = false;
+      const std::string tmp = cache_path + ".tmp";
+      if (std::FILE* f = std::fopen(tmp.c_str(), "wb")) {
+        for (const auto& [k, p] : cache) std::fwrite(p.data(), sizeof(float), 3, f);
+        std::fclose(f);
+        std::remove(cache_path.c_str());
+        std::rename(tmp.c_str(), cache_path.c_str());
+      }
+    }
+    uint32_t added = 0;
+    for (const auto& [key, head] : cache) {
+      if (!ready_keys.insert(key).second) continue;
+      const float dx = head[0] - g_lamp_camera[0], dy = head[1] - g_lamp_camera[1], dz = head[2] - g_lamp_camera[2];
+      g_lamps_ready.push_back({head[0], head[1], head[2], dx * dx + dy * dy + dz * dz});
+      ++added;
+    }
+    if (REXCVAR_GET(sr_lamp_log) && swap_number_ % 120 == 0) {
+      std::string kinds;
+      for (const auto& [k, n] : lamp_votes) kinds += fmt::format(" {:08X}:{}", k, n);
+      std::unordered_map<uint32_t, uint32_t> hist;
+      for (const auto& e : entries) ++hist[e.kind];
+      kinds += " | all:";
+      for (const auto& [k, n] : hist) kinds += fmt::format(" {:08X}:{}", k, n);
+      static bool dumped = false;
+      if (!dumped && swap_number_ >= 2000) {
+        dumped = true;
+        for (const auto& e : entries)
+          REXLOG_INFO("prop entry {:08X} ({:.2f} {:.2f} {:.2f})", e.kind, e.pos[0], e.pos[1], e.pos[2]);
+      }
+      REXLOG_INFO("lamps: {} prop entries, {} lamps from them, kinds{}", entries.size(), added, kinds);
+    }
+  }
+  {
+    daynight::LightingFrame light;
+    const float night = daynight::CurrentLighting(light) ? light.night : 0.0f;
+    const float power = night * float(REXCVAR_GET(sr_lamp_power));
+    const float reach = float(REXCVAR_GET(sr_lamp_radius));
+    // Nearest first: when a grid cell overflows, the farther lamps are the ones left out.
+    std::sort(g_lamps_ready.begin(), g_lamps_ready.end(),
+              [](const auto& a, const auto& b) { return a[3] < b[3]; });
+    const uint32_t n = power > 0.0f && reach > 0.0f ? uint32_t(std::min<size_t>(g_lamps_ready.size(), kLampMax)) : 0u;
+    // The grid: cells 2 x reach wide, so a lamp's circle touches at most 2 x 2 of them and a
+    // pixel only reads its own cell (srLampLight). Each cell lists up to eight lamps.
+    const float cell = 2.0f * std::max(reach, 1.0f);
+    uint16_t* grid = reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(data) + kLampGridOffset);
+    std::fill(grid, grid + kLampCells * kLampSlots, uint16_t(0xFFFF));
+    uint32_t dropped = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+      const float* l = g_lamps_ready[i].data();
+      std::memcpy(reinterpret_cast<uint8_t*>(data) + kLampListOffset + i * 16, l, 12);
+      const int32_t x0 = int32_t(std::floor((l[0] - reach) / cell)), x1 = int32_t(std::floor((l[0] + reach) / cell));
+      const int32_t z0 = int32_t(std::floor((l[2] - reach) / cell)), z1 = int32_t(std::floor((l[2] + reach) / cell));
+      for (int32_t x = x0; x <= x1; ++x)
+        for (int32_t z = z0; z <= z1; ++z) {
+          const uint32_t slot = (uint32_t(x) * 73856093u ^ uint32_t(z) * 19349663u) & (kLampCells - 1);
+          uint16_t* e = grid + slot * kLampSlots;
+          uint32_t k = 0;
+          while (k < kLampSlots && e[k] != 0xFFFF) ++k;
+          if (k < kLampSlots) e[k] = uint16_t(i);
+          else ++dropped;
+        }
+    }
+    static uint32_t view_fresh = 0, view_frames = 0;
+    ++view_frames;
+    if (lamp_view_swap_ + 1 >= swap_number_) ++view_fresh;  // captured this frame or the previous one
+    if (REXCVAR_GET(sr_lamp_log) && swap_number_ % 120 == 0) {
+      REXLOG_INFO("lamps: view matrix fresh in {} of {} frames", view_fresh, view_frames);
+      REXLOG_INFO("lamps: {} drawn, {} known, {} sent, {} cell overflows, nearest {:.1f}, farthest {:.1f}, camera "
+                  "({:.1f} {:.1f} {:.1f})", drawn_now, g_lamps_known.size(), n, dropped,
+                  g_lamps_ready.empty() ? -1.0f : std::sqrt(g_lamps_ready[0][3]),
+                  n ? std::sqrt(g_lamps_ready[n - 1][3]) : -1.0f, g_lamp_camera[0], g_lamp_camera[1], g_lamp_camera[2]);
+    }
+    data[40] = n;
+    const float lamp[7] = {reach, power, power * 0.78f, power * 0.52f,
+                           light.ambient[0], light.ambient[1], light.ambient[2]};
+    std::memcpy(&data[41], lamp, sizeof(lamp));
+    std::memcpy(&data[48], g_lamp_inv_vp, sizeof(g_lamp_inv_vp));
+    std::memcpy(&data[320], g_lamp_vp, sizeof(g_lamp_vp));
+    std::memcpy(&data[324], &cell, 4);  // byte 1296: the grid's cell size
+  }
   Transition(rt_frame_buffer_.Get(), rt_frame_state_, D3D12_RESOURCE_STATE_COPY_DEST);
-  command_list_->CopyBufferRegion(rt_frame_buffer_.Get(), 0, up.resource, up.offset, 256);
+  command_list_->CopyBufferRegion(rt_frame_buffer_.Get(), 0, up.resource, up.offset, kRtFrameBytes);
   Transition(rt_frame_buffer_.Get(), rt_frame_state_,
              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
   rt_frame_swap_ = swap_number_;
@@ -2582,6 +3199,296 @@ DXGI_FORMAT RtPositionFormat(DXGI_FORMAT host) {
 // Ray-traced shadows, step 3: remember the static meshes the game draws as
 // shadow receivers (the city), one BLAS each, and their world matrices as
 // TLAS instances for the following frames.
+// sr_lod_distance_scale: the city's full-detail objects are drawn within 1383.84 (constant
+// 0x820203E0) times the game's scale 0x82913CC0 (1.0) of the camera; sub_823055A8 squares it
+// each frame. Writing the scale moves the edge (3.0: from ~1384 to ~4150, measured with sr_lod_log).
+void Renderer::LodDistanceApply(uint8_t* base) {
+  static uint64_t applied_swap = ~0ull;
+  if (applied_swap == swap_number_) return;
+  applied_swap = swap_number_;
+  const int64_t from = REXCVAR_GET(sr_lod_distance_scale_from_swap);
+  const float scale = from > 0 && swap_number_ < uint64_t(from) ? 1.0f : float(REXCVAR_GET(sr_lod_distance_scale));
+  uint32_t u;
+  std::memcpy(&u, &scale, 4);
+  u = __builtin_bswap32(u);
+  uint8_t* at = base + 0x82913CC0u;
+  // sr_probe_pair "a,b,gap" at swap sr_probe_pair_swap: big-endian floats a and b no more than
+  // gap bytes apart anywhere in guest memory below 0x90000000, logged with what is around them.
+  if (REXCVAR_GET(sr_probe_pair_swap) > 0 && swap_number_ == uint64_t(REXCVAR_GET(sr_probe_pair_swap))) {
+    float a = 0, b = 0, gap = 0;
+    std::string v = REXCVAR_GET(sr_probe_pair);
+    std::replace(v.begin(), v.end(), ',', ' ');
+    if (std::sscanf(v.c_str(), "%f %f %f", &a, &b, &gap) == 3) {
+      auto rd = [](const uint8_t* q) {
+        uint32_t u;
+        std::memcpy(&u, q, 4);
+        u = __builtin_bswap32(u);
+        float f;
+        std::memcpy(&f, &u, 4);
+        return f;
+      };
+      uint32_t hits = 0;
+      for (uint64_t ga = 0; ga < 0x90000000ull && hits < 80;) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(base + ga, &mbi, sizeof(mbi))) break;
+        const uint64_t region_end = uint64_t(static_cast<uint8_t*>(mbi.BaseAddress) - base) + mbi.RegionSize;
+        const bool readable = mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                              (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ |
+                                              PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY));
+        if (readable) {
+          const uint8_t* p = static_cast<const uint8_t*>(mbi.BaseAddress);
+          const int64_t g = int64_t(gap) / 4;
+          for (uint64_t o = 0; o + 4 <= mbi.RegionSize && hits < 80; o += 4) {
+            if (rd(p + o) != a) continue;
+            bool pair = false;
+            for (int64_t k = -g; k <= g && !pair; ++k) {
+              const int64_t at = int64_t(o) + k * 4;
+              pair = k != 0 && at >= 0 && uint64_t(at) + 4 <= mbi.RegionSize && rd(p + at) == b;
+            }
+            if (!pair) continue;
+            ++hits;
+            std::string s;
+            for (int k = -12; k < 12; ++k) {
+              const int64_t at = int64_t(o) + k * 4;
+              if (at < 0 || uint64_t(at) + 4 > mbi.RegionSize) continue;
+              uint32_t raw;
+              std::memcpy(&raw, p + at, 4);
+              raw = __builtin_bswap32(raw);
+              const float f = rd(p + at);
+              s += std::fabs(f) < 1e7f && (std::fabs(f) > 1e-4f || f == 0.0f) ? fmt::format(" {:+d}:{:.3f}", k * 4, f)
+                                                                               : fmt::format(" {:+d}:#{:08X}", k * 4, raw);
+            }
+            REXLOG_INFO("probe pair at {:08X}:{}", uint32_t((p + o) - base), s);
+          }
+        }
+        if (region_end <= ga) break;
+        ga = region_end;
+      }
+      REXLOG_INFO("probe pair: {} hits", hits);
+    }
+  }
+  // sr_probe_image_value "v1,v2,...": at sr_probe_pair_swap, every address in the game image
+  // (0x82000000-0x83000000) holding one of these big-endian floats.
+  if (REXCVAR_GET(sr_probe_pair_swap) > 0 && swap_number_ == uint64_t(REXCVAR_GET(sr_probe_pair_swap)) &&
+      !REXCVAR_GET(sr_probe_image_value).empty()) {
+    std::string v = REXCVAR_GET(sr_probe_image_value);
+    std::replace(v.begin(), v.end(), ',', ' ');
+    std::istringstream in(v);
+    std::string token;
+    while (in >> token) {
+      // "#XXXXXXXX": a raw 32-bit word (a code address in a vtable), else a float.
+      float want = 0.0f;
+      uint32_t raw;
+      if (token[0] == '#') {
+        raw = uint32_t(std::strtoul(token.c_str() + 1, nullptr, 16));
+        std::memcpy(&want, &raw, 4);
+      } else {
+        want = std::strtof(token.c_str(), nullptr);
+        std::memcpy(&raw, &want, 4);
+      }
+      raw = __builtin_bswap32(raw);
+      std::string s;
+      uint32_t hits = 0;
+      for (uint64_t a = 0x82000000ull; a < 0x83000000ull; a += 4096) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(base + a, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+          continue;
+        for (uint32_t o = 0; o < 4096; o += 4)
+          if (std::memcmp(base + a + o, &raw, 4) == 0 && hits++ < 200) s += fmt::format(" {:08X}", uint32_t(a + o));
+      }
+      REXLOG_INFO("probe image value {}: {} hits:{}", token, hits, s);
+    }
+  }
+  // sr_probe_image_dump "ADDR:count,...": at sr_probe_pair_swap, that many 32-bit words from ADDR.
+  if (REXCVAR_GET(sr_probe_pair_swap) > 0 && swap_number_ == uint64_t(REXCVAR_GET(sr_probe_pair_swap)) &&
+      !REXCVAR_GET(sr_probe_image_dump).empty()) {
+    std::string v = REXCVAR_GET(sr_probe_image_dump);
+    std::replace(v.begin(), v.end(), ',', ' ');
+    std::istringstream in(v);
+    std::string token;
+    while (in >> token) {
+      const size_t colon = token.find(':');
+      const uint32_t at = uint32_t(std::strtoul(token.substr(0, colon).c_str(), nullptr, 16));
+      const uint32_t n = colon == std::string::npos ? 16 : uint32_t(std::strtoul(token.c_str() + colon + 1, nullptr, 10));
+      std::string s;
+      for (uint32_t k = 0; k < n && k < 256; ++k) {
+        uint32_t w;
+        std::memcpy(&w, base + at + k * 4, 4);
+        s += fmt::format(" {:08X}", __builtin_bswap32(w));
+      }
+      REXLOG_INFO("probe dump {:08X}:{}", at, s);
+    }
+  }
+  // sr_probe_poke "ADDR=value,...": big-endian floats written every swap (live-copy tests).
+  if (const std::string poke = REXCVAR_GET(sr_probe_poke); !poke.empty()) {
+    for (size_t at = 0; at < poke.size();) {
+      size_t end = poke.find(',', at);
+      if (end == std::string::npos) end = poke.size();
+      const std::string item = poke.substr(at, end - at);
+      const size_t eq = item.find('=');
+      if (eq != std::string::npos) {
+        const uint32_t addr = uint32_t(std::strtoul(item.substr(0, eq).c_str(), nullptr, 16));
+        const float val = std::strtof(item.substr(eq + 1).c_str(), nullptr);
+        uint32_t raw;
+        std::memcpy(&raw, &val, 4);
+        raw = __builtin_bswap32(raw);
+        std::memcpy(base + addr, &raw, 4);
+      }
+      at = end + 1;
+    }
+  }
+  if (REXCVAR_GET(sr_lamp_log) && swap_number_ % 600 == 300) {
+    auto rd = [&](uint32_t a) {
+      uint32_t v;
+      std::memcpy(&v, base + a, 4);
+      v = __builtin_bswap32(v);
+      float f;
+      std::memcpy(&f, &v, 4);
+      return f;
+    };
+    std::string s;
+    for (uint32_t a = 0x82913CC0u; a < 0x82913CF0u; a += 4) s += fmt::format(" {:X}={}", a, rd(a));
+    for (uint32_t a = 0x820203E0u; a < 0x820203F0u; a += 4) s += fmt::format(" {:X}={}", a, rd(a));
+    REXLOG_INFO("lod params:{}", s);
+  }
+  if (std::memcmp(at, &u, 4) != 0) {
+    static float logged = -1.0f;
+    if (logged != scale) {
+      uint32_t old;
+      std::memcpy(&old, at, 4);
+      old = __builtin_bswap32(old);
+      float oldf;
+      std::memcpy(&oldf, &old, 4);
+      REXLOG_INFO("lod: full-detail distance scale {} (was {}), edge {:.0f}", scale, oldf, 1383.84f * scale);
+      logged = scale;
+    }
+    std::memcpy(at, &u, 4);
+  }
+  // The far cut d2 = 4536 x the scale 0x82913CCC (x 0x82913CE0): an object farther away is not
+  // drawn and its district's low-detail block is drawn instead (measured over the bay: 57-269
+  // blocks per frame at 1, none at 4, the islands drawn with their real buildings).
+  {
+    const float far_scale = float(REXCVAR_GET(sr_lod_far_scale));
+    uint32_t uf;
+    std::memcpy(&uf, &far_scale, 4);
+    uf = __builtin_bswap32(uf);
+    uint8_t* at_far = base + 0x82913CCCu;
+    if (std::memcmp(at_far, &uf, 4) != 0) {
+      static float logged_far = -1.0f;
+      if (logged_far != far_scale) {
+        REXLOG_INFO("lod: far cut scale {}, edge {:.0f}", far_scale, 4536.0f * far_scale);
+        logged_far = far_scale;
+      }
+      std::memcpy(at_far, &uf, 4);
+    }
+  }
+  // The small-object cut: an instance is drawn while its size over its distance exceeds
+  // 0.01148 (0x820203E8) times the scale 0x82913CD0; street lamps vanished about 300 units out.
+  const float size_cut = float(REXCVAR_GET(sr_lod_small_scale));
+  uint32_t us;
+  std::memcpy(&us, &size_cut, 4);
+  us = __builtin_bswap32(us);
+  uint8_t* at_small = base + 0x82913CD0u;
+  if (std::memcmp(at_small, &us, 4) != 0) {
+    static float logged_small = -1.0f;
+    if (logged_small != size_cut) {
+      REXLOG_INFO("lod: small-object size cut scale {}", size_cut);
+      logged_small = size_cut;
+    }
+    std::memcpy(at_small, &us, 4);
+  }
+}
+
+// sr_lod_log: per object origin (world matrix translation), the indices drawn this frame (the
+// shadow pass and the main pass both count, the same each frame); a changed total between
+// frames is a detail switch (or the object leaving the view in part), logged with its distance.
+void Renderer::LodProbe(const float* m, uint32_t count, char kind, const float* bounds) {
+  static std::unordered_map<uint64_t, std::array<uint32_t, 2>> totals;  // [this frame, last frame]
+  static std::unordered_map<uint64_t, std::array<float, 4>> origins;
+  static uint64_t frame = 0;
+  if (frame != swap_number_) {
+    for (auto& [k, t] : totals) {
+      if (t[0] != t[1]) {
+        const auto& o = origins[k];
+        const float dx = o[0] - g_view_camera[0], dy = o[1] - g_view_camera[1], dz = o[2] - g_view_camera[2];
+        const float px = o[0] - g_player_pos[0], py = o[1] - g_player_pos[1], pz = o[2] - g_player_pos[2];
+        float cd = -1.0f, rad = -1.0f;
+        if (g_lod_spheres) {
+          auto sit = g_lod_spheres->find(k);
+          if (sit != g_lod_spheres->end()) {
+            const auto& s = sit->second;
+            const float sx = s[0] - g_view_camera[0], sy = s[1] - g_view_camera[1], sz = s[2] - g_view_camera[2];
+            cd = std::sqrt(sx * sx + sy * sy + sz * sz);
+            rad = s[3];
+          }
+        }
+        const float depth = dx * g_lod_view_dir[0] + dy * g_lod_view_dir[1] + dz * g_lod_view_dir[2];
+        float clip[4];
+        for (int r = 0; r < 4; ++r)
+          clip[r] = g_lod_vp[r * 4] * o[0] + g_lod_vp[r * 4 + 1] * o[1] + g_lod_vp[r * 4 + 2] * o[2] + g_lod_vp[r * 4 + 3];
+        const float nx = clip[3] != 0.0f ? clip[0] / clip[3] : 9.0f, ny = clip[3] != 0.0f ? clip[1] / clip[3] : 9.0f;
+        REXLOG_INFO("lod switch {} swap {} at ({:.4f} {:.4f} {:.4f}) dist {:.0f} hdist {:.0f} pdist {:.1f} "
+                    "phdist {:.1f} cdist {:.1f} radius {:.1f} depth {:.1f} ndc {:.2f} {:.2f}: indices {} -> {}",
+                    char(o[3]), swap_number_, o[0], o[1], o[2], std::sqrt(dx * dx + dy * dy + dz * dz),
+                    std::sqrt(dx * dx + dz * dz), std::sqrt(px * px + py * py + pz * pz), std::sqrt(px * px + pz * pz),
+                    cd, rad, depth, nx, ny, t[1], t[0]);
+      }
+      t[1] = t[0];
+      t[0] = 0;
+    }
+    frame = swap_number_;
+    {
+      // The view direction: the screen centre unprojected at two depths.
+      float q[2][3];
+      for (int zi = 0; zi < 2; ++zi) {
+        const float clip[4] = {0.0f, 0.0f, zi ? 0.1f : 0.9f, 1.0f};
+        float p[4];
+        for (int r = 0; r < 4; ++r)
+          p[r] = g_lamp_inv_vp[r * 4] * clip[0] + g_lamp_inv_vp[r * 4 + 1] * clip[1] + g_lamp_inv_vp[r * 4 + 2] * clip[2] +
+                 g_lamp_inv_vp[r * 4 + 3] * clip[3];
+        for (int k = 0; k < 3; ++k) q[zi][k] = p[k] / p[3];
+      }
+      float d[3] = {q[1][0] - q[0][0], q[1][1] - q[0][1], q[1][2] - q[0][2]};
+      const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      if (len > 0.0f)
+        for (int k = 0; k < 3; ++k) g_lod_view_dir[k] = d[k] / len;
+      Invert4x4(g_lamp_inv_vp, g_lod_vp);
+    }
+    if (swap_number_ % 300 == 0) {
+      // The scene camera's clip planes: the centre of the screen at clip z 0 and 1.
+      float d[2];
+      for (int zi = 0; zi < 2; ++zi) {
+        const float clip[4] = {0.0f, 0.0f, float(zi), 1.0f};
+        float p[4];
+        for (int r = 0; r < 4; ++r)
+          p[r] = g_lamp_inv_vp[r * 4] * clip[0] + g_lamp_inv_vp[r * 4 + 1] * clip[1] + g_lamp_inv_vp[r * 4 + 2] * clip[2] +
+                 g_lamp_inv_vp[r * 4 + 3] * clip[3];
+        const float x = p[0] / p[3] - g_view_camera[0], y = p[1] / p[3] - g_view_camera[1], z = p[2] / p[3] - g_view_camera[2];
+        d[zi] = std::sqrt(x * x + y * y + z * z);
+      }
+      REXLOG_INFO("lod camera swap {}: clip z0 at {:.2f}, z1 at {:.1f}", swap_number_, d[0], d[1]);
+    }
+  }
+  const uint64_t okey = RtMix(RtMix(uint64_t(int64_t(std::floor(m[3] * 4.0f))), uint64_t(int64_t(std::floor(m[7] * 4.0f)))),
+                              uint64_t(int64_t(std::floor(m[11] * 4.0f))));
+  totals[okey][0] += count;
+  origins[okey] = {m[3], m[7], m[11], float(kind)};
+  // The world bounding sphere of the object's largest mesh.
+  static std::unordered_map<uint64_t, std::array<float, 4>> spheres;
+  if (bounds && bounds[3] >= 0.0f) {
+    float c[3];
+    for (int r = 0; r < 3; ++r) c[r] = m[r * 4] * bounds[0] + m[r * 4 + 1] * bounds[1] + m[r * 4 + 2] * bounds[2] + m[r * 4 + 3];
+    const float scale = std::sqrt(m[0] * m[0] + m[4] * m[4] + m[8] * m[8]);
+    auto& s = spheres[okey];
+    if (bounds[3] * scale >= s[3]) s = {c[0], c[1], c[2], bounds[3] * scale};
+  }
+  g_lod_spheres = &spheres;
+}
+
+// Superman's cape: world-space cloth vertices, camera-only vertex shader (RtCaptureCape).
+constexpr uint64_t kCapeVs = 0x4536A1CD0C92C7C9ull;
+
 void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd,
                              const BufferEntry* ib, uint32_t start_index, uint32_t index_count,
                              int32_t base_vertex, bool strip) {
@@ -2591,22 +3498,16 @@ void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCm
   if (swap_number_ >= last_diag + 600) {
     last_diag = swap_number_;
     REXLOG_INFO("native: rt capture diag: indexed triangle-list draws {}, not receiver {}, no world {}, "
-                "no position {}, bad args {}, skinned {}, format {}, captured {}, meshes {}, instances {}",
+                "no position {}, bad args {}, skinned {}, format {}, captured {} (full scene {}, strip meshes {}), budget {}, "
+                "meshes {}, instances {}",
                 calls, no_receiver, no_world, no_pos, bad_args, rt_stats_.skip_skinned,
-                rt_stats_.skip_format, rt_stats_.captured, rt_meshes_.size(), rt_city_instances_.size());
+                rt_stats_.skip_format, rt_stats_.captured, rt_stats_.full_scene, rt_stats_.strip_meshes, rt_stats_.skip_budget,
+                rt_meshes_.size(), rt_city_instances_.size());
   }
   if (!ib || base_vertex < 0 || index_count < 3) { ++bad_args; return; }
-  const ShadowRegs* send = std::end(kShadowRegs);
-  const ShadowRegs* sit = std::lower_bound(std::begin(kShadowRegs), send, current_vs_hash_,
-                                           [](const ShadowRegs& e, uint64_t h) { return e.hash < h; });
-  if (sit == send || sit->hash != current_vs_hash_) { ++no_receiver; return; }  // not a sun shadow receiver
-  const WorldRegs* wend = std::end(kWorldRegs);
-  const WorldRegs* wit = std::lower_bound(std::begin(kWorldRegs), wend, current_vs_hash_,
-                                          [](const WorldRegs& e, uint64_t h) { return e.hash < h; });
-  if (wit == wend || wit->hash != current_vs_hash_) { ++no_world; return; }
-  if (wit->skinned) {
-    // Stream output writes the draw's triangles as a list: 3 vertices each. A
-    // strip (the characters) has length - 2 per run between restart indices.
+  // Stream output writes the draw's triangles as a list: 3 vertices each. A
+  // strip (the characters) has length - 2 per run between restart indices.
+  auto so_vertices = [&]() {
     uint32_t vertices = index_count - index_count % 3;
     if (strip) {
       const uint32_t isize = cmd.index32 ? 4 : 2, cut = cmd.index32 ? 0xFFFFFFFFu : 0xFFFFu;
@@ -2626,10 +3527,38 @@ void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCm
       }
       vertices = triangles * 3;
     }
-    RtCaptureSkinned(base, sit->u, sit->v, sit->z, start_index, index_count, base_vertex, vertices);
+    return vertices;
+  };
+  if (current_vs_hash_ == kCapeVs) {
+    RtCaptureCape(base, true, start_index, index_count, base_vertex, so_vertices());
     return;
   }
-  if (strip) return;  // static geometry: triangle lists only
+  const ShadowRegs* send = std::end(kShadowRegs);
+  const ShadowRegs* sit = std::lower_bound(std::begin(kShadowRegs), send, current_vs_hash_,
+                                           [](const ShadowRegs& e, uint64_t h) { return e.hash < h; });
+  const WorldRegs* wend = std::end(kWorldRegs);
+  const WorldRegs* wit = std::lower_bound(std::begin(kWorldRegs), wend, current_vs_hash_,
+                                          [](const WorldRegs& e, uint64_t h) { return e.hash < h; });
+  // Static world geometry that does not receive the sun shadow (cars and props
+  // with damage effects, far lit buildings, foliage) joins the scene too, except
+  // the water surface itself (Gerstner waves) and camera-facing sprites.
+  const bool receiver = sit != send && sit->hash == current_vs_hash_;
+  const bool full_scene = REXCVAR_GET(sr_rt_full_scene) && wit != wend && wit->hash == current_vs_hash_ &&
+                          !wit->skinned && current_vs_hash_ != 0x31FE1648D1734C70ull &&
+                          current_vs_hash_ != 0x0EAF824686027895ull;
+  if (!receiver && full_scene) ++rt_stats_.full_scene;
+  if (!receiver && !full_scene) {  // not a sun shadow receiver
+    ++no_receiver;
+    return;
+  }
+  if (wit == wend || wit->hash != current_vs_hash_) { ++no_world; return; }
+  if (wit->skinned) {
+    RtCaptureSkinned(base, sit->u, sit->v, sit->z, start_index, index_count, base_vertex, so_vertices());
+    return;
+  }
+  // Static strips: their indices are expanded to a triangle list for the BLAS
+  // (with sr_rt_full_scene; before, static geometry was triangle lists only).
+  if (strip && !REXCVAR_GET(sr_rt_full_scene)) return;
   // Position element and its stream.
   const StreamPlan* pos_stream = nullptr;
   uint32_t pos_offset = 0;
@@ -2652,13 +3581,16 @@ void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCm
   key = RtMix(key, cmd.index.key);
   key = RtMix(key, (uint64_t(start_index) << 32) | index_count);
   key = RtMix(key, uint64_t(uint32_t(base_vertex)));
+  if (strip) key = RtMix(key, 0x5354524950ull);
   // World matrix rows (the vertex shader's gWorldXform, dot products with the
   // position), the same world space the receivers' light rows use.
   const float* c = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase);
   RtInstance instance;
   instance.mesh = key;
-  instance.source = current_vs_hash_ == 0xC7C0E381A3C9B79Eull ? 2 : 1;
+  instance.vs = current_vs_hash_;
+  instance.source = !receiver ? 8 : current_vs_hash_ == 0xC7C0E381A3C9B79Eull ? 2 : 1;
   std::memcpy(instance.transform, c + wit->reg * 4, sizeof(instance.transform));
+  if (REXCVAR_GET(sr_lod_log)) LodProbe(instance.transform, index_count, 'd', nullptr);
   const uint64_t ikey = RtInstanceKey(instance);
   auto mit = rt_meshes_.find(key);
   if (mit == rt_meshes_.end()) {
@@ -2666,7 +3598,7 @@ void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCm
       rt_builds_swap_ = swap_number_;
       rt_builds_this_frame_ = 0;
     }
-    if (rt_builds_this_frame_ >= 64) { ++rt_stats_.skip_budget; return; }
+    if (rt_builds_this_frame_ >= uint32_t(REXCVAR_GET(sr_rt_builds_per_frame))) { ++rt_stats_.skip_budget; return; }
     auto vb_it = buffers_.find(pos_stream->buffer.key);  // already uploaded by BindVertexStreams
     if (vb_it == buffers_.end() || !vb_it->second.resource) return;
     const BufferEntry* vb = &vb_it->second;
@@ -2686,9 +3618,42 @@ void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCm
         ib->resource->GetGPUVirtualAddress() + uint64_t(start_index) * (index32 ? 4 : 2);
     geometry.Triangles.IndexFormat = index32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     geometry.Triangles.IndexCount = index_count - index_count % 3;
+    if (strip) {
+      // The strip as a list in the order stream output writes it (odd triangles
+      // i+1, i, i+2, restart index ends a run), so primitive n is SO triangle n.
+      const uint32_t isize = index32 ? 4 : 2, cut = index32 ? 0xFFFFFFFFu : 0xFFFFu;
+      const uint8_t* q = GuestPtr(base, 0xA0000000u + cmd.index.address + start_index * isize, index_count * isize);
+      std::vector<uint32_t> list;
+      list.reserve(size_t(index_count) * 3);
+      uint32_t run[2] = {}, n = 0;
+      for (uint32_t i = 0; i < index_count; ++i) {
+        const uint32_t index = isize == 4 ? (uint32_t(q[4 * i]) << 24) | (uint32_t(q[4 * i + 1]) << 16) |
+                                                (uint32_t(q[4 * i + 2]) << 8) | q[4 * i + 3]
+                                          : (uint32_t(q[2 * i]) << 8) | q[2 * i + 1];
+        if (index == cut) { n = 0; continue; }
+        if (n >= 2) {
+          const bool odd = (n - 2) & 1;
+          list.push_back(odd ? run[1] : run[0]);
+          list.push_back(odd ? run[0] : run[1]);
+          list.push_back(index);
+        }
+        run[0] = run[1];
+        run[1] = index;
+        if (n < 2) run[n] = index;  // first two vertices of a run
+        ++n;
+      }
+      if (list.empty()) return;
+      UploadAlloc up;
+      if (!Upload(list.size() * 4, 16, up)) return;
+      std::memcpy(up.cpu, list.data(), list.size() * 4);
+      geometry.Triangles.IndexBuffer = up.resource->GetGPUVirtualAddress() + up.offset;
+      geometry.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+      geometry.Triangles.IndexCount = UINT(list.size());
+      ++rt_stats_.strip_meshes;
+    }
     RtMesh mesh;
     if (!RtBuildBlas(geometry, mesh)) return;
-    mesh.triangles = index_count / 3;
+    mesh.triangles = geometry.Triangles.IndexCount / 3;
     ++rt_builds_this_frame_;
     ++rt_stats_.new_meshes;
     mit = rt_meshes_.emplace(key, std::move(mesh)).first;
@@ -2711,7 +3676,7 @@ void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCm
   // pixel shader has a colour texture (the shadow pass draws it first without).
   if (REXCVAR_GET(sr_rt_reflections))
     RtCaptureUv(mit->second, base, RtUvInterp(current_ps_hash_), RtPaletteInterp(current_ps_hash_), true,
-                index_count, start_index, base_vertex);
+                index_count, start_index, base_vertex, strip ? so_vertices() : 0);
   RtAddInstance(instance);
 }
 
@@ -2827,6 +3792,11 @@ bool Renderer::RtDrawMaterial(int32_t captured_uv_interp, RtMaterial& in) {
   } else if (const AlbedoRegs* ait = RtAlbedoFor(current_ps_hash_); ait && texture(int32_t(ait->slot))) {
     // Other materials: the colour texture alone.
     in.albedo = texture(int32_t(ait->slot));
+    // Its alpha test (leaves, fences): the ray tests the texture's alpha the same way.
+    const uint32_t cc = mirror_.regs()[rex::graphics::XE_GPU_REG_RB_COLORCONTROL];
+    in.alpha_ref = -1.0f;
+    if (REXCVAR_GET(sr_rt_alpha_test) && (cc & 8) && (cc & 7) != 7 && (cc & 7) != 0)
+      std::memcpy(&in.alpha_ref, &mirror_.regs()[rex::graphics::XE_GPU_REG_RB_ALPHA_REF], 4);
     in.albedo_gen = SrvGeneration(in.albedo & 0x7FFFu);
     in.sampler = rt_samp_[ait->slot];
     if (ait->interp >= 0 && captured_uv_interp == ait->interp) {
@@ -2853,8 +3823,14 @@ void Renderer::RtAddInstance(const RtInstance& instance) {
   if (mit == rt_meshes_.end()) return;
   mit->second.last_swap = swap_number_;
   auto [iit, inserted] = rt_city_instances_.try_emplace(RtInstanceKey(instance), instance);
-  if (inserted) iit->second.first_swap = swap_number_;
+  if (inserted) {
+    iit->second.first_swap = swap_number_;
+    iit->second.xform = RtXformKey(instance.transform);
+    rt_young_instances_.emplace_back(iit->first, swap_number_);
+  }
   iit->second.last_swap = swap_number_;
+  // A copy a shadow receiver also draws is not only full-scene geometry.
+  if ((iit->second.source & 8) && !(instance.source & 8)) iit->second.source = instance.source;
   // Draws without a colour texture (the shadow pass, which also draws what is
   // outside the view) leave the material the copy or the mesh already has.
   RtMaterial in;
@@ -2933,6 +3909,24 @@ void Renderer::RtCaptureInstanced(uint8_t* base, const WorkBatch& batch, const W
   key = RtMix(key, (uint64_t(ps.stride) << 32) | offsets[0]);
   key = RtMix(key, RtMix(xs.buffer.key, xs.offset));
   key = RtMix(key, (uint64_t(first_local) << 32) | per_copy);
+  // Copies past sr_rt_instance_range stay out of the ray tracing (a longer sr_lod_distance_scale
+  // draws many more; their shadows and reflections are not seen that far, their cost is).
+  const float rt_range = float(REXCVAR_GET(sr_rt_instance_range));
+  auto in_rt_range = [&](uint32_t copy) {
+    const uint32_t reg = iit->transforms + copy * iit->per_instance;
+    if (reg + iit->per_instance > 256) return false;
+    const float* t = c + reg * 4;
+    const float* o = iit->per_instance == 2 ? t : t + 12;
+    const float dx = o[0] - g_view_camera[0], dy = o[1] - g_view_camera[1], dz = o[2] - g_view_camera[2];
+    return !(dx * dx + dy * dy + dz * dz > rt_range * rt_range);
+  };
+  if (rt_range > 0.0f && g_view_camera_valid && !REXCVAR_GET(sr_lod_log)) {
+    const uint32_t first_copy = uint32_t((double(start_vertex) + 0.5) / per_copy);
+    const uint32_t last_copy = uint32_t((double(start_vertex) + vertex_count - 1 + 0.5) / per_copy);
+    bool any = false;
+    for (uint32_t i = first_copy; i <= last_copy && !any; ++i) any = in_rt_range(i);
+    if (!any) return;
+  }
   const bool fresh = !rt_meshes_.count(key);
   const bool dump = REXCVAR_GET(sr_rt_dump_obj_swap) > 0 &&
                     swap_number_ == uint64_t(REXCVAR_GET(sr_rt_dump_obj_swap)) &&
@@ -2942,7 +3936,7 @@ void Renderer::RtCaptureInstanced(uint8_t* base, const WorkBatch& batch, const W
       rt_builds_swap_ = swap_number_;
       rt_builds_this_frame_ = 0;
     }
-    if (rt_builds_this_frame_ >= 64) { ++rt_stats_.skip_budget; return; }
+    if (rt_builds_this_frame_ >= uint32_t(REXCVAR_GET(sr_rt_builds_per_frame))) { ++rt_stats_.skip_budget; return; }
   }
   if (!ps.stride) return;
   const uint32_t vertex_total = (ps.size - offsets[0]) / ps.stride;
@@ -2985,6 +3979,42 @@ void Renderer::RtCaptureInstanced(uint8_t* base, const WorkBatch& batch, const W
     ++rt_stats_.new_meshes;
     rt_meshes_.emplace(key, std::move(mesh));
   }
+  // sr_lod_log: the mesh's bounding sphere (local), once per mesh.
+  std::array<float, 4> lod_bounds{0.0f, 0.0f, 0.0f, -1.0f};
+  if (REXCVAR_GET(sr_lod_log) && pos_format == DXGI_FORMAT_R32G32B32_FLOAT) {
+    static std::unordered_map<uint64_t, std::array<float, 4>> bounds;
+    auto bit = bounds.find(key);
+    if (bit == bounds.end()) {
+      float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+      bool ok = xs.stride != 0;
+      for (uint32_t i = 0; ok && i < per_copy; ++i) {
+        const uint64_t at = uint64_t(first_local + i) * xs.stride + offsets[1];
+        if (at + 4 > xs.size) { ok = false; break; }
+        const uint8_t* q = GuestPtr(base, 0xA0000000u + xs.buffer.address + xs.offset + uint32_t(at), 4);
+        const uint32_t w = (uint32_t(q[0]) << 24) | (uint32_t(q[1]) << 16) | (uint32_t(q[2]) << 8) | q[3];
+        float f;
+        if (index_uint) f = float(w);
+        else std::memcpy(&f, &w, 4);
+        if (!(f >= 0.0f) || f >= float(vertex_total)) { ok = false; break; }
+        const uint8_t* v = GuestPtr(base, 0xA0000000u + ps.buffer.address + ps.offset + offsets[0] + uint32_t(f) * ps.stride, 12);
+        for (int k = 0; k < 3; ++k) {
+          const uint32_t u = (uint32_t(v[4 * k]) << 24) | (uint32_t(v[4 * k + 1]) << 16) | (uint32_t(v[4 * k + 2]) << 8) | v[4 * k + 3];
+          float c;
+          std::memcpy(&c, &u, 4);
+          lo[k] = std::min(lo[k], c);
+          hi[k] = std::max(hi[k], c);
+        }
+      }
+      std::array<float, 4> b{0.0f, 0.0f, 0.0f, -1.0f};
+      if (ok) {
+        for (int k = 0; k < 3; ++k) b[k] = (lo[k] + hi[k]) * 0.5f;
+        b[3] = 0.5f * std::sqrt((hi[0] - lo[0]) * (hi[0] - lo[0]) + (hi[1] - lo[1]) * (hi[1] - lo[1]) +
+                                (hi[2] - lo[2]) * (hi[2] - lo[2]));
+      }
+      bit = bounds.emplace(key, b).first;
+    }
+    lod_bounds = bit->second;
+  }
   // Copies covered by this draw (SV_VertexID starts at start_vertex).
   const uint32_t first = uint32_t((double(start_vertex) + 0.5) / per_copy);
   const uint32_t last = uint32_t((double(start_vertex) + vertex_count - 1 + 0.5) / per_copy);
@@ -3018,6 +4048,8 @@ void Renderer::RtCaptureInstanced(uint8_t* base, const WorkBatch& batch, const W
     for (int k = 0; k < 12; ++k) finite = finite && std::isfinite(m[k]);
     if (!finite) continue;
     ++rt_stats_.instanced_copies;
+    if (REXCVAR_GET(sr_lod_log)) LodProbe(m, per_copy, 'i', lod_bounds.data());
+    if (rt_range > 0.0f && g_view_camera_valid && !in_rt_range(i)) continue;
     if (dump) RtDumpObj(base, ps.buffer.address + ps.offset + offsets[0], ps.stride, indices, m, RtInstanceKey(instance));
     RtAddInstance(instance);
   }
@@ -3375,6 +4407,60 @@ bool Renderer::ReinterpretSurface(HostSurface& dst, HostSurface& src) {
   ++stats_.edram_reinterprets;
   Breadcrumb("edram reinterpret");
   // Guest state must be rebound (root signature, heaps, targets).
+  frame_state_bound_ = false;
+  bound_rt_count_ = 0;
+  bound_ds_ = nullptr;
+  std::memset(bound_rts_, 0, sizeof(bound_rts_));
+  return true;
+}
+
+// Resolve exponent bias: multiplies a region of one layer of a resolve texture
+// by `factor` (blending: source x 0 + destination x blend factor; powers of
+// two are exact in float).
+bool Renderer::ScaleResolveLayer(ResolveTexture& dst, uint32_t layer, const D3D12_RECT& rect, float factor) {
+  auto& pso = resolve_scale_pipelines_[uint32_t(dst.srv_format)];
+  if (!pso) {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = alias_root_signature_.Get();
+    desc.VS = {kEdramAliasVS, sizeof(kEdramAliasVS)};
+    desc.PS = {kResolveScalePS, sizeof(kResolveScalePS)};
+    auto& rt = desc.BlendState.RenderTarget[0];
+    rt.BlendEnable = TRUE;
+    rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ZERO;
+    rt.DestBlend = rt.DestBlendAlpha = D3D12_BLEND_BLEND_FACTOR;
+    rt.BlendOp = rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+    rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    desc.SampleMask = UINT_MAX;
+    desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = dst.srv_format;
+    desc.SampleDesc.Count = 1;
+    if (FAILED(device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso)))) {
+      pso.Reset();
+      static int logged = 0;
+      if (logged++ < 4) REXLOG_WARN("native: resolve exponent bias: no pipeline for format {}", int(dst.srv_format));
+      return false;
+    }
+  }
+  if (layer >= 4 || !dst.layer_rtvs[layer].ptr) return false;
+  const D3D12_CPU_DESCRIPTOR_HANDLE rtv = dst.layer_rtvs[layer];
+  Transition(dst.resource.Get(), dst.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+  command_list_->SetGraphicsRootSignature(alias_root_signature_.Get());
+  command_list_->SetPipelineState(pso.Get());
+  command_list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  D3D12_VIEWPORT vp{0.0f, 0.0f, float(HostPx(dst.width, dst.scale)), float(HostPx(dst.height, dst.scale)),
+                    0.0f, 1.0f};
+  command_list_->RSSetViewports(1, &vp);
+  command_list_->RSSetScissorRects(1, &rect);
+  const float f[4] = {factor, factor, factor, factor};
+  command_list_->OMSetBlendFactor(f);
+  command_list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  command_list_->DrawInstanced(3, 1, 0, 0);
+  Breadcrumb("resolve exp bias");
+  // Guest state must be rebound (root signature, targets, viewport).
   frame_state_bound_ = false;
   bound_rt_count_ = 0;
   bound_ds_ = nullptr;
@@ -4200,9 +5286,13 @@ uint32_t Renderer::GetTextureSrvIndex(uint8_t* base, const uint32_t fetch[6], bo
     if (entry.checked_frame != frame_count_ && !entry.guest_ranges.empty()) {
       entry.checked_frame = frame_count_;
       // With write watches: guest physical writes trigger a check immediately.
-      // Dynamic movie and UI textures (up to 4MB) are revalidated each frame
-      // because guest virtual CPU writes (video codecs) bypass physical write watches.
-      // Larger unwatched textures are checked every 30 frames.
+      // Small textures (up to 4MB: movie and UI planes) are also hashed every
+      // 16 frames against a writer the watch does not see; one caught that way
+      // is hashed every frame from then on. Every change observed so far arrived
+      // notified (SR_NATIVE_TEXTURE_AUDIT, title to city flight: 3.17 M checks,
+      // 0 unnotified), and hashing them all every frame took a fifth of the
+      // render worker. Without watches small textures are hashed every frame,
+      // larger ones every 30 frames.
       const auto written_since = [this](uint32_t address, uint32_t size, uint32_t seq) {
         return TextureWrittenSince(address, size, seq);
       };
@@ -4217,8 +5307,11 @@ uint32_t Renderer::GetTextureSrvIndex(uint8_t* base, const uint32_t fetch[6], bo
       watch_timer.Stop();
       // Preserve the existing base-level threshold; adding mip coverage must
       // not move an existing per-frame texture into the slower policy.
-      bool check = entry.guest_size <= (4096u << 10) ||
-                   (texture_watch_ ? written : frame_count_ - entry.hashed_frame >= 30);
+      const bool small_texture = entry.guest_size <= (4096u << 10);
+      bool check = texture_watch_
+                       ? written || (small_texture && (entry.unwatched_writer ||
+                                                       frame_count_ - entry.hashed_frame >= 16))
+                       : small_texture || frame_count_ - entry.hashed_frame >= 30;
       if (REXCVAR_GET(sr_native_debug_texture_format) >= 0 &&
           int32_t(fetch[1] & 0x3F) == REXCVAR_GET(sr_native_debug_texture_format)) {
         static int logged = 0;
@@ -4268,6 +5361,13 @@ uint32_t Renderer::GetTextureSrvIndex(uint8_t* base, const uint32_t fetch[6], bo
         if (TextureHashReplayEnabled())
           MaybeReplayTextureHash(std::span<const uint32_t, 6>(fetch, 6), frame_count_, "d3d12");
         if (hash != entry.content_hash) {
+          // A write racing with the hash is newer than watch_seq: not unwatched.
+          if (texture_watch_ && !written && !entry.unwatched_writer &&
+              !TextureContentWritten(entry.guest_ranges, entry.watch_seq, written_since)) {
+            entry.unwatched_writer = true;
+            REXLOG_INFO("native: texture {:08X} changed without a write notification; "
+                        "hashed every frame from now on", entry.guest_base);
+          }
           if (CpuProfiling()) ++cpu_timings.texture_hash_changes;
           ++stats_.textures_reloaded;
           Retire(entry.resource);
@@ -4383,8 +5483,10 @@ uint32_t Renderer::CreateTexture(const uint32_t fetch[6], TextureEntry& entry) {
   }
   // Remaster textures (texture_replace.h): dump by content name, and upload a
   // replacement of the same name instead of the game's texture.
+  std::string created_name;
   if (!cube && !volume) {
     const std::string tex_name = TextureName(pre_hash, decoded);
+    created_name = tex_name;
     DumpTextureOnce(tex_name, decoded,
                     IsGammaFetch(fetch) && REXCVAR_GET(sr_native_texture_gamma) == 1);
     DecodedTexture replacement;
@@ -4446,7 +5548,10 @@ uint32_t Renderer::CreateTexture(const uint32_t fetch[6], TextureEntry& entry) {
   }
   desc.Format = resource_format;
   desc.SampleDesc.Count = 1;
-  if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+  // In a pre-made heap when there is room (no driver allocation on the worker),
+  // else committed as before.
+  if (!texture_heap_.Place(desc, D3D12_RESOURCE_STATE_COPY_DEST, entry.resource) &&
+      FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
                                               D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                               IID_PPV_ARGS(&entry.resource)))) {
     return 0;
@@ -4530,6 +5635,10 @@ uint32_t Renderer::CreateTexture(const uint32_t fetch[6], TextureEntry& entry) {
     srv.Texture2D.MipLevels = decoded.mip_levels;
   }
   entry.srv_index = AllocSrvIndex();
+  if (entry.srv_index) {
+    if (srv_names_.size() <= entry.srv_index) srv_names_.resize(size_t(entry.srv_index) + 1024);
+    srv_names_[entry.srv_index] = created_name;
+  }
   if (!entry.srv_index) {
     Retire(entry.resource);
     entry.resource.Reset();
@@ -4556,7 +5665,12 @@ uint32_t Renderer::GetSamplerIndex(const uint32_t fetch[6], bool force_linear, f
   CpuTimer cpu_timer(cpu_timings.sampler_ns);
   xenos::xe_gpu_texture_fetch_t f;
   std::memcpy(&f, fetch, sizeof(f));
-  uint32_t bias_q = uint32_t(std::clamp(lod_bias, 0.0f, 7.9f) * 16.0f);  // 1/16 steps
+  // The global bias (sr_texture_mip_bias, auto from the DLSS scale) on the game's textures only.
+  if (!render_target) {
+    const double set = REXCVAR_GET(sr_texture_mip_bias);
+    lod_bias += set > 50.0 ? g_dlss_mip_bias : float(set);
+  }
+  uint32_t bias_q = uint32_t(std::clamp(lod_bias, -7.9f, 7.9f) * 16.0f + 128.0f);  // 1/16 steps, 128 = 0
   uint64_t key = (uint64_t(fetch[0]) & 0x7FFC00) | (uint64_t(fetch[3] & 0x3FF80000) << 32) |
                  (uint64_t(force_linear) << 63) | (uint64_t(render_target) << 62) |
                  (uint64_t(bias_q) << 1);
@@ -4597,7 +5711,7 @@ uint32_t Renderer::GetSamplerIndex(const uint32_t fetch[6], bool force_linear, f
   desc.AddressV = MapClamp(uint32_t(f.clamp_y));
   desc.AddressW = MapClamp(uint32_t(f.clamp_z));
   desc.MaxLOD = D3D12_FLOAT32_MAX;
-  desc.MipLODBias = float(bias_q) / 16.0f;
+  desc.MipLODBias = (float(bias_q) - 128.0f) / 16.0f;
   desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
   uint32_t index = sampler_heap_next_ < kSamplerHeapSize ? sampler_heap_next_++ : 0;
   device_->CreateSampler(&desc, provider_->OffsetSamplerDescriptor(
@@ -4802,16 +5916,164 @@ void Renderer::FlushRingConstants(uint8_t* base, uint32_t dev) {
   pending_ring_constants_.clear();
 }
 
+// The sky's moon (patch 0034 srSkyBodies): textures/sky_moon.dds (premultiplied
+// RGBA8 with mips, tools/textures/make_moon.py), uploaded once into the fixed
+// descriptor kSkyMoonSrv. Without it the moon is drawn procedurally.
+bool Renderer::EnsureSkyMoon() {
+  if (sky_moon_state_ != 0) return sky_moon_state_ > 0;
+  sky_moon_state_ = -1;
+  DecodedTexture tex;
+  if (!LoadReplacement("sky_moon", tex) || tex.dimension != 1 || tex.depth != 1 || tex.levels.empty()) {
+    REXLOG_INFO("sky: no textures/sky_moon.dds, the moon is drawn procedurally");
+    return false;
+  }
+  if (!UploadStaticTexture(tex, sky_moon_, kSkyMoonSrv)) return false;
+  sky_moon_state_ = 1;
+  REXLOG_INFO("sky: moon texture {}x{} ({} mips) in descriptor {}", tex.width, tex.height, tex.mip_levels, kSkyMoonSrv);
+  return true;
+}
+
+// Open water ripples (patch 0035 srCrestWaterNormal): Crest's wave normal map
+// (wave-harmonic/crest, MIT), textures/water/crest_wave_normals.dds made by
+// tools/textures/png_to_dds.py --normal, uploaded once.
+bool Renderer::EnsureWaterNormals() {
+  if (water_normals_state_ != 0) return water_normals_state_ > 0;
+  water_normals_state_ = -1;
+  DecodedTexture tex;
+  if (!LoadReplacement("crest_wave_normals", tex) || tex.dimension != 1 || tex.depth != 1 || tex.levels.empty()) {
+    REXLOG_INFO("water: no textures/water/crest_wave_normals.dds, the open water keeps the game's ripples");
+    return false;
+  }
+  if (!UploadStaticTexture(tex, water_normals_, kWaterNormalsSrv)) return false;
+  water_normals_state_ = 1;
+  REXLOG_INFO("water: Crest wave normals {}x{} in descriptor {}", tex.width, tex.height, kWaterNormalsSrv);
+  return true;
+}
+
+// Night rooms (patch 0036 srWindowRoom): the room atlas of Gaxil/Unity-InteriorMapping
+// (MIT), textures/windows/gaxil_building_atlas.dds.
+bool Renderer::EnsureWindowAtlas() {
+  if (window_atlas_state_ != 0) return window_atlas_state_ > 0;
+  window_atlas_state_ = -1;
+  DecodedTexture tex;
+  if (!LoadReplacement("office_room_panoramas", tex) || tex.dimension != 1 || tex.depth != 1 || tex.levels.empty()) {
+    REXLOG_INFO("windows: no textures/windows/office_room_panoramas.dds, the night windows keep the old light");
+    return false;
+  }
+  if (!UploadStaticTexture(tex, window_atlas_, kWindowAtlasSrv)) return false;
+  window_atlas_state_ = 1;
+  REXLOG_INFO("windows: room atlas {}x{} in descriptor {}", tex.width, tex.height, kWindowAtlasSrv);
+  return true;
+}
+
+// The window map of the building draw's material map (fetch slot 2 of pixel
+// shader 8A6DD1D52752FAD6): c202 = (SRV, width, height, 12345); false without one.
+// The content name of the texture bound to fetch slot `slot` of the current draw, or null.
+const std::string* Renderer::FetchSlotName(uint8_t* base, uint32_t dev, uint32_t slot) {
+  uint32_t fetch[6];
+  for (uint32_t d = 0; d < 6; ++d)
+    fetch[d] = GpuConstant(base, dev, Pm4Mirror::kFetchConstantBase + 6 * slot + d,
+                           kDevFetchConstants + 24 * slot + 4 * d);
+  if (!IsTextureBound(fetch[0])) return nullptr;
+  const uint32_t srv = GetTextureSrvIndex(base, fetch) & 0x7FFFu;
+  if (srv <= 2 || srv >= srv_names_.size() || srv_names_[srv].empty()) return nullptr;
+  return &srv_names_[srv];
+}
+
+bool Renderer::WindowMapFor(uint8_t* base, uint32_t dev, float out[4]) {
+  const std::string* name = FetchSlotName(base, dev, 2);
+  if (!name) return false;
+  auto [it, inserted] = window_maps_.try_emplace(*name);
+  WindowMap& map = it->second;
+  if (inserted) {
+    DecodedTexture tex;
+    const uint32_t index = LoadReplacement(*name + "_win", tex) && tex.dimension == 1 && tex.depth == 1 &&
+                                   !tex.levels.empty()
+                               ? AllocSrvIndex()
+                               : 0;
+    if (index && UploadStaticTexture(tex, map.resource, index)) {
+      map.srv = index;
+      map.width = tex.width;
+      map.height = tex.height;
+    }
+  }
+  if (!map.srv) return false;
+  out[0] = float(map.srv);
+  out[1] = float(map.width);
+  out[2] = float(map.height);
+  out[3] = 12345.0f;
+  return true;
+}
+
+bool Renderer::UploadStaticTexture(const DecodedTexture& tex, Microsoft::WRL::ComPtr<ID3D12Resource>& out,
+                                   uint32_t srv_index) {
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc{};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = tex.width;
+  desc.Height = tex.height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = uint16_t(tex.mip_levels);
+  desc.Format = tex.format;
+  desc.SampleDesc.Count = 1;
+  if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                              nullptr, IID_PPV_ARGS(&out)))) {
+    return false;
+  }
+  std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(tex.mip_levels);
+  std::vector<UINT> rows(tex.mip_levels);
+  std::vector<UINT64> row_sizes(tex.mip_levels);
+  UINT64 total = 0;
+  device_->GetCopyableFootprints(&desc, 0, tex.mip_levels, 0, layouts.data(), rows.data(), row_sizes.data(), &total);
+  UploadAlloc upload;
+  if (!Upload(size_t(total), D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, upload)) {
+    out.Reset();
+    return false;
+  }
+  for (uint32_t mip = 0; mip < tex.mip_levels; ++mip) {
+    const auto& level = tex.levels[mip];
+    uint8_t* dst = upload.cpu + layouts[mip].Offset;
+    const uint32_t copy_rows = std::min<uint32_t>(rows[mip], level.rows);
+    const size_t copy_bytes = std::min<size_t>(size_t(row_sizes[mip]), level.row_pitch);
+    for (uint32_t r = 0; r < copy_rows; ++r)
+      std::memcpy(dst + size_t(r) * layouts[mip].Footprint.RowPitch,
+                  tex.data.data() + level.offset + size_t(r) * level.row_pitch, copy_bytes);
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = upload.resource;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint = layouts[mip];
+    src.PlacedFootprint.Offset += upload.offset;
+    D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+    dst_loc.pResource = out.Get();
+    dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst_loc.SubresourceIndex = mip;
+    command_list_->CopyTextureRegion(&dst_loc, 0, 0, 0, &src, nullptr);
+  }
+  D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COPY_DEST;
+  Transition(out.Get(), state,
+             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+  srv.Format = tex.format;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Texture2D.MipLevels = tex.mip_levels;
+  device_->CreateShaderResourceView(
+      out.Get(), &srv, provider_->OffsetViewDescriptor(srv_heap_->GetCPUDescriptorHandleForHeapStart(), srv_index));
+  return true;
+}
+
 bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
   CpuTimer cpu_timer(cpu_timings.constants_ns);
   CpuTimer float_timer(cpu_timings.constant_float_ns);
   if(CpuProfiling()) ++cpu_timings.constant_draws;
   FlushRingConstants(base, dev);
+  WaterProbe(base);  // the memory probe and watchpoints (water.cpp), at any draw
+  LodDistanceApply(base);
   UpdateRtFrame(base);
   DlssCaptureCamera();
   const bool cache_shared = SharedConstantsCaching();
   UploadAlloc shared;
-  if (!cache_shared && !Upload(4096, 256, shared)) return false;
   bool use_mirror = REXCVAR_GET(sr_native_pm4_mirror);
   // Debug: sr_native_debug_ps_const=<ps hash hex>:<register>:<x>,<y>,<z>,<w>
   static const struct Override {
@@ -4847,16 +6109,153 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
     graphics::guest::CaptureFloatConstants({src,1024}, !use_mirror, captured, error);
     std::memcpy(dst,captured.data(),sizeof(captured));
   };
-  if (!use_mirror || cb_vs_version_ != mirror_.vs_version || !cb_vs_gpu_) {
+  // Day and night: shaders with the game's lighting constants get their own
+  // rewritten copy (never reused by the next draw: version 0).
+  const LightRegs* dn_vs = DayNightRegs(current_vs_hash_, false, swap_number_);
+  const LightRegs* dn_ps = DayNightRegs(current_ps_hash_, true, swap_number_);
+  const uint32_t vs_regs = ConstRegs(current_vs_hash_, false);
+  if (!use_mirror || dn_vs || cb_vs_version_ != mirror_.vs_version || !cb_vs_gpu_ || vs_regs > cb_vs_regs_) {
     UploadAlloc vs;
     if (!Upload(4096, 256, vs)) return false;
     // Through a CPU copy: DLSS keeps it as this draw's "previous" constants
     // for the next frame (upload memory is slow to read back).
     fill(Pm4Mirror::kAluConstantBase, kDevVsConstants, cb_vs_cpu_.data());
-    std::memcpy(vs.cpu, cb_vs_cpu_.data(), 4096);
+    if (dn_vs) {
+      // Rewritten in ordinary memory, then written once: reading back the
+      // upload heap (write-combined) made this the worker's hottest function.
+      alignas(16) uint32_t local[1024];
+      std::memcpy(local, cb_vs_cpu_.data(), 4096);
+      ApplyDayNight(dn_vs, local);
+      std::memcpy(vs.cpu, local, size_t(vs_regs) * 16);
+    } else {
+      std::memcpy(vs.cpu, cb_vs_cpu_.data(), size_t(vs_regs) * 16);
+    }
+    cb_vs_regs_ = vs_regs;
     cb_vs_gpu_ = vs.gpu;
-    cb_vs_version_ = use_mirror ? mirror_.vs_version : 0;
+    cb_vs_version_ = use_mirror && !dn_vs ? mirror_.vs_version : 0;
   }
+  // The night lamps' pixel positions come from depth through the view-projection of the frame:
+  // taken from the first city draw of each frame (the instanced city vertex shaders all keep
+  // gViewInverse at c229 and gViewProjectionXform at c232; roads draw every frame) and written
+  // into the frame data at once. It came only from drawn lamps before, so with no lamp in view
+  // (high above the city) a stale matrix made the pools slide with the camera.
+  if (lamp_view_swap_ != swap_number_ && use_mirror) {
+    static constexpr uint64_t kCityVs[] = {0x1C89B1A64AA3110Bull, 0x315E6843ECE68A00ull, 0x5AB90FB33C54F855ull,
+                                           0x5F7299BBF4390BA3ull, 0x9A62E7C65051447Aull, 0xB27A827D7AA91D13ull,
+                                           0xDF1EB50388CC2563ull, 0xEA88A5BB6930F942ull};
+    if (std::find(std::begin(kCityVs), std::end(kCityVs), current_vs_hash_) != std::end(kCityVs)) {
+      const float* c = reinterpret_cast<const float*>(cb_vs_cpu_.data());
+      const float cam[3] = {c[229 * 4 + 3], c[230 * 4 + 3], c[231 * 4 + 3]};
+      const float dx = cam[0] - g_view_camera[0], dy = cam[1] - g_view_camera[1], dz = cam[2] - g_view_camera[2];
+      // The shadow pass draws the same shaders with the light's matrices: keep the camera's.
+      if (!g_view_camera_valid || dx * dx + dy * dy + dz * dz < 150.0f * 150.0f) {
+        float inv[16];
+        if (Invert4x4(c + 232 * 4, inv)) {
+          lamp_view_swap_ = swap_number_;
+          std::memcpy(g_lamp_inv_vp, inv, sizeof(inv));
+          std::memcpy(g_lamp_vp, g_draw_vp, sizeof(g_lamp_vp));
+          std::memcpy(g_lamp_view_proj, c + 232 * 4, sizeof(g_lamp_view_proj));
+          std::memcpy(g_lamp_camera, cam, sizeof(cam));
+          // This frame's data is already on the GPU: patch the matrix and viewport in it.
+          UploadAlloc up;
+          if (rt_frame_buffer_ && rt_frame_swap_ == swap_number_ && Upload(80, 16, up)) {
+            std::memcpy(up.cpu, g_lamp_inv_vp, 64);
+            std::memcpy(static_cast<uint8_t*>(up.cpu) + 64, g_lamp_vp, 16);
+            Transition(rt_frame_buffer_.Get(), rt_frame_state_, D3D12_RESOURCE_STATE_COPY_DEST);
+            command_list_->CopyBufferRegion(rt_frame_buffer_.Get(), 192, up.resource, up.offset, 64);
+            command_list_->CopyBufferRegion(rt_frame_buffer_.Get(), 1280, up.resource, up.offset + 64, 16);
+            Transition(rt_frame_buffer_.Get(), rt_frame_state_,
+                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+          }
+        }
+      }
+    }
+  }
+  // sr_far_log: how far the city's full-detail instances reach each frame (instanced city
+  // shaders, rows at c100 + 4 i, position in the 4th row), and how many low-detail district
+  // blocks (PS E3656F63 / 91111A32) are drawn instead.
+  if (REXCVAR_GET(sr_far_log) && use_mirror) {
+    static uint64_t frame = ~0ull;
+    static float max_d = 0.0f;
+    static uint32_t far_inst = 0, inst = 0, lod_blocks = 0;
+    if (frame != swap_number_) {
+      if (frame != ~0ull && swap_number_ % 30 == 0)
+        REXLOG_INFO("far: swap {} camera ({:.0f} {:.0f} {:.0f}) instances {} farthest {:.0f}, beyond 7000: {}, "
+                    "district blocks {}", frame, g_lamp_camera[0], g_lamp_camera[1], g_lamp_camera[2], inst, max_d,
+                    far_inst, lod_blocks);
+      frame = swap_number_;
+      max_d = 0.0f;
+      far_inst = inst = lod_blocks = 0;
+    }
+    if (current_ps_hash_ == 0xE3656F63B9C43547ull || current_ps_hash_ == 0x91111A326A89010Aull) ++lod_blocks;
+    static constexpr uint64_t kCityVsFar[] = {0x1C89B1A64AA3110Bull, 0x315E6843ECE68A00ull, 0x5AB90FB33C54F855ull,
+                                              0x5F7299BBF4390BA3ull, 0x9A62E7C65051447Aull, 0xB27A827D7AA91D13ull,
+                                              0xDF1EB50388CC2563ull, 0xEA88A5BB6930F942ull};
+    if (lamp_view_swap_ == swap_number_ &&
+        std::find(std::begin(kCityVsFar), std::end(kCityVsFar), current_vs_hash_) != std::end(kCityVsFar)) {
+      const float* c = reinterpret_cast<const float*>(cb_vs_cpu_.data());
+      const float cam_d = std::fabs(c[229 * 4 + 3] - g_lamp_camera[0]) + std::fabs(c[231 * 4 + 3] - g_lamp_camera[2]);
+      const float per = c[16];
+      if (cam_d < 1.0f && per > 0.0f && dlss_draw_count_) {
+        const uint32_t n = std::min<uint32_t>(uint32_t(float(dlss_draw_count_) / per + 0.5f), 38);
+        for (uint32_t i = 0; i < n; ++i) {
+          const float* r = c + (100 + 4 * i) * 4;
+          const float dx = r[12] - g_lamp_camera[0], dy = r[13] - g_lamp_camera[1], dz = r[14] - g_lamp_camera[2];
+          const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+          ++inst;
+          max_d = std::max(max_d, d);
+          if (d > 7000.0f) ++far_inst;
+        }
+      }
+    }
+  }
+  if (current_vs_hash_ == 0xC687EB65D635C5D7ull && current_ps_hash_ == 0x3EF6A4A3C740ADB1ull) {
+    // Superman: gViewInverse c12-c14 .w is the camera, drawn every frame.
+    const float* c = reinterpret_cast<const float*>(cb_vs_cpu_.data());
+    for (int k = 0; k < 3; ++k) g_view_camera[k] = c[(12 + k) * 4 + 3];
+    for (int k = 0; k < 3; ++k) g_player_pos[k] = c[k * 4 + 3];
+    g_view_camera_valid = true;
+  }
+  if (REXCVAR_GET(sr_player_log) && current_vs_hash_ == 0xC687EB65D635C5D7ull &&
+      current_ps_hash_ == 0x3EF6A4A3C740ADB1ull) {
+    // Superman (skinned vertex shader, his own pixel shader): gWorldXform c0-c2
+    // .w is his position, gViewInverse c12-c14 .w the camera.
+    static uint64_t seen_swap = ~0ull;
+    static double last_ms = 0.0, last_log_ms = 0.0;
+    static float last[3] = {};
+    if (seen_swap != swap_number_) {
+      seen_swap = swap_number_;
+      const float* c = reinterpret_cast<const float*>(cb_vs_cpu_.data());
+      const float pos[3] = {c[3], c[7], c[11]};
+      const double now = compat::BenchElapsedMs();
+      if (now - last_log_ms >= 100.0) {
+        const double dt = (now - last_ms) / 1000.0;
+        const float dx = pos[0] - last[0], dy = pos[1] - last[1], dz = pos[2] - last[2];
+        const double speed = dt > 0.0 ? std::sqrt(double(dx * dx + dy * dy + dz * dz)) / dt : 0.0;
+        // Projection scale: |row 0 of world-view-projection| / |row 0 of world-view|.
+        const float* wvp = c + 8 * 4;
+        const float* wv = c + 4 * 4;
+        const double p00 = std::sqrt(double(wvp[0] * wvp[0] + wvp[1] * wvp[1] + wvp[2] * wvp[2])) /
+                           std::max(1e-6, std::sqrt(double(wv[0] * wv[0] + wv[1] * wv[1] + wv[2] * wv[2])));
+        const float cx = c[12 * 4 + 3] - pos[0], cy = c[13 * 4 + 3] - pos[1], cz = c[14 * 4 + 3] - pos[2];
+        REXLOG_INFO("player: t {:.2f} swap {} pos ({:.2f} {:.2f} {:.2f}) speed {:.1f}/s proj {:.4f} camdist {:.2f}",
+                    now / 1000.0, swap_number_, pos[0], pos[1], pos[2], speed, p00,
+                    std::sqrt(double(cx * cx + cy * cy + cz * cz)));
+        last_log_ms = now;
+      }
+      last_ms = now;
+      std::memcpy(last, pos, sizeof(last));
+    }
+  }
+  // The lamp's near model (816 indices, within 100 units) and its far one (438, the same
+  // spot, up to the game's cut near 300); 1404/600/366 on this material are traffic lights.
+  if (current_vs_hash_ == kLampVs && current_ps_hash_ == kLampPs && dlss_draw_count_ != 0 &&
+      (reinterpret_cast<const float*>(cb_vs_cpu_.data())[16] == float(kLampIndices) ||
+       reinterpret_cast<const float*>(cb_vs_cpu_.data())[16] == float(kLampFarIndices))) {
+    CollectLamps(reinterpret_cast<const float*>(cb_vs_cpu_.data()), dlss_draw_count_);
+  }
+  if (REXCVAR_GET(sr_lamp_log) && current_vs_hash_ == kLampVs)
+    LampModelProbe(reinterpret_cast<const float*>(cb_vs_cpu_.data()), current_ps_hash_, dlss_draw_count_, swap_number_);
   if (!REXCVAR_GET(sr_native_debug_vs).empty() && use_mirror &&
       current_vs_hash_ == std::strtoull(REXCVAR_GET(sr_native_debug_vs).c_str(), nullptr, 16)) {
     static int logged = 0;
@@ -4892,22 +6291,144 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
       REXLOG_INFO("native dbg ps consts (vs {:016X}):{}", current_vs_hash_, m);
     }
   }
-  if (!use_mirror || override_ps || cb_ps_version_ != mirror_.ps_version || !cb_ps_gpu_) {
+  const bool sky_ps = current_ps_hash_ == kSkyBackdropPs && current_vs_hash_ == kSkyBackdropVs &&
+                      REXCVAR_GET(sr_sky_bodies);
+  const bool lod_ps = IsLodCity(current_ps_hash_) &&
+                      (current_vs_hash_ == 0xC79CC997C897773Eull || current_vs_hash_ == 0x29C1ACD9F4373197ull);
+  // The open water (patch 0035): c201 = (ripple strength, split column, -, 12345) once Crest's map is in.
+  const bool ocean_ps = current_ps_hash_ == 0x2EFEE77C92B2F443ull && REXCVAR_GET(sr_water_modern) && EnsureWaterNormals();
+  // The Daily Planet letters' shader: its own constants per draw (c210 glow only on the letters).
+  const bool glow_ps = current_ps_hash_ == 0x872652E70C705D44ull && REXCVAR_GET(sr_glow_strength) > 0.0;
+  // The big globe's letters: one warm colour over the whole object (c210.w = 23456).
+  bool glow_flat_ps = false;
+  if (current_ps_hash_ == 0x3A7A1A60DE39C81Full && REXCVAR_GET(sr_glow_flat_strength) > 0.0) {
+    const std::string* name = FetchSlotName(base, dev, 1);
+    glow_flat_ps = name && REXCVAR_GET(sr_glow_flat_textures).find(*name) != std::string::npos;
+  }
+  // Debug (sr_draw_idview = a texture content name, e.g. the big globe's atlas): the draws
+  // around the one using it (its index in the previous frame, same order every frame) are
+  // painted one hue each by their offset from it, and logged once with that offset.
+  // Debug (sr_draw_idview): every draw painted as a barcode of its id (three digits in a
+  // ten-colour palette, then a black stripe); each (vs, ps, t0-t3, index count) combination
+  // gets the next id, logged once ("idview N ...").
+  int idview_id = -1;
+  if (REXCVAR_GET(sr_draw_idview) && !ScreenSpaceDraw(base, dev) &&
+      !reg::RB_DEPTHCONTROL{LoadReg(base, dev, rex::graphics::XE_GPU_REG_RB_DEPTHCONTROL)}.z_enable) {
+    // Not painted (post-processing lives here too), only listed: world draws without a depth test.
+    static std::unordered_set<std::string> seen_noz;
+    const std::string* t1 = FetchSlotName(base, dev, 1);
+    const std::string key = fmt::format("vs {:016X} ps {:016X} t1={} idx {}", current_vs_hash_, current_ps_hash_,
+                                        t1 ? *t1 : "-", crumb_count_);
+    if (seen_noz.size() < 3000 && seen_noz.insert(key).second) REXLOG_INFO("idview noz {}", key);
+  }
+  if (REXCVAR_GET(sr_draw_idview) && !ScreenSpaceDraw(base, dev) && crumb_count_ > 6 &&
+      (reg::RB_DEPTHCONTROL{LoadReg(base, dev, rex::graphics::XE_GPU_REG_RB_DEPTHCONTROL)}.z_enable ||
+       (crumb_count_ > 6 && current_vs_hash_ != 0x3F41E431E1015A1Aull))) {
+    // Without a depth test too, but not the post-processing quads or the sky dome.
+    // World draws only (depth tested), not post-processing or the UI.
+    static std::unordered_map<std::string, int> ids;
+    std::string names;
+    for (uint32_t k = 0; k < 4; ++k) {
+      const std::string* n = FetchSlotName(base, dev, k);
+      if (n) names += fmt::format(" t{}={}", k, *n);
+    }
+    const std::string* t1 = FetchSlotName(base, dev, 1);
+    const std::string key = fmt::format("vs {:016X} ps {:016X} t1={}", current_vs_hash_, current_ps_hash_, t1 ? *t1 : "-");
+    auto [it, fresh] = ids.try_emplace(key, int(ids.size()));
+    if (fresh) REXLOG_INFO("idview {:03d} {} idx {}{}", it->second, key, crumb_count_, names);
+    idview_id = it->second < 1000 ? it->second : 999;
+  }
+  const bool idview_ps = idview_id >= 0;
+  const uint32_t ps_regs = ConstRegs(current_ps_hash_, true);
+  if (!use_mirror || override_ps || dn_ps || sky_ps || lod_ps || ocean_ps || glow_ps || glow_flat_ps || idview_ps || cb_ps_version_ != mirror_.ps_version ||
+      ps_regs > cb_ps_regs_ ||
+      !cb_ps_gpu_) {
     UploadAlloc ps;
     if (!Upload(4096, 256, ps)) return false;
-    uint32_t* ps_dst = reinterpret_cast<uint32_t*>(ps.cpu);
+    // Built in ordinary memory and written to the upload heap once at the end
+    // (the day/night, window and sky edits read it back; write-combined reads crawl).
+    alignas(16) uint32_t ps_local[1024];
+    uint32_t* ps_dst = ps_local;
     fill(Pm4Mirror::kAluConstantBase + 1024, kDevPsConstants, ps_dst);
     if (override_ps) std::memcpy(ps_dst + ps_override.reg * 4, ps_override.v, 16);
+    if (dn_ps) {
+      // RB_BLENDCONTROL0 colour destination factor (bits 8-12) 1 = ONE: additive.
+      const uint32_t blend = LoadReg(base, dev, rex::graphics::XE_GPU_REG_RB_BLENDCONTROL0);
+      ApplyDayNight(dn_ps, ps_dst, ((blend >> 8) & 0x1F) == 1);
+    }
+    if (dn_ps && current_ps_hash_ == 0x8A6DD1D52752FAD6ull && REXCVAR_GET(sr_window_rooms) && EnsureWindowAtlas()) {
+      float v[4];
+      if (WindowMapFor(base, dev, v)) {
+        std::memcpy(ps_dst + 202 * 4, v, sizeof(v));
+        // The rooms' camera (c203): the lamps' camera is only sent with lamps nearby, so
+        // up a skyscraper it was the world origin and every room a smear.
+        if (g_view_camera_valid) {
+          const float cam[4] = {g_view_camera[0], g_view_camera[1], g_view_camera[2], 12345.0f};
+          std::memcpy(ps_dst + 203 * 4, cam, sizeof(cam));
+        }
+      }
+    }
+    // Night glow (c210, read by the lit shaders' col_map, patch 0037): the Daily Planet
+    // globe's letters (PS 872652E70C705D44, col_map in fetch slot 1) light up at night.
+    if (glow_ps) {
+      const std::string* name = FetchSlotName(base, dev, 1);
+      if (name && REXCVAR_GET(sr_glow_textures).find(*name) != std::string::npos) {
+        daynight::LightingFrame light;
+        const float night = daynight::CurrentLighting(light) ? light.night : 0.0f;
+        const float k = float(REXCVAR_GET(sr_glow_strength)) * night;
+        const bool probe = REXCVAR_GET(sr_glow_probe);
+        const float v[4] = {probe ? 4.0f : k * 1.0f, probe ? 0.0f : k * 0.82f, probe ? 4.0f : k * 0.55f, 12345.0f};
+        if (k > 0.0f || probe) std::memcpy(ps_dst + 210 * 4, v, sizeof(v));
+      }
+    }
+    if (glow_flat_ps) {
+      {
+        static std::unordered_set<uint32_t> seen_counts;
+        if (seen_counts.size() < 64 && seen_counts.insert(crumb_count_).second)
+          REXLOG_INFO("glow flat draw vs {:016X} indices {}", current_vs_hash_, crumb_count_);
+        daynight::LightingFrame light;
+        const float night = daynight::CurrentLighting(light) ? light.night : 0.0f;
+        const float k = float(REXCVAR_GET(sr_glow_flat_strength)) * night;
+        const bool probe = REXCVAR_GET(sr_glow_probe);
+        const bool uvview = REXCVAR_GET(sr_glow_uvview);
+        const float v[4] = {probe ? 4.0f : k * 1.0f, probe ? 0.0f : k * 0.75f, probe ? 4.0f : k * 0.35f,
+                            uvview ? 45678.0f : 23456.0f};
+        float rect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+        std::sscanf(REXCVAR_GET(sr_glow_flat_uv).c_str(), "%f %f %f %f", &rect[0], &rect[1], &rect[2], &rect[3]);
+        if (k > 0.0f || probe || uvview) {
+          std::memcpy(ps_dst + 210 * 4, v, sizeof(v));
+          std::memcpy(ps_dst + 211 * 4, rect, sizeof(rect));
+        }
+      }
+    }
+    if (idview_ps) {
+      const float v[4] = {float(idview_id), 0.0f, 0.0f, 34567.0f};
+      std::memcpy(ps_dst + 210 * 4, v, sizeof(v));
+    }
+    if (ocean_ps) {
+      const float split = float(REXCVAR_GET(sr_water_split)) * g_draw_vp[2];  // viewport width in pixels
+      const float v[4] = {float(REXCVAR_GET(sr_water_detail)), split, 0.0f, 12345.0f};
+      std::memcpy(ps_dst + 201 * 4, v, sizeof(v));
+    }
+    if (lod_ps) LodCityWindows(reinterpret_cast<const float*>(cb_vs_cpu_.data()), g_draw_vp, ps_dst);
+    if (sky_ps) {
+      SkyBodies(reinterpret_cast<const float*>(cb_vs_cpu_.data()), g_draw_vp, EnsureSkyMoon(), ps_dst);
+    }
+    std::memcpy(ps.cpu, ps_local, size_t(ps_regs) * 16);
+    cb_ps_regs_ = ps_regs;
     cb_ps_gpu_ = ps.gpu;
-    cb_ps_version_ = (use_mirror && !override_ps) ? mirror_.ps_version : 0;
+    cb_ps_version_ =
+        (use_mirror && !override_ps && !dn_ps && !sky_ps && !lod_ps && !ocean_ps && !glow_ps && !glow_flat_ps && !idview_ps) ? mirror_.ps_version : 0;
   }
   float_timer.Stop();
   // Assemble all derived state in ordinary CPU memory. Upload only after the
   // final bytes are known; matching PM4 versions alone would miss derived SRVs,
-  // scale, alpha testing and vertex metadata.
+  // scale, alpha testing and vertex metadata. Never in the upload buffer itself:
+  // the code below reads entries back, and reads of write-combined memory took
+  // a fifth of the render worker's time.
   SharedConstantBlock shared_data;
   static_assert(512 + sizeof(vertex_fetch_) == sizeof(shared_data));
-  uint32_t* s = cache_shared ? shared_data.data() : reinterpret_cast<uint32_t*>(shared.cpu);
+  uint32_t* s = shared_data.data();
   std::memset(s, 0, 512);
   // Also describe IA inputs for inline draws: they don't pass through
   // BindVertexStreams. The shader needs the type to undo USHORT2 UNORM.
@@ -4919,6 +6440,7 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
   }
   std::memcpy(s + 128, vertex_fetch_, sizeof(vertex_fetch_));
   CpuTimer slots_timer(cpu_timings.constant_slots_ns);
+  uint32_t slot_srv[16] = {};
   for (uint32_t slot = 0; slot < 16; ++slot) {
     uint32_t fetch[6];
     for (uint32_t d = 0; d < 6; ++d) {
@@ -4987,6 +6509,7 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
         sc.srv = srv;
         sc.frame = frame_count_;
       }
+      slot_srv[slot] = srv & 0x7FFFu;
       sampler = GetSamplerIndex(fetch, sc.smooth, 0.0f, sc.render_target);
       // Smooth effects: small textures of blended draws (particles, glows,
       // light halos) magnify with a cubic B-spline above the original
@@ -5047,6 +6570,69 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
     s[48 + slot] = sampler;
   }
   slots_timer.Stop();
+  // Debug (sr_window_log): the building draws with night windows (light role 9):
+  // pixel shader, the content names of their textures and c0-c31, once per
+  // combination, for the window maps (tools/textures/make_window_map.py).
+  if (REXCVAR_GET(sr_window_log)) {
+    const LightRegs* regs = DayNightRegs(current_ps_hash_, true, swap_number_);
+    bool window = false;
+    for (uint32_t i = 0; regs && i < regs->count; ++i) window |= regs->entries[i].role == 9;
+    if (window) {
+      std::string names;
+      for (uint32_t slot = 0; slot < 16; ++slot)
+        if (slot_srv[slot] > 2 && slot_srv[slot] < srv_names_.size() && !srv_names_[slot_srv[slot]].empty())
+          names += fmt::format(" t{}={}", slot, srv_names_[slot_srv[slot]]);
+      static std::unordered_set<std::string> seen;
+      const std::string key = fmt::format("{:016X}{}", current_ps_hash_, names);
+      if (seen.insert(key).second && seen.size() < 4000) {
+        const float* pc = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase + 1024);
+        std::string consts;
+        for (int r = 0; r < 32; ++r)
+          consts += fmt::format(" c{}=({:.4g} {:.4g} {:.4g} {:.4g})", r, pc[r * 4], pc[r * 4 + 1], pc[r * 4 + 2], pc[r * 4 + 3]);
+        REXLOG_INFO("window draw ps {:016X}{} |{}", current_ps_hash_, names, consts);
+      }
+    }
+  }
+  // Debug (sr_texture_draw_log = a texture content name): the shaders and slots drawing
+  // with it, once per combination.
+  if (!REXCVAR_GET(sr_texture_draw_log).empty()) {
+    const std::string& want = REXCVAR_GET(sr_texture_draw_log);
+    // The draws right after a match (an object's parts, e.g. letters stuck on a globe).
+    static int follow = 0;
+    static uint32_t follow_logs = 0;
+    static std::string prev[4];
+    static uint32_t prev_at = 0;
+    std::string names;
+    for (uint32_t k = 0; k < 8; ++k)
+      if (slot_srv[k] > 2 && slot_srv[k] < srv_names_.size() && !srv_names_[slot_srv[k]].empty())
+        names += fmt::format(" t{}={}", k, srv_names_[slot_srv[k]]);
+    const std::string line = fmt::format("vs {:016X} ps {:016X}{}", current_vs_hash_, current_ps_hash_, names);
+    if (follow > 0 && follow_logs < 400) {
+      --follow;
+      ++follow_logs;
+      REXLOG_INFO("texture draw next {}", line);
+    }
+    bool hit = false;
+    for (uint32_t slot = 0; slot < 16; ++slot)
+      if (slot_srv[slot] > 2 && slot_srv[slot] < srv_names_.size() && srv_names_[slot_srv[slot]] == want) hit = true;
+    if (hit) {
+      follow = 4;
+      if (follow_logs < 400)
+        for (uint32_t i = 0; i < 4; ++i) REXLOG_INFO("texture draw prev{} {}", 4 - i, prev[(prev_at + i) % 4]);
+    }
+    prev[prev_at] = line;
+    prev_at = (prev_at + 1) % 4;
+    for (uint32_t slot = 0; slot < 16; ++slot) {
+      if (slot_srv[slot] <= 2 || slot_srv[slot] >= srv_names_.size() || srv_names_[slot_srv[slot]] != want) continue;
+      static std::unordered_set<std::string> seen;
+      std::string names;
+      for (uint32_t k = 0; k < 16; ++k)
+        if (slot_srv[k] > 2 && slot_srv[k] < srv_names_.size() && !srv_names_[slot_srv[k]].empty())
+          names += fmt::format(" t{}={}", k, srv_names_[slot_srv[k]]);
+      if (seen.insert(fmt::format("{:016X}{:016X}{}", current_vs_hash_, current_ps_hash_, names)).second)
+        REXLOG_INFO("texture draw vs {:016X} ps {:016X} slot {}{}", current_vs_hash_, current_ps_hash_, slot, names);
+    }
+  }
   for (uint32_t i = 0; i < 4; ++i) {
     s[64 + i] = GpuConstant(base, dev, Pm4Mirror::kBoolConstantBase + i, kDevVsBools + 4 * i);
     s[68 + i] = GpuConstant(base, dev, Pm4Mirror::kBoolConstantBase + 4 + i, kDevPsBools + 4 * i);
@@ -5056,7 +6642,13 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
   // pix_center = 0) are emulated like Xenia, by moving the viewport half a
   // pixel right/down (the VS adds g_HalfPixelOffset * w to the position).
   float half_pixel[2] = {0.0f, 0.0f};
-  if (REXCVAR_GET(sr_native_half_pixel_offset) &&
+  // Movies: the player's YUV quad (pixel shaders with three samplers, Y, U,
+  // V; the only draw of an intro frame with Xenos pixel centres) already sits
+  // on the pixel grid. Shifted, it left the top row and the left column of the
+  // screen as a thin line in another colour along those edges.
+  const bool movie_quad = current_ps_hash_ == 0x84AB4982B9F6D441ull || current_ps_hash_ == 0x797FC52F63D77367ull ||
+                          current_ps_hash_ == 0x79CEC5DBA4D8ADAAull || current_ps_hash_ == 0xFFEDEF7CED88B48Dull;
+  if (REXCVAR_GET(sr_native_half_pixel_offset) && !movie_quad &&
       !(LoadReg(base, dev, rex::graphics::XE_GPU_REG_PA_SU_VTX_CNTL) & 1)) {
     float w = 0.0f, h = 0.0f;
     if (ScreenSpaceDraw(base, dev)) {
@@ -5203,6 +6795,30 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
   bool motion_valid = false;
   const D3D12_GPU_VIRTUAL_ADDRESS prev_vs = DlssPrevVsConstants(motion_valid);
   s[122] = motion_valid ? 1u : 0u;
+  // Ocean waves (g_SrWaterWaves, shared c30.w): their height scale on the
+  // open-water draw only; the shore strips share its vertex shader.
+  if (IsOceanDraw()) {
+    const float waves = WaterWaveScale();
+    std::memcpy(&s[123], &waves, 4);
+  }
+  // Debug (sr_native_log_ps_consts = pixel shader hash): that shader's c0-c19
+  // once per second, for finding the game's lighting values.
+  {
+    static const uint64_t log_ps = [] {
+      std::string h = REXCVAR_GET(sr_native_log_ps_consts);
+      return h.empty() ? 0ull : std::stoull(h, nullptr, 16);
+    }();
+    static double last_s = 0.0;
+    const double now_s = compat::BenchElapsedMs() / 1000.0;
+    if (log_ps && current_ps_hash_ == log_ps && now_s - last_s >= 1.0) {
+      last_s = now_s;
+      const float* c = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase + 1024);
+      std::string pc;
+      for (int r = 0; r < 64; ++r)
+        pc += fmt::format(" c{}=({:.4f} {:.4f} {:.4f} {:.4f})", r, c[r * 4], c[r * 4 + 1], c[r * 4 + 2], c[r * 4 + 3]);
+      REXLOG_INFO("ps consts {:.1f} s {:016X}:{}", now_s, log_ps, pc);
+    }
+  }
   if (trace_state_ == 1) {
     const float* v = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase);
     std::string vc;
@@ -5214,15 +6830,17 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
                 c[644], c[645], c[646], c[647]);
   }
   CpuTimer shared_upload_timer(cpu_timings.shared_upload_ns);
-  uint64_t shared_gpu = cache_shared ? shared_constants_cache_.Find(shared_data) : shared.gpu;
+  uint64_t shared_gpu = cache_shared ? shared_constants_cache_.Find(shared_data) : 0;
   if (cache_shared && shared_gpu) {
     if (CpuProfiling()) ++cpu_timings.shared_hits;
-  } else if (cache_shared) {
+  } else {
     if (!Upload(sizeof(shared_data), 256, shared)) return false;
     std::memcpy(shared.cpu, shared_data.data(), sizeof(shared_data));
     shared_gpu = shared.gpu;
-    shared_constants_cache_.Commit(shared_data, shared_gpu);
-    if (CpuProfiling()) ++cpu_timings.shared_uploads;
+    if (cache_shared) {
+      shared_constants_cache_.Commit(shared_data, shared_gpu);
+      if (CpuProfiling()) ++cpu_timings.shared_uploads;
+    }
   }
   shared_upload_timer.Stop();
   command_list_->SetGraphicsRootConstantBufferView(0, cb_vs_gpu_);
@@ -5306,6 +6924,10 @@ void Renderer::ApplyFixedFunctionState(uint8_t* base, uint32_t dev) {
     vp.Height *= k;
   }
   command_list_->RSSetViewports(1, &vp);
+  g_draw_vp[0] = vp.TopLeftX;
+  g_draw_vp[1] = vp.TopLeftY;
+  g_draw_vp[2] = vp.Width;
+  g_draw_vp[3] = vp.Height;
   // Scissor (draw_util::GetScissor): window scissor + window offset, clamped by
   // the screen scissor. Not during predicated tiling: host surfaces are untiled
   // while the XDK sets a per-tile scissor.
@@ -5462,11 +7084,19 @@ bool Renderer::PrepareDraw(uint8_t* base, uint32_t dev, uint32_t prim,
     }
   }
   uint32_t decl = Load32(base, dev + kDevVertexDecl);
-  static const uint64_t skip_ps = [] {
+  // "<hash>" or "<hash>:<index count>" (one mesh of that shader).
+  static const std::pair<uint64_t, uint32_t> skip_ps = [] {
     std::string v = REXCVAR_GET(sr_native_skip_ps);
-    return v.empty() ? 0ull : std::stoull(v, nullptr, 16);
+    if (v.empty()) return std::pair<uint64_t, uint32_t>{0, 0};
+    const size_t colon = v.find(':');
+    return std::pair<uint64_t, uint32_t>{
+        std::stoull(v.substr(0, colon), nullptr, 16),
+        colon == std::string::npos ? 0u : uint32_t(std::stoul(v.substr(colon + 1)))};
   }();
-  if (skip_ps && ps_hash == skip_ps) return false;
+  if (skip_ps.first && ps_hash == skip_ps.first &&
+      (!skip_ps.second || dlss_draw_count_ == skip_ps.second)) {
+    return false;
+  }
   DlssDrawKey(vs_hash, ps_hash, Load32(base, dev + kDevVertexFetch0), prim, dlss_draw_count_);
   if (trace_state_ == 1) {
     uint32_t n = decl ? Load32(base, decl + 0x18) : 0;
@@ -5489,6 +7119,49 @@ bool Renderer::PrepareDraw(uint8_t* base, uint32_t dev, uint32_t prim,
     uint32_t rt0 = Load32(base, dev + kDevRenderTargets);
     tex += fmt::format(" rt0info {:08X}", rt0 ? Load32(base, rt0 + 0x1C) : 0);
     els += tex;
+    els += fmt::format(" count {}", dlss_draw_count_);
+    if (vs_hash == 0x31FE1648D1734C70ull) {
+      // Water: its vertex fetch and the first vertices' positions (float3, big endian).
+      const uint32_t f0 = Load32(base, dev + kDevVertexFetch0);
+      const uint32_t f1 = Load32(base, dev + kDevVertexFetch0 + 4);
+      const uint32_t stride = Load8(base, dev + kDev.stream_strides) * 4;
+      els += fmt::format(" vf1 {:08X}", f1);
+      const float* vc = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase);
+      for (int r = 4; r <= 12; ++r)
+        els += fmt::format(" c{}=({:.4f} {:.4f} {:.4f} {:.4f})", r, vc[r * 4], vc[r * 4 + 1], vc[r * 4 + 2],
+                           vc[r * 4 + 3]);
+      const uint32_t nverts = stride ? ((f1 >> 2) & 0xFFFFFFu) * 4 / stride : 0;
+      float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+      for (uint32_t i = 0; i < nverts && i < 200000; ++i) {
+        const uint8_t* p = GuestPtr(base, 0xA0000000u + (f0 & ~3u) + i * stride, 12);
+        for (int k = 0; k < 3; ++k) {
+          const uint32_t u = (uint32_t(p[k * 4]) << 24) | (uint32_t(p[k * 4 + 1]) << 16) |
+                             (uint32_t(p[k * 4 + 2]) << 8) | p[k * 4 + 3];
+          float f;
+          std::memcpy(&f, &u, 4);
+          lo[k] = std::min(lo[k], f);
+          hi[k] = std::max(hi[k], f);
+        }
+      }
+      els += fmt::format(" nverts {} bbox ({:.1f} {:.1f} {:.1f})-({:.1f} {:.1f} {:.1f}) verts", nverts, lo[0],
+                         lo[1], lo[2], hi[0], hi[1], hi[2]);
+      for (uint32_t i = 0; i < 16 && stride; ++i) {
+        const uint8_t* p = GuestPtr(base, 0xA0000000u + (f0 & ~3u) + i * stride, 12);
+        float xyz[3];
+        for (int k = 0; k < 3; ++k) {
+          const uint32_t u = (uint32_t(p[k * 4]) << 24) | (uint32_t(p[k * 4 + 1]) << 16) |
+                             (uint32_t(p[k * 4 + 2]) << 8) | p[k * 4 + 3];
+          std::memcpy(&xyz[k], &u, 4);
+        }
+        els += fmt::format(" ({:.2f} {:.2f} {:.2f})", xyz[0], xyz[1], xyz[2]);
+        if (stride == 32) {
+          const uint8_t* r = GuestPtr(base, 0xA0000000u + (f0 & ~3u) + i * stride + 12, 20);
+          els += "[";
+          for (int k = 0; k < 20; ++k) els += fmt::format("{:02X}", r[k]);
+          els += "]";
+        }
+      }
+    }
     REXLOG_INFO("trace draw p{} #{} prim {} vs {:016X} ps {:016X} stride0 {} fetch0 {:08X} cc {:08X} blend {:08X} depth {:08X} mask {:X}{}",
                 g_current_pass, draw_index, prim, vs_hash, ps_hash, Load8(base, dev + kDev.stream_strides) * 4,
                 Load32(base, dev + kDevVertexFetch0),
@@ -5640,6 +7313,11 @@ bool Renderer::PrepareDraw(uint8_t* base, uint32_t dev, uint32_t prim,
   ApplyFixedFunctionState(base, dev);
   command_list_->SetPipelineState(pso);
   rt_so_target_.decl = decl;
+  {
+    const uint32_t decl_count = std::min(Load32(base, decl + 0x18), 64u);
+    rt_so_target_.decl_hash = XXH3_64bits(GuestPtr(base, decl + 0x34, decl_count * 12),
+                                          size_t(decl_count) * 12);
+  }
   rt_so_target_.rt_count = rt_count;
   std::copy(rtv_formats, rtv_formats + 4, rt_so_target_.rtv);
   rt_so_target_.dsv = dsv_format;
@@ -5795,23 +7473,22 @@ const Renderer::BufferEntry* Renderer::ApplyBuffer(uint8_t* base, const BufferPl
   }
   std::memcpy(upload.cpu, scratch.data(), size);
   if (!reuse) {
-    if (entry.resource) Retire(entry.resource);
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = (size + 15) & ~15u;
-    desc.Height = 1;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    entry.state = D3D12_RESOURCE_STATE_COPY_DEST;
-    if (FAILED(device_->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, entry.state,
-                                                nullptr, IID_PPV_ARGS(&entry.resource)))) {
+    // From the stock (buffer_stock.h): no driver allocation on the worker.
+    if (entry.resource) {
+      buffer_stock_.Give(BufferStock::Kind::kGuestData, {std::move(entry.resource), entry.state},
+                         next_fence_value_);
+    }
+    // The raw SRV described the old resource.
+    if (entry.raw_srv && REXCVAR_GET(sr_native_persistent_raw_srv)) RetireSrvIndex(entry.raw_srv);
+    entry.raw_srv = 0;
+    BufferStock::Buffer fresh = buffer_stock_.Take(BufferStock::Kind::kGuestData, (size + 15) & ~15u);
+    if (!fresh.resource) {
       buffers_.erase(plan.key);
       return nullptr;
     }
+    entry.resource = std::move(fresh.resource);
+    entry.state = fresh.state;
+    Transition(entry.resource.Get(), entry.state, D3D12_RESOURCE_STATE_COPY_DEST);
     entry.raw_srv = 0;
     entry.raw_srv_fence = 0;
   } else {
@@ -6152,6 +7829,27 @@ bool Renderer::BindVertexStreams(uint8_t* base, const WorkBatch& batch, const Wo
   std::memset(vertex_fetch_, 0, sizeof(vertex_fetch_));
   const uint32_t dev = GuestDevice(base);
   const bool dynamic_fetch = dev && DynamicVertexFetch(base, dev);
+  static const bool persistent_srv = REXCVAR_GET(sr_native_persistent_raw_srv);
+  if (persistent_srv && dynamic_fetch && swap_number_ >= raw_srv_sweep_swap_ + 32) {
+    // Buffers no draw read for 8 swaps give their SRV back (transient game
+    // buffers would otherwise fill the heap within minutes).
+    raw_srv_sweep_swap_ = swap_number_;
+    size_t kept = 0;
+    for (uint64_t key : raw_srv_buffers_) {
+      auto it = buffers_.find(key);
+      if (it == buffers_.end()) continue;
+      if (it->second.raw_srv && swap_number_ > it->second.raw_srv_used + 8) {
+        RetireSrvIndex(it->second.raw_srv);
+        it->second.raw_srv = 0;
+      }
+      if (!it->second.raw_srv) {
+        it->second.raw_srv_listed = false;
+        continue;
+      }
+      raw_srv_buffers_[kept++] = key;
+    }
+    raw_srv_buffers_.resize(kept);
+  }
   for (uint32_t i = 0; i < cmd.stream_count; ++i) {
     const StreamPlan& sp = batch.streams[cmd.stream_first + i];
     const BufferEntry* vb = ApplyBuffer(base, sp.buffer);
@@ -6173,14 +7871,34 @@ bool Renderer::BindVertexStreams(uint8_t* base, const WorkBatch& batch, const Wo
     // Static IA draws need no descriptor: allocate only for shader-driven
     // instancing, otherwise transient vertex buffers would fill the SRV heap.
     BufferEntry& entry = buffers_.at(sp.buffer.key);
-    if (!entry.raw_srv || entry.raw_srv_fence != next_fence_value_) {
+    if (persistent_srv) {
+      // One SRV per buffer for as long as its resource lives: creating it
+      // again every frame (one CreateShaderResourceView per instanced draw)
+      // was 3% of the render worker in fast flight.
+      if (!entry.raw_srv) {
+        entry.raw_srv = AllocSrvIndex();
+        if (!entry.raw_srv) { ok = false; continue; }
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R32_TYPELESS;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Buffer.NumElements = UINT((uint64_t(entry.size) + 3) / 4);
+        srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+        device_->CreateShaderResourceView(entry.resource.Get(), &srv,
+            provider_->OffsetViewDescriptor(srv_heap_->GetCPUDescriptorHandleForHeapStart(), entry.raw_srv));
+        if (!entry.raw_srv_listed) raw_srv_buffers_.push_back(sp.buffer.key);
+        entry.raw_srv_listed = true;
+      }
+      entry.raw_srv_used = swap_number_;
+    } else if (!entry.raw_srv || entry.raw_srv_fence != next_fence_value_) {
       entry.raw_srv = AllocSrvIndex();
       if (!entry.raw_srv) { ok = false; continue; }
       D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
       srv.Format = DXGI_FORMAT_R32_TYPELESS;
       srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
       srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-      srv.Buffer.NumElements = UINT(entry.resource->GetDesc().Width / 4);
+      // The guest size: a stock buffer can be wider than the data.
+      srv.Buffer.NumElements = UINT((uint64_t(entry.size) + 3) / 4);
       srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
       device_->CreateShaderResourceView(entry.resource.Get(), &srv,
           provider_->OffsetViewDescriptor(srv_heap_->GetCPUDescriptorHandleForHeapStart(), entry.raw_srv));
@@ -6253,10 +7971,16 @@ void Renderer::ExecDrawVertices(uint8_t* base, const WorkBatch& batch, const Wor
   } else {
     if (!SkipGpuDraw()) command_list_->DrawInstanced(vertex_count, 1, start_vertex, 0);
   }
-  ++stats_.draws; ++trace_draws_; Breadcrumb();
-  ++stats_.pass_draws[g_current_pass & 31];
-  if (topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && !quads)
+  ++stats_.draws; ++trace_draws_; Breadcrumb();  ++stats_.pass_draws[g_current_pass & 31];
+  if (!quads && current_vs_hash_ == kCapeVs &&
+      (topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST || topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)) {
+    // The cloth comes as a list or a strip; stream output writes either as a list.
+    const uint32_t so = topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ? (vertex_count >= 3 ? (vertex_count - 2) * 3 : 0)
+                                                                         : vertex_count - vertex_count % 3;
+    if (REXCVAR_GET(sr_rt_shadows)) RtCaptureCape(base, false, start_vertex, vertex_count, 0, so);
+  } else if (topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && !quads) {
     RtCaptureInstanced(base, batch, cmd, start_vertex, vertex_count);
+  }
 }
 
 void Renderer::ExecDrawIndexedVertices(uint8_t* base, const WorkBatch& batch,
@@ -6295,6 +8019,39 @@ void Renderer::ExecDrawIndexedVertices(uint8_t* base, const WorkBatch& batch,
     return;
   }
   RtLogSkinnedDraw(current_vs_hash_, "indexed", prim, int(topology), quads);
+  if (trace_state_ == 1 && current_vs_hash_ == 0x31FE1648D1734C70ull && cmd.has_index) {
+    // Water diagnostic: the vertices this strip really uses (bbox, edge lengths).
+    const uint32_t isize = cmd.index32 ? 4 : 2;
+    const uint8_t* q = GuestPtr(base, 0xA0000000u + cmd.index.address + start_index * isize, index_count * isize);
+    const uint32_t f0 = Load32(base, dev + kDevVertexFetch0);
+    const uint32_t stride = Load8(base, dev + kDev.stream_strides) * 4;
+    auto be = [](const uint8_t* p) {
+      const uint32_t u = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+      float f;
+      std::memcpy(&f, &u, 4);
+      return f;
+    };
+    float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f}, prev[3] = {}, emin = 1e30f, emax = 0, esum = 0;
+    uint32_t edges = 0, used = 0;
+    for (uint32_t i = 0; i < index_count; ++i) {
+      const uint32_t idx = isize == 4 ? (uint32_t(q[i * 4]) << 24 | uint32_t(q[i * 4 + 1]) << 16 |
+                                         uint32_t(q[i * 4 + 2]) << 8 | q[i * 4 + 3])
+                                      : (uint32_t(q[i * 2]) << 8 | q[i * 2 + 1]);
+      if (idx == cmd.index.reset_index || idx == 0xFFFF || idx == 0xFFFFFFFF) { used = 0; continue; }
+      const uint8_t* p = GuestPtr(base, 0xA0000000u + (f0 & ~3u) + (idx + base_vertex) * stride, 12);
+      float v[3] = {be(p), be(p + 4), be(p + 8)};
+      for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], v[k]); hi[k] = std::max(hi[k], v[k]); }
+      if (used++) {
+        const float e = std::sqrt((v[0] - prev[0]) * (v[0] - prev[0]) + (v[1] - prev[1]) * (v[1] - prev[1]) +
+                                  (v[2] - prev[2]) * (v[2] - prev[2]));
+        emin = std::min(emin, e); emax = std::max(emax, e); esum += e; ++edges;
+      }
+      std::memcpy(prev, v, sizeof prev);
+    }
+    REXLOG_INFO("trace water strip ps {:016X} indices {} start {} bv {} bbox ({:.1f} {:.1f} {:.1f})-({:.1f} {:.1f} {:.1f}) "
+                "edge min {:.1f} mean {:.1f} max {:.1f}", current_ps_hash_, index_count, start_index, base_vertex,
+                lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], emin, edges ? esum / edges : 0.0f, emax);
+  }
   if (quads) {
     UploadAlloc tris;
     if (!Upload(size_t(quad_indices) * 4, 4, tris)) return;
@@ -6302,8 +8059,7 @@ void Renderer::ExecDrawIndexedVertices(uint8_t* base, const WorkBatch& batch,
     D3D12_INDEX_BUFFER_VIEW qv{tris.gpu, quad_indices * 4, DXGI_FORMAT_R32_UINT};
     command_list_->IASetIndexBuffer(&qv);
     if (!SkipGpuDraw()) command_list_->DrawIndexedInstanced(quad_indices, 1, 0, base_vertex, 0);
-    ++stats_.draws; ++trace_draws_; Breadcrumb();
-    ++stats_.pass_draws[g_current_pass & 31];
+    ++stats_.draws; ++trace_draws_; Breadcrumb();    ++stats_.pass_draws[g_current_pass & 31];
     return;
   }
   D3D12_INDEX_BUFFER_VIEW ibv{ib->resource->GetGPUVirtualAddress(), cmd.index_size,
@@ -6323,9 +8079,11 @@ void Renderer::ExecDrawIndexedVertices(uint8_t* base, const WorkBatch& batch,
                   base_vertex, current_ps_hash_, cmd.index_size, cmd.index32, st);
     }
   }
-  if (!SkipGpuDraw()) command_list_->DrawIndexedInstanced(index_count, 1, start_index, base_vertex, 0);
-  ++stats_.draws; ++trace_draws_; Breadcrumb();
-  ++stats_.pass_draws[g_current_pass & 31];
+  WaterProbe(base);
+  // Ocean waves: the open water drawn with the dense disc (water.cpp).
+  if (!(IsOceanDraw() && DrawOceanMesh()) && !SkipGpuDraw())
+    command_list_->DrawIndexedInstanced(index_count, 1, start_index, base_vertex, 0);
+  ++stats_.draws; ++trace_draws_; Breadcrumb();  ++stats_.pass_draws[g_current_pass & 31];
   if (topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST || topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
     RtCaptureDraw(base, batch, cmd, ib, start_index, index_count, base_vertex,
                   topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -6386,15 +8144,13 @@ void Renderer::ExecDrawInlineVertices(uint8_t* base, uint32_t prim, uint32_t dat
     std::vector<uint8_t> expanded = ExpandRectList(base, decl, vdata, vertex_count, stride);
     UploadAlloc rect_vb;
     if (expanded.empty() || !Upload(expanded.size(), 16, rect_vb)) {
-      ++stats_.draws_skipped;
-      return;
+      ++stats_.draws_skipped;      return;
     }
     std::memcpy(rect_vb.cpu, expanded.data(), expanded.size());
     D3D12_VERTEX_BUFFER_VIEW rect_view{rect_vb.gpu, uint32_t(expanded.size()), stride};
     command_list_->IASetVertexBuffers(0, 1, &rect_view);
     if (!SkipGpuDraw()) command_list_->DrawInstanced(uint32_t(expanded.size() / stride), 1, 0, 0);
-    ++stats_.draws; ++trace_draws_; Breadcrumb();
-    ++stats_.pass_draws[g_current_pass & 31];
+    ++stats_.draws; ++trace_draws_; Breadcrumb();    ++stats_.pass_draws[g_current_pass & 31];
     return;
   }
   std::memcpy(vb.cpu, vdata, vb_size);
@@ -6420,8 +8176,7 @@ void Renderer::ExecDrawInlineVertices(uint8_t* base, uint32_t prim, uint32_t dat
   } else {
     if (!SkipGpuDraw()) command_list_->DrawInstanced(vertex_count, 1, 0, 0);
   }
-  ++stats_.draws; ++trace_draws_; Breadcrumb();
-  ++stats_.pass_draws[g_current_pass & 31];
+  ++stats_.draws; ++trace_draws_; Breadcrumb();  ++stats_.pass_draws[g_current_pass & 31];
 }
 
 void Renderer::ExecBeginTiling(uint8_t* base, uint32_t count, uint32_t rects,
@@ -6663,20 +8418,39 @@ void Renderer::ExecResolve(uint8_t* base, uint32_t flags, uint32_t src_rect,
     // downsample chains): one host texture per size, never recreated per frame.
     uint64_t resolve_key = (uint64_t(dest_base) << 32) | (uint32_t(dst_format) & 0xFF) |
                            (((dest_w - 1) & 0x1FFF) << 8) | (((dest_h - 1) & 0x7FF) << 21);
+    // The scene is resolved into the same texture before the particles (at the
+    // scene's scale) and after them (DLSS's output scale): one host texture each,
+    // or it is recreated twice per frame. dest_base is page aligned, so bit 32 is free.
+    if (dlss_source) resolve_key |= uint64_t(1) << 32;
     resolve_latest_[dest_base] = resolve_key;
     ResolveTexture& dst = resolve_textures_[resolve_key];
     std::memcpy(dst.guest_fetch, fetch, sizeof(fetch));
+    // RB_COPY_DEST_INFO copy_dest_exp_bias (bits 16-21, signed): Xenos scales
+    // the copied colour by 2^bias (the sun's shadow map: -5, its k_16_16
+    // target's -32..32 becomes -1..1 in the texture). Such destinations are
+    // created drawable and scaled in place after the copy.
+    const int32_t exp_bias = depth || dlss_source ? 0 : int32_t(copy_dest_info << 10) >> 26;
+    const bool exp_biased = exp_bias != 0 && REXCVAR_GET(sr_native_resolve_exp_bias);
+    if (exp_bias != 0 && !dst.resource) {
+      static int logged = 0;
+      if (logged++ < 8)
+        REXLOG_INFO("native: exp bias resolve {} src {} {}x{} fmt {} -> {:08X} {}x{} layers {} existing {} rt {}",
+                    exp_bias, SurfaceName(src), src->width, src->height, int(src->srv_format), dest_base, dest_w,
+                    dest_h, layers, dst.resource != nullptr, dst.color_rt);
+    }
     if (!dst.resource || dst.width != dest_w || dst.height != dest_h ||
-        dst.scale != dst_scale || dst.layers != layers) {
+        dst.scale != dst_scale || dst.layers != layers || (exp_biased && !dst.color_rt)) {
       Retire(dst.resource);
       for (auto& [mapping, index] : dst.srv_by_mapping) RetireSrvIndex(index);
-      D3D12_CPU_DESCRIPTOR_HANDLE rtv = dst.rtv, raw_rtv = dst.raw_rtv;
+      D3D12_CPU_DESCRIPTOR_HANDLE rtv = dst.rtv, raw_rtv = dst.raw_rtv, layer_rtvs[4];
+      std::memcpy(layer_rtvs, dst.layer_rtvs, sizeof(layer_rtvs));
       Retire(dst.raw_resource);
       for (auto& [mapping, index] : dst.raw_srv_by_mapping) RetireSrvIndex(index);
       if (dst.plain_srv) RetireSrvIndex(dst.plain_srv);
       dst = ResolveTexture{};
       dst.rtv = rtv;
       dst.raw_rtv = raw_rtv;
+      std::memcpy(dst.layer_rtvs, layer_rtvs, sizeof(layer_rtvs));
       dst.width = dest_w;
       dst.height = dest_h;
       dst.layers = layers;
@@ -6693,7 +8467,8 @@ void Renderer::ExecResolve(uint8_t* base, uint32_t flags, uint32_t src_rect,
       desc.MipLevels = 1;
       desc.Format = dst.format;
       desc.SampleDesc.Count = 1;
-      if (depth) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+      if (depth || exp_biased) desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+      dst.color_rt = exp_biased;
       D3D12_HEAP_PROPERTIES heap{};
       heap.Type = D3D12_HEAP_TYPE_DEFAULT;
       dst.state = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -6702,6 +8477,21 @@ void Renderer::ExecResolve(uint8_t* base, uint32_t flags, uint32_t src_rect,
         resolve_textures_.erase(resolve_key);
         resolve_latest_.erase(dest_base);
         return;
+      }
+      // Exponent-biased destinations: a persistent view per layer (slots of the
+      // shared RTV ring stay with this texture; taking one per resolve would
+      // wrap the ring and overwrite other targets' views).
+      for (uint32_t l = 0; dst.color_rt && l < std::min<uint32_t>(layers, 4); ++l) {
+        if (!dst.layer_rtvs[l].ptr) {
+          dst.layer_rtvs[l] = provider_->OffsetRTVDescriptor(rtv_heap_->GetCPUDescriptorHandleForHeapStart(),
+                                                             rtv_heap_next_++ % kRtvHeapSize);
+        }
+        D3D12_RENDER_TARGET_VIEW_DESC view{};
+        view.Format = dst.srv_format;
+        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+        view.Texture2DArray.FirstArraySlice = l;
+        view.Texture2DArray.ArraySize = 1;
+        device_->CreateRenderTargetView(dst.resource.Get(), &view, dst.layer_rtvs[l]);
       }
       if (depth) {
         if (!dst.rtv.ptr) {
@@ -6801,6 +8591,16 @@ void Renderer::ExecResolve(uint8_t* base, uint32_t flags, uint32_t src_rect,
         command_list_->CopyTextureRegion(&d, dx, dy, 0, &s, &box);
         Breadcrumb("color resolve");
       }
+      if (exp_biased && dst.color_rt) {
+        const D3D12_RECT rect{LONG(dx), LONG(dy), LONG(dx + (x2 - x1)), LONG(dy + (y2 - y1))};
+        ScaleResolveLayer(dst, layer, rect, std::ldexp(1.0f, exp_bias));
+      }
+      if (exp_bias != 0) {
+        static std::set<uint64_t> seen;
+        if (seen.insert((uint64_t(dest_base) << 8) | uint32_t(exp_bias & 0xFF)).second && seen.size() < 32)
+          REXLOG_INFO("native: resolve exp bias {} ({} {}x{} -> {:08X}, applied {})", exp_bias, SurfaceName(src),
+                      src->width, src->height, dest_base, exp_biased && dst.color_rt);
+      }
       Transition(dst.resource.Get(), dst.state,
                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -6877,6 +8677,63 @@ void Renderer::ExecResolve(uint8_t* base, uint32_t flags, uint32_t src_rect,
   std::memset(bound_rts_, 0, sizeof(bound_rts_));
 }
 
+// The presenter's refresh callback (inline presents): submits the open frame
+// and copies the output target into the presenter's guest output.
+bool Renderer::CopyFrameToPresenter(rex::ui::Presenter::GuestOutputRefreshContext& context) {
+  auto& d3d12_context =
+      static_cast<rex::ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context);
+  ID3D12Resource* output = d3d12_context.resource_uav_capable();
+  D3D12_RESOURCE_STATES out_state =
+      rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
+  if (frame_open_) {
+    Transition(output_rt(), output_rt_states_[frame_index_],
+               D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (!own_queue_) {
+      Transition(output, out_state, D3D12_RESOURCE_STATE_COPY_DEST);
+      command_list_->CopyResource(output, output_rt());
+      Transition(output, out_state,
+                 rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+    }
+    EndFrameTimestamp();
+    ProfileEnd();
+    command_list_->Close();
+    ID3D12CommandList* lists[] = {command_list_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    frame_open_ = false;
+  }
+  if (own_queue_) {
+    // The presenter's guest output belongs to the direct queue timeline:
+    // copy there, after this frame's native work.
+    queue_->Signal(fence_.Get(), next_fence_value_);
+    ID3D12CommandQueue* direct = provider_->GetDirectQueue();
+    direct->Wait(fence_.Get(), next_fence_value_);
+    ++next_fence_value_;
+    present_allocators_[frame_index_]->Reset();
+    present_list_->Reset(present_allocators_[frame_index_].Get(), nullptr);
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = output;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = out_state;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    if (barrier.Transition.StateBefore != barrier.Transition.StateAfter) {
+      present_list_->ResourceBarrier(1, &barrier);
+    }
+    present_list_->CopyResource(output, output_rt());
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    if (barrier.Transition.StateBefore != barrier.Transition.StateAfter) {
+      present_list_->ResourceBarrier(1, &barrier);
+    }
+    present_list_->Close();
+    ID3D12CommandList* present_lists[] = {present_list_.Get()};
+    direct->ExecuteCommandLists(1, present_lists);
+    direct->Signal(present_fence_.Get(), present_fence_next_);
+    present_fence_values_[frame_index_] = present_fence_next_++;
+  }
+  context.SetIs8bpc(true);
+  return true;
+}
+
 void Renderer::EndFrameAndPresent(uint32_t front_buffer_address) {
   // Blit the resolved front buffer into the output target.
   auto latest = resolve_latest_.find(front_buffer_address);
@@ -6933,62 +8790,33 @@ void Renderer::EndFrameAndPresent(uint32_t front_buffer_address) {
     command_list_->ClearRenderTargetView(output_rtvs_[frame_index_], color, 0, nullptr);
   }
 
+  // Paced (frame_pacing.cpp): submit now, the present thread shows the frame.
+  const bool paced = PacedPresentActive();
+  if (paced && frame_open_) {
+    Transition(output_rt(), output_rt_states_[frame_index_], D3D12_RESOURCE_STATE_COPY_SOURCE);
+    EndFrameTimestamp();
+    ProfileEnd();
+    command_list_->Close();
+    ID3D12CommandList* lists[] = {command_list_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    frame_open_ = false;
+    queue_->Signal(fence_.Get(), next_fence_value_);
+    QueuePacedPresent(next_fence_value_++);
+  } else if (!paced) {
+    // The present thread's frames first: it uses the same present list.
+    for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) WaitPacedPresent(slot);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    present_qpc_[frame_index_] = now.QuadPart;
+  }
+
   // native_present=false: render (and dump) natively but leave presentation to
   // Xenos, for same-run A/B comparisons against its screenshots.
-  if (!REXCVAR_GET(sr_native_ab_mode) && !REXCVAR_GET(sr_native_debug_no_present))
+  if (!paced && !REXCVAR_GET(sr_native_ab_mode) && !REXCVAR_GET(sr_native_debug_no_present))
   presenter_->RefreshGuestOutput(
       output_width_, output_height_, 1280, 720,
-      [&](rex::ui::Presenter::GuestOutputRefreshContext& context) -> bool {
-        auto& d3d12_context =
-            static_cast<rex::ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context);
-        ID3D12Resource* output = d3d12_context.resource_uav_capable();
-        Transition(output_rt(), output_rt_states_[frame_index_],
-                   D3D12_RESOURCE_STATE_COPY_SOURCE);
-        D3D12_RESOURCE_STATES out_state =
-            rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
-        if (!own_queue_) {
-          Transition(output, out_state, D3D12_RESOURCE_STATE_COPY_DEST);
-          command_list_->CopyResource(output, output_rt());
-          Transition(output, out_state,
-                     rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
-        }
-        EndFrameTimestamp();
-        ProfileEnd();
-        command_list_->Close();
-        ID3D12CommandList* lists[] = {command_list_.Get()};
-        queue_->ExecuteCommandLists(1, lists);
-        frame_open_ = false;
-        if (own_queue_) {
-          // The presenter's guest output belongs to the direct queue timeline:
-          // copy there, after this frame's native work.
-          queue_->Signal(fence_.Get(), next_fence_value_);
-          ID3D12CommandQueue* direct = provider_->GetDirectQueue();
-          direct->Wait(fence_.Get(), next_fence_value_);
-          ++next_fence_value_;
-          present_allocators_[frame_index_]->Reset();
-          present_list_->Reset(present_allocators_[frame_index_].Get(), nullptr);
-          D3D12_RESOURCE_BARRIER barrier{};
-          barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-          barrier.Transition.pResource = output;
-          barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-          barrier.Transition.StateBefore = out_state;
-          barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-          if (barrier.Transition.StateBefore != barrier.Transition.StateAfter) {
-            present_list_->ResourceBarrier(1, &barrier);
-          }
-          present_list_->CopyResource(output, output_rt());
-          std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-          if (barrier.Transition.StateBefore != barrier.Transition.StateAfter) {
-            present_list_->ResourceBarrier(1, &barrier);
-          }
-          present_list_->Close();
-          ID3D12CommandList* present_lists[] = {present_list_.Get()};
-          direct->ExecuteCommandLists(1, present_lists);
-          direct->Signal(present_fence_.Get(), present_fence_next_);
-          present_fence_values_[frame_index_] = present_fence_next_++;
-        }
-        context.SetIs8bpc(true);
-        return true;
+      [this](rex::ui::Presenter::GuestOutputRefreshContext& context) {
+        return CopyFrameToPresenter(context);
       });
 
   if (frame_open_) {
@@ -7092,6 +8920,16 @@ void Renderer::EndFrameAndPresent(uint32_t front_buffer_address) {
   static double last_buffer_log = 0;
   if (compat::BenchElapsedMs() - last_buffer_log > 2000) {
     last_buffer_log = compat::BenchElapsedMs();
+    {
+      uint64_t hits = 0, misses = 0;
+      buffer_stock_.TakeStats(hits, misses);
+      if (hits || misses) REXLOG_INFO("native: buffer stock: {} taken ready, {} created on the worker", hits, misses);
+      texture_heap_.TakeStats(hits, misses);
+      if (hits || misses) REXLOG_INFO("native: texture heaps: {} placed, {} committed on the worker", hits, misses);
+      if (!raw_srv_buffers_.empty())
+        REXLOG_INFO("native: raw vertex SRVs kept {} (heap next {} of {})", raw_srv_buffers_.size(), srv_heap_next_,
+                    kSrvAllocLimit);
+    }
     REXLOG_INFO("native: buffers uploads {} partial {} ({} MB) invalidations {} ({} MB) live {}",
                 stats_.buffer_uploads, stats_.buffer_partial_uploads,
                 stats_.buffer_upload_bytes >> 20, front_invalidations_.load(),
@@ -8032,6 +9870,7 @@ uint64_t ElapsedUs(std::chrono::steady_clock::time_point since) {return uint64_t
 
 void Renderer::WorkerMain() {
   compat::RegisterSampledThread(4, "sr_native_worker");
+  RegisterWorkerThreadForSampling();
   auto& timeline = graphics::FrameTimeline::Global();
   for (;;) {
     std::shared_ptr<const WorkBatch> batch;
@@ -8645,11 +10484,14 @@ void Renderer::OnSwap(uint8_t* base, uint32_t front_buffer_texture, uint64_t swa
     const uint64_t wait_begin_ns = timeline.enabled() ? graphics::FrameTimeline::NowNs() : 0;
     {
       CpuTimer cpu_timer(front_cpu_timings.wait_ns);
-      WaitWorkerIdle(REXCVAR_GET(sr_native_worker_lag) ? prev_swap_batches_ : submitted);
+      WaitWorkerIdle(!REXCVAR_GET(sr_native_worker_lag) ? submitted
+                     : REXCVAR_GET(sr_native_worker_lag_frames) >= 2 ? prev2_swap_batches_
+                                                                     : prev_swap_batches_);
     }
     if (timeline.enabled())
       timeline.RecordSpan(graphics::TimelineStage::kFrontWait, swap_number, wait_begin_ns,
                           graphics::FrameTimeline::NowNs(), 0);
+    prev2_swap_batches_ = prev_swap_batches_;
     prev_swap_batches_ = submitted;
   }
   if(CpuProfiling() && front_frame_%120==0) {

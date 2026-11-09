@@ -1,0 +1,218 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 7dea8d4..acee680 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -112,10 +112,12 @@ struct PushConstants
+ #define g_SoftParticleDepth SR_SHARED_UINT(480)
+ #define g_ShadowRange SR_SHARED_FLOAT(484)
+ #define g_SrMotionValid SR_SHARED_UINT(488)
++#define g_SrWaterWaves SR_SHARED_FLOAT(492)
+ #define g_ColorRange SR_SHARED_FLOAT4(496)
+ #define g_SpecConstants() g_SpecConstantsRuntime
+ #else
+ [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
++#define g_SrWaterWaves 0.0
+ #define g_SpecConstants() g_SpecConstants
+ #endif
+ 
+@@ -144,7 +146,7 @@ struct PushConstants
+     float g_AlphaThreshold : packoffset(c18.w); \
+     uint4 g_VertexFetchArr[224] : packoffset(c32); \
+     uint4 g_LoopConstantsArr[8] : packoffset(c19); \
+-    float4 g_ScreenXform : packoffset(c27);     uint g_SpecConstantsRuntime : packoffset(c28.x); float g_PixelPosScale : packoffset(c28.y); float g_ShadowAtlasTexelScale : packoffset(c28.z); float g_ShadowSoftness : packoffset(c28.w); float2 g_SoftParticleW : packoffset(c29.x); float g_SoftParticleDistance : packoffset(c29.z); float g_SoftParticleTexelScale : packoffset(c29.w); uint g_SoftParticleDepth : packoffset(c30.x); float g_ShadowRange : packoffset(c30.y); uint g_SrMotionValid : packoffset(c30.z); float4 g_ColorRange : packoffset(c31);
++    float4 g_ScreenXform : packoffset(c27);     uint g_SpecConstantsRuntime : packoffset(c28.x); float g_PixelPosScale : packoffset(c28.y); float g_ShadowAtlasTexelScale : packoffset(c28.z); float g_ShadowSoftness : packoffset(c28.w); float2 g_SoftParticleW : packoffset(c29.x); float g_SoftParticleDistance : packoffset(c29.z); float g_SoftParticleTexelScale : packoffset(c29.w); uint g_SoftParticleDepth : packoffset(c30.x); float g_ShadowRange : packoffset(c30.y); uint g_SrMotionValid : packoffset(c30.z); float g_SrWaterWaves : packoffset(c30.w); float4 g_ColorRange : packoffset(c31);
+ 
+ #define g_Booleans(i) (g_BooleansArr[(i) / 4][(i) % 4])
+ #define g_VertexFetch(i) (g_VertexFetchArr[i])
+@@ -794,6 +796,96 @@ float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData, b
+         return env;
+     return srRtReflectAlong(env, normalize(cubeMapData.cubeMapDirections[texCoord.z]), 0.3, swapRB);
+ }
++// Ocean waves (port/src/native_renderer/water_waves.h holds the same model for
++// the CPU: keep both tables identical). A sum of Gerstner waves over the world
++// xz plane, time in seconds (the game's gTime). g_SrWaterWaves (shared c30.w)
++// is the height scale, set by the host only on the open-water draw (0 = flat:
++// the shore strips share this vertex shader). fadeDist is the distance from
++// the camera: a wave fades out past fadeLen to 2 fadeLen of its wavelengths,
++// before the mesh (6: its rings are ~3% of the distance apart) or the pixels
++// (12, the normals: a pixel far away averages many waves, the surface it
++// sees is flatter; steeper normals there sent every grazing reflection into
++// the sky and erased the skyline) can no longer carry it.
++#define SR_WATER_WAVES 12
++static const float4 g_srWaterWaveA[SR_WATER_WAVES] = {  // dir.x, dir.z, k = 2 pi / wavelength, amplitude
++    float4( 0.825336,  0.564642, 0.130900, 0.576000),
++    float4( 0.453596,  0.891207, 0.181805, 0.351902),
++    float4( 0.980067,  0.198669, 0.252507, 0.214991),
++    float4( 0.070737,  0.997495, 0.350704, 0.131347),
++    float4( 0.980067, -0.198669, 0.487089, 0.080245),
++    float4( 0.659983,  0.751280, 0.676513, 0.049025),
++    float4( 0.877583, -0.479426, 0.939601, 0.029951),
++    float4(-0.323290,  0.946300, 1.305002, 0.018298),
++    float4( 0.900447,  0.434966, 1.812503, 0.011179),
++    float4( 0.267499,  0.963558, 2.517365, 0.006830),
++    float4( 1.000000,  0.000000, 3.496340, 0.004173),
++    float4(-0.029200,  0.999574, 4.856028, 0.002549)};
++static const float2 g_srWaterWaveB[SR_WATER_WAVES] = {  // omega = sqrt(9.81 k), phase
++    float2(1.133193, 0.0), float2(1.335481, 1.7), float2(1.573879, 3.4), float2(1.854834, 5.1),
++    float2(2.185943, 6.8), float2(2.576158, 8.5), float2(3.036032, 10.2), float2(3.577998, 11.9),
++    float2(4.216711, 13.6), float2(4.969442, 15.3), float2(5.856543, 17.0), float2(6.902002, 18.7)};
++static const float g_srWaterSteepness = 0.9;
++static float g_srWaterTime = 0.0;  // pixel shaders: the vertex shader's gTime (TEXCOORD6.y)
++float srWaterFade(float k, float fadeDist, float fadeLen)
++{
++    float wavelength = 6.2831853 / k;
++    return saturate(2.0 - fadeDist / (wavelength * fadeLen));
++}
++// Displacement of the surface point that rests at xz.
++float3 srWaterGerstner(float2 xz, float t, float scale, float fadeDist)
++{
++    float q = g_srWaterSteepness / max(1.0, scale * 0.440);
++    float3 d = 0.0;
++    [unroll] for (int i = 0; i < SR_WATER_WAVES; i++)
++    {
++        float4 w = g_srWaterWaveA[i];
++        float a = w.w * scale * srWaterFade(w.z, fadeDist, 6.0);
++        float ph = w.z * dot(w.xy, xz) - g_srWaterWaveB[i].x * t + g_srWaterWaveB[i].y;
++        float s, c;
++        sincos(ph, s, c);
++        d.xz += q * a * w.xy * c;
++        d.y += a * s;
++    }
++    return d;
++}
++// Surface normal at the point resting at xz.
++float3 srWaterNormal(float2 xz, float t, float scale, float fadeDist)
++{
++    float q = g_srWaterSteepness / max(1.0, scale * 0.440);
++    float3 n = float3(0.0, 1.0, 0.0);
++    [unroll] for (int i = 0; i < SR_WATER_WAVES; i++)
++    {
++        float4 w = g_srWaterWaveA[i];
++        float a = w.w * scale * srWaterFade(w.z, fadeDist, 12.0);
++        float ph = w.z * dot(w.xy, xz) - g_srWaterWaveB[i].x * t + g_srWaterWaveB[i].y;
++        float s, c;
++        sincos(ph, s, c);
++        n.xz -= w.xy * (w.z * a * c);
++        n.y -= q * w.z * a * s;
++    }
++    return normalize(n);
++}
++// The water vertex shader's position input (object space): moved by the waves
++// in world space (Mobj rows m0..m2, the disc's centre = the camera), then back.
++// (Macros pass g_SrWaterWaves: the shared constants are declared after this file.)
++#define srWaterDisplace(P, M0, M1, M2, T) srWaterDisplaceImpl(P, M0, M1, M2, T, g_SrWaterWaves)
++float4 srWaterDisplaceImpl(float4 p, float4 m0, float4 m1, float4 m2, float t, float scale)
++{
++    if (scale <= 0.0)
++        return p;
++    float4 q = float4(p.xyz, 1.0);
++    float3 w = float3(dot(m0, q), dot(m1, q), dot(m2, q));
++    float3 d = srWaterGerstner(w.xz, t, scale, length(w.xz - float2(m0.w, m2.w)));
++    // Object-space offset: the inverse of Mobj's 3x3 part (adjugate / determinant).
++    float3 r0 = m0.xyz, r1 = m1.xyz, r2 = m2.xyz;
++    float3 c0 = cross(r1, r2), c1 = cross(r2, r0), c2 = cross(r0, r1);
++    float det = dot(r0, c0);
++    if (abs(det) < 1e-20)
++        return p;
++    float3 local = (c0 * d.x + c1 * d.y + c2 * d.z) / det;
++    return float4(p.xyz + local, p.w);
++}
++
+ // Water (pixel shaders with gWaterSpec): its sky sample becomes what a ray
+ // along the reflection hits, then the game's own Fresnel and water colours mix
+ // it as they mixed the sky. The game reads that cube with coordinates its
+@@ -803,17 +895,37 @@ float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData, b
+ // Rays below the horizon are lifted to graze it: they would only find the
+ // water itself.
+ static float3 g_srRtCameraPos = 0.0;  // water: the camera's world position
+-float4 srRtReflectWater(float4 env, float3 texCoord, inout CubeMapData cubeMapData, bool swapRB)
++#define srRtReflectWater(ENV, TC, CMD, SWAP) srRtReflectWaterImpl(ENV, TC, CMD, SWAP, g_SrWaterWaves)
++float4 srRtReflectWaterImpl(float4 env, float3 texCoord, inout CubeMapData cubeMapData, bool swapRB, float waves)
+ {
+     if (!srRtReflections() && srRtDebug() != 6 && srRtDebug() != 7 && srRtDebug() != 8)
+         return env;
+     float3 view = normalize(g_srRtPixelPos - g_srRtCameraPos);
+     float3 dir = float3(view.x, -view.y, view.z);
++    // Ocean waves: mirror on the wave's normal (evaluated at the displaced point,
++    // close enough for the gentle slopes), and scale the sky sample by the
++    // Schlick Fresnel of the tilted surface over that of the flat one the game
++    // assumed when it mixed the colours.
++    float waveFresnel = 1.0;
++    if (waves > 0.0)
++    {
++        float3 n = srWaterNormal(g_srRtPixelPos.xz, g_srWaterTime, waves,
++                                 length(g_srRtPixelPos.xz - g_srRtCameraPos.xz));
++        // The reflection sees 30% of the slope (like Crest's normals strength): at
++        // grazing views the full one sends every ray over the skyline into the sky.
++        n = normalize(float3(n.x * 0.3, n.y, n.z * 0.3));
++        dir = reflect(view, n);
++        float fFlat = 0.02 + 0.98 * pow(1.0 - saturate(-view.y), 5.0);
++        float fWave = 0.02 + 0.98 * pow(1.0 - saturate(-dot(view, n)), 5.0);
++        waveFresnel = clamp(fWave / fFlat, 0.5, 2.0);
++    }
+     float ripple = dot(env.rgb, 1.0 / 3.0) - 0.5;
+     dir.xz += ripple * 0.08;
+     dir = normalize(float3(dir.x, max(dir.y, 0.02), dir.z));
+     g_srRtReflectTMax = 16000.0;  // the skyline across the bay is past the receivers' 4000
+-    return srRtReflectAlong(env, dir, 1.0, swapRB);
++    float4 seen = srRtReflectAlong(env, dir, 1.0, swapRB);
++    seen.rgb *= waveFresnel;
++    return seen;
+ }
+ 
+ #ifdef CONAN_RECOMP
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 68a707e..d05f038 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -280,7 +280,10 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     {
+         const uint32_t usage = uint32_t(findResult->second.usage);
+         const uint32_t index = uint32_t(findResult->second.usageIndex);
+-        if (std::strcmp(USAGE_TYPES[usage], "float4") == 0)
++        if (srWaterVertexShader && findResult->second.usage == DeclUsage::Position && index == 0)
++            print("srWaterDisplace(srVertexInput({}, i{}{}), Mobj(0), Mobj(1), Mobj(2), gTime.x)",
++                  usage * 16 + index, USAGE_VARIABLES[usage], index);
++        else if (std::strcmp(USAGE_TYPES[usage], "float4") == 0)
+             print("srVertexInput({}, i{}{})", usage * 16 + index, USAGE_VARIABLES[usage], index);
+         else
+             print("i{}{}", USAGE_VARIABLES[usage], index);
+@@ -1461,6 +1464,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         srWaterShader |= strcmp(reinterpret_cast<const char*>(constantTableData + constantInfo->name),
+                                 "gWaterSpec") == 0;
+     }
++    // The water vertex shader (constant gerstner_wave_amp; its Mobj and gTime
++    // name the object matrix and the time): ocean waves move its position.
++    srWaterVertexShader = false;
++    for (uint32_t i = 0; i < constantTableContainer->constantTable.constants && !isPixelShader; i++)
++    {
++        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
++            constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
++        srWaterVertexShader |= strcmp(reinterpret_cast<const char*>(constantTableData + constantInfo->name),
++                                      "gerstner_wave_amp") == 0;
++    }
+     // Motion vectors: set by main around its run with the previous constants
+     // (SPIR-V has no previous constants: both runs read the current ones).
+     if (!isPixelShader)
+@@ -2205,7 +2218,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                    "\tg_srRtShadowVis = srRtShadowsReplace() ? srRtVisibilitySoft(g_srRtPixelPos) : -1.0;\n";
+         else if (srWaterShader)
+             out += "\tg_srRtPixelPos = iTexCoord4.xyz;\n"
+-                   "\tg_srRtCameraPos = float3(ViewInvMat(0).w, ViewInvMat(1).w, ViewInvMat(2).w);\n";
++                   "\tg_srRtCameraPos = float3(ViewInvMat(0).w, ViewInvMat(1).w, ViewInvMat(2).w);\n"
++                   "\tg_srWaterTime = iTexCoord6.y;\n";
+ #endif
+ #if defined(UNLEASHED_RECOMP) || defined(CONAN_RECOMP)
+         out += "\tfloat2 pixelCoord = 0.0;\n";
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index c47fc34..3c64a0d 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -62,6 +62,7 @@ struct ShaderRecompiler : StringBuffer
+     // srRtShadowDepth (ray-traced shadows replace the cascades).
+     bool srShadowReceiverShader = false;
+     bool srWaterShader = false;  // gWaterSpec: ray-traced reflections from TEXCOORD4
++    bool srWaterVertexShader = false;  // gerstner_wave_amp: ocean waves move its position input
+ #endif
+ 
+ #ifdef REBLUE_RECOMP

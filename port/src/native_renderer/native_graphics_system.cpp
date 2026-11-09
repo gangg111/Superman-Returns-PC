@@ -417,15 +417,30 @@ void D3D12NativeGraphicsSystem::VsyncThreadMain() {
   uint64_t freq = rex::chrono::Clock::guest_tick_frequency();
   int32_t fps = REXCVAR_GET(sr_native_fps_limit);
   int32_t vblank_hz = fps > 0 ? int32_t(profile::kVblanksPerFrame) * std::clamp(fps, 10, 1000)
-                              : std::max(int32_t(1), REXCVAR_GET(sr_native_unlocked_vblank_hz));
-  REXLOG_INFO("native graphics: frame rate limit {} (guest vblank {} Hz)", fps, vblank_hz);
+                              : std::max(int32_t(1), REXCVAR_GET(sr_native_unlocked_vblank_hz));  REXLOG_INFO("native graphics: frame rate limit {} (guest vblank {} Hz)", fps, vblank_hz);
   uint64_t interval = std::max(uint64_t(1), freq / uint64_t(vblank_hz));
   uint64_t last = rex::chrono::Clock::QueryGuestTickCount();
+  // rex::thread::Sleep is ::Sleep in whole milliseconds at the system timer
+  // resolution (up to 15.6 ms): vblanks came up to a frame late and the game's
+  // frames alternated 21 / 12 ms at the 60 FPS limit. A high-resolution timer
+  // wakes up 200 us early and the last stretch yields.
+  HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                        TIMER_ALL_ACCESS);
   while (running_) {
     uint64_t now = rex::chrono::Clock::QueryGuestTickCount();
     if (now - last < interval) {
       uint64_t remaining_us = (interval - (now - last)) * 1000000ull / freq;
-      rex::thread::Sleep(std::chrono::microseconds(std::min<uint64_t>(remaining_us, 8000ull)));
+      if (remaining_us > 300 && timer) {
+        LARGE_INTEGER due;
+        due.QuadPart = -int64_t(std::min<uint64_t>(remaining_us - 200, 8000ull) * 10);
+        if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
+          WaitForSingleObject(timer, 20);
+        }
+      } else if (remaining_us > 300) {
+        rex::thread::Sleep(std::chrono::microseconds(std::min<uint64_t>(remaining_us, 8000ull)));
+      } else {
+        SwitchToThread();
+      }
       continue;
     }
     // Vblank: the guest sees progress and its vblank handler runs.
@@ -437,6 +452,7 @@ void D3D12NativeGraphicsSystem::VsyncThreadMain() {
       last = rex::chrono::Clock::QueryGuestTickCount();
     }
   }
+  if (timer) CloseHandle(timer);
 }
 
 // --- PM4 consumer -------------------------------------------------------------

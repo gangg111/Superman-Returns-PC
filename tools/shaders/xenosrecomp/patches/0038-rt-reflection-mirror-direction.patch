@@ -1,0 +1,46 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -1113,13 +1113,41 @@
+         g_srRtReflectSeen = srRtDebug() == 7 ? path * (hasUv ? 1.0 : 0.5) : color;
+     return float4(swapRB ? color.zyx : color, env.a);
+ }
++// The reflection direction of a receiver: the game's cube direction bends with
++// the surface's normal map, which a blurred cube map hid; a ray into the sharp
++// scene turns every bump into grain. The mirror direction off the smooth
++// surface (normal from the pixel's world position derivatives, the view from
++// the camera, frame bytes 148..159) with the bump mixed in by byte 100
++// (sr_rt_reflection_bump). Without a camera: the game's direction.
++float3 srRtMirrorDir(float3 bumped)
++{
++#if !defined(SR_VULKAN_BUFFERS) && !defined(__spirv__)
++    ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
++    float3 cam = asfloat(b.Load3(148));
++    float bump = asfloat(b.Load(100));
++    float3 view = g_srRtPixelPos - cam;
++    float3 n = cross(ddx(g_srRtPixelPos), ddy(g_srRtPixelPos));
++    float vl = dot(view, view), nl = dot(n, n);
++    if (all(cam == 0.0) || bump >= 1.0 || vl < 1e-8 || nl < 1e-12)
++        return bumped;
++    view *= rsqrt(vl);
++    n *= rsqrt(nl);
++    if (dot(n, view) > 0.0)
++        n = -n;
++    float3 mirror = reflect(view, n);
++    float3 dir = lerp(mirror, bumped, bump);
++    return dot(dir, dir) > 1e-8 ? normalize(dir) : mirror;
++#else
++    return bumped;
++#endif
++}
+ // A receiver's environment sample (env_map) replaced by what a ray from the
+ // pixel along the cube direction hits.
+ float4 srRtReflect(float4 env, float3 texCoord, inout CubeMapData cubeMapData, bool swapRB)
+ {
+     if (!srRtReflections() && srRtDebug() != 6 && srRtDebug() != 7)
+         return env;
+-    return srRtReflectAlong(env, normalize(cubeMapData.cubeMapDirections[texCoord.z]), 0.3, swapRB);
++    return srRtReflectAlong(env, srRtMirrorDir(normalize(cubeMapData.cubeMapDirections[texCoord.z])), 0.3, swapRB);
+ }
+ // Ocean waves (port/src/native_renderer/water_waves.h holds the same model for
+ // the CPU: keep both tables identical). A sum of Gerstner waves over the world

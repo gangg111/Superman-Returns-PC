@@ -7,7 +7,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -40,6 +42,27 @@ struct ReplaceIndex {
   std::unordered_map<std::string, fs::path> files;  // name -> file
 };
 
+// One read for the whole file (a per-byte stream iterator took seconds per
+// texture and stalled the frame).
+std::shared_ptr<const std::vector<uint8_t>> ReadWhole(const fs::path& path) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  auto b = std::make_shared<std::vector<uint8_t>>(f ? size_t(f.tellg()) : 0);
+  if (!b->empty()) {
+    f.seekg(0);
+    f.read(reinterpret_cast<char*>(b->data()), std::streamsize(b->size()));
+  }
+  return b;
+}
+
+std::mutex g_file_cache_mutex;
+std::unordered_map<std::string, std::shared_ptr<const std::vector<uint8_t>>> g_file_cache;
+
+std::shared_ptr<const std::vector<uint8_t>> CachedFile(const std::string& name) {
+  std::lock_guard lock(g_file_cache_mutex);
+  const auto it = g_file_cache.find(name);
+  return it == g_file_cache.end() ? nullptr : it->second;
+}
+
 const ReplaceIndex& Index() {
   static const ReplaceIndex index = [] {
     ReplaceIndex r;
@@ -61,6 +84,19 @@ const ReplaceIndex& Index() {
       if (e.is_regular_file() && e.path().extension() == ".dds")
         r.files.emplace(e.path().stem().string(), e.path());
     REXLOG_INFO("textures: {} replacement(s) in {}", r.files.size(), r.dir.string());
+    // All of them into memory on a background thread (about 100 MB), so the
+    // renderer never waits for the disk when a new building or texture appears.
+    std::thread([files = r.files] {
+      SetThreadDescription(GetCurrentThread(), L"Texture replacement prefetch");
+      uint64_t total = 0;
+      for (const auto& [stem, path] : files) {
+        auto data = ReadWhole(path);
+        total += data->size();
+        std::lock_guard lock(g_file_cache_mutex);
+        g_file_cache.emplace(stem, std::move(data));
+      }
+      REXLOG_INFO("textures: {} replacement file(s) prefetched, {} MB", files.size(), total >> 20);
+    }).detach();
     return r;
   }();
   return index;
@@ -200,14 +236,11 @@ bool LoadReplacement(const std::string& name, DecodedTexture& out) {
   const auto found = index.files.find(name);
   if (found == index.files.end()) return false;
   const fs::path& path = found->second;
-  // One read for the whole file (a per-byte stream iterator took seconds per
-  // texture and stalled the frame).
-  std::ifstream f(path, std::ios::binary | std::ios::ate);
-  std::vector<uint8_t> b(f ? size_t(f.tellg()) : 0);
-  if (!b.empty()) {
-    f.seekg(0);
-    f.read(reinterpret_cast<char*>(b.data()), std::streamsize(b.size()));
-  }
+  // The file's bytes from the in-memory copy the prefetch thread reads at start
+  // (a read on the render worker stalled fast flight), else from disk now.
+  std::shared_ptr<const std::vector<uint8_t>> bytes = CachedFile(name);
+  if (!bytes) bytes = ReadWhole(path);
+  const std::vector<uint8_t>& b = *bytes;
   auto fail = [&](const char* why) {
     REXLOG_WARN("textures: {} not used: {}", path.string(), why);
     return false;

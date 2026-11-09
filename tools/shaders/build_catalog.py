@@ -126,6 +126,16 @@ def ucode_stats(blob: bytes, rec):
     return {"ucode_dwords": len(u) // 4}
 
 
+def shader_profile(kind: str, src: str) -> str:
+    """DXC target of a translated shader. Pixel shaders that trace inline
+    RayQuery need shader model 6.5 (the device reports tier 1.2 / SM 6.5): the
+    sun shadow receivers (docs/cienie-rt-projekt.md) and the water, whose sky
+    reflection is ray-traced (constant gWaterSpec)."""
+    if kind == "ps" and ("shadowMapOffsetScales" in src or "gWaterSpec" in src):
+        return "ps_6_5"
+    return "ps_6_0" if kind == "ps" else "vs_6_0"
+
+
 def run(cmd, timeout=120):
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -180,11 +190,7 @@ def process(s, a, dirs):
     # Per-instruction filter overrides (CONAN_RECOMP comments), unique per slot.
     res["tfetch_filters"] = sorted({tuple(int(x) for x in m2.groups()) for m2 in re.finditer(
         r"// conan_tfetch slot=(\d+) mag=(\d+) min=(\d+) mip=(\d+) aniso=(\d+)", src)})
-    prof = "ps_6_0" if s["type"] == "ps" else "vs_6_0"
-    # Sun shadow receivers trace inline RayQuery (docs/cienie-rt-projekt.md):
-    # shader model 6.5 (the device reports tier 1.2 / SM 6.5).
-    if s["type"] == "ps" and "shadowMapOffsetScales" in src:
-        prof = "ps_6_5"
+    prof = shader_profile(s["type"], src)
     base = ["-HV", "2021", "-all-resources-bound", "-Wno-ignored-attributes"]
     # default (spec constants = 0) standalone variant: provide the g_SpecConstants body
     std_src = dirs["logs"].parent / "work" / "std" / f"{stem}.hlsl"

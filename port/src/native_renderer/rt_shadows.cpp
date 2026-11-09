@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
+#include <unordered_set>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -17,6 +19,10 @@ REXCVAR_DEFINE_DOUBLE(sr_rt_test_cube, 0.0, "Superman Returns Native",
                       "Ray-traced shadows step 2: light-space depth (0..1) of a 6-unit test cube on "
                       "the sun line through the first cascade's centre; 0 = no cube")
     .range(0.0, 1.0);
+REXCVAR_DECLARE(bool, sr_rt_alpha_test);
+REXCVAR_DEFINE_INT32(sr_rt_ab_max_vertices, 0, "Superman Returns Native",
+                     "Debug A/B: with sr_rt_ab_vs, leave out only the character draws of at most this many "
+                     "stream-output vertices (0 = all of them)");
 REXCVAR_DEFINE_INT32(sr_rt_exclude_sources, 0, "Superman Returns Native",
                      "Debug: leave these capture sources out of the ray-traced scene (bit mask: 1 = indexed "
                      "scene draws, 2 = the shadow caster pass, 4 = instanced draws, 8 = skinned characters)")
@@ -24,6 +30,10 @@ REXCVAR_DEFINE_INT32(sr_rt_exclude_sources, 0, "Superman Returns Native",
 REXCVAR_DEFINE_BOOL(sr_rt_characters, true, "Superman Returns Native",
                     "Ray-traced shadows: skinned characters (Superman, pedestrians) cast shadows (their "
                     "post-skinning positions captured by stream output, one frame behind)");
+
+REXCVAR_DEFINE_BOOL(sr_rt_cape, true, "Superman Returns Native",
+                    "Ray-traced scene: Superman's cape (CPU cloth, world-space vertices) is captured with the "
+                    "characters, so reflections and ray-traced shadows have it");
 
 namespace superman_returns::native {
 
@@ -208,8 +218,7 @@ bool Renderer::RtBuildBlas(const D3D12_RAYTRACING_GEOMETRY_DESC& geometry, RtMes
   rt_device_->GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &info);
   if (!info.ResultDataMaxSizeInBytes) return false;
   if (!RtEnsureScratch(info.ScratchDataSizeInBytes)) return false;
-  mesh.blas = MakeBuffer(device_, info.ResultDataMaxSizeInBytes, D3D12_HEAP_TYPE_DEFAULT,
-                         D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, true);
+  mesh.blas = buffer_stock_.Take(BufferStock::Kind::kAccelStruct, info.ResultDataMaxSizeInBytes).resource;
   if (!mesh.blas) return false;
   D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC build{};
   build.Inputs = inputs;
@@ -228,7 +237,7 @@ bool Renderer::RtBuildBlas(const D3D12_RAYTRACING_GEOMETRY_DESC& geometry, RtMes
 // BLAS build.
 bool Renderer::RtMakeIndexBuffer(const std::vector<uint32_t>& indices, RtMesh& mesh) {
   const size_t bytes = indices.size() * sizeof(uint32_t);
-  mesh.indices = MakeBuffer(device_, bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false);
+  mesh.indices = buffer_stock_.Take(BufferStock::Kind::kUpload, bytes).resource;
   if (!mesh.indices) return false;
   Fill(mesh.indices.Get(), indices.data(), bytes);
   return true;
@@ -244,24 +253,45 @@ bool Renderer::RtBuildCityTlas(const float anchor[3]) {
   }
   // Static instances (same matrix for 30+ frames) stay 900 frames after they
   // were last drawn, so geometry outside the view keeps casting; moving ones
-  // (a new matrix every frame) only 3.
-  for (auto it = rt_city_instances_.begin(); it != rt_city_instances_.end();) {
-    const RtInstance& in = it->second;
+  // (a new matrix every frame) only 3. Expired instances are left out of the
+  // TLAS every frame (the loop below). Moving objects' keys are erased through
+  // the young queue; walking every instance and mesh, which every frame took 6%
+  // of the render worker, happens every 32 frames. A mesh is erased only by
+  // that sweep, after its instances.
+  const auto expired = [this](const RtInstance& in) {
     const uint64_t keep = in.last_swap >= in.first_swap + 30 ? 900 : 3;
-    if (swap_number_ > in.last_swap + keep) it = rt_city_instances_.erase(it);
+    return swap_number_ > in.last_swap + keep;
+  };
+  // Instances older than 3 frames leave the young queue: an expired one (a
+  // moving object's key of a past frame) is erased now, the rest wait for the
+  // sweep.
+  while (!rt_young_instances_.empty() && rt_young_instances_.front().second + 3 < swap_number_) {
+    auto it = rt_city_instances_.find(rt_young_instances_.front().first);
+    if (it != rt_city_instances_.end() && expired(it->second)) rt_city_instances_.erase(it);
+    rt_young_instances_.pop_front();
+  }
+  const bool sweep = (swap_number_ & 31) == 0;
+  for (auto it = rt_city_instances_.begin(); sweep && it != rt_city_instances_.end();) {
+    if (expired(it->second)) it = rt_city_instances_.erase(it);
     else ++it;
   }
-  for (auto it = rt_meshes_.begin(); it != rt_meshes_.end();) {
+  for (auto it = rt_meshes_.begin(); sweep && it != rt_meshes_.end();) {
     if (swap_number_ > it->second.last_swap + 1800) {
-      Retire(std::move(it->second.blas));
-      if (it->second.indices) Retire(std::move(it->second.indices));
+      // Back to the stock: releasing hundreds of buffers at once in the
+      // driver stalled the worker for up to 0.3 s.
+      buffer_stock_.Give(BufferStock::Kind::kAccelStruct,
+                         {std::move(it->second.blas), D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE},
+                         next_fence_value_);
+      if (it->second.indices) {
+        buffer_stock_.Give(BufferStock::Kind::kUpload,
+                           {std::move(it->second.indices), D3D12_RESOURCE_STATE_GENERIC_READ},
+                           next_fence_value_);
+      }
       it = rt_meshes_.erase(it);
     } else {
       ++it;
     }
   }
-  std::vector<D3D12_RAYTRACING_INSTANCE_DESC> descs;
-  descs.reserve(rt_city_instances_.size());
   // Ray-traced reflections: one material entry per TLAS instance (InstanceID =
   // its index): uv pool base (~0 = none), colour texture (SRV | 0x8000 PWL
   // gamma, 0xFFFFFF = none), uv components | sampler << 8, -, uv scale, offset.
@@ -275,12 +305,49 @@ bool Renderer::RtBuildCityTlas(const float anchor[3]) {
   };
   static_assert(sizeof(Material) == 128);
   const Material kNone{0xFFFFFFFFu, kRtNoAlbedo, 0, kRtNoAlbedo, 0, 0, 0, 0.0f, {1.0f, 1.0f, 0.0f, 0.0f}, {}, {}};
-  std::vector<Material> materials;
-  materials.reserve(rt_city_instances_.size() + 1);
   const float radius2 = 4000.0f * 4000.0f;
   const int32_t excluded = REXCVAR_GET(sr_rt_exclude_sources);
+  // Alpha-tested copies (scene draws with a textured alpha test): where one
+  // stands, the shadow pass's copy at the same transform is a solid hull.
+  const bool ab_swap = RtAbOldSwap(), ab_all = ab_swap && RtAbAll();
+  // The city part (thousands of instances, a tenth of the render worker in fast
+  // flight) is rebuilt every other frame; the frame between reuses it (an
+  // object streamed in joins the rays one frame later). Characters below are
+  // added every frame. Sweeps (meshes erased) and A/B frames always rebuild.
+  // The city part is built in place in these vectors (copying them was ~6 MB
+  // per frame); the characters' entries are appended after it every frame.
+  static std::vector<D3D12_RAYTRACING_INSTANCE_DESC> descs;
+  static std::vector<Material> materials;
+  static size_t city_descs = 0, city_materials = 0;
+  static uint64_t city_alpha = 0, city_hulls = 0, city_swap = 0;
+  const bool rebuild_city = (swap_number_ & 1) == 0 || sweep || ab_swap || swap_number_ != city_swap + 1;
+  uint64_t alpha_instances = 0, hulls_skipped = 0;
+  if (!rebuild_city) {
+    descs.resize(city_descs);
+    materials.resize(city_materials);
+    alpha_instances = city_alpha;
+    hulls_skipped = city_hulls;
+  } else {
+  descs.clear();
+  materials.clear();
+  descs.reserve(rt_city_instances_.size() + 1);
+  materials.reserve(rt_city_instances_.size() + 1);
+  std::unordered_set<uint64_t> alpha_xforms;
+  if ((REXCVAR_GET(sr_rt_alpha_test) && !ab_all)) {
+    for (const auto& [key, instance] : rt_city_instances_) {
+      const RtMaterial& m = instance.material;
+      if (!(instance.source & 2) && m.alpha_ref >= 0.0f && m.albedo != kRtNoAlbedo && m.uv_interp >= 0)
+        alpha_xforms.insert(instance.xform);
+    }
+  }
   for (const auto& [key, instance] : rt_city_instances_) {
-    if (instance.source & excluded) continue;
+    if ((instance.source & 2) && !alpha_xforms.empty() && alpha_xforms.count(instance.xform)) {
+      ++hulls_skipped;
+      continue;
+    }
+    if ((instance.source & excluded) || expired(instance)) continue;
+    // A/B: the full-scene geometry, or (with a shader list) also the shadow pass's copies.
+    if (ab_swap && ((instance.source & 8) || ((instance.source & 2) && !ab_all)) && RtAbHidesVs(instance.vs)) continue;  // A/B: as before the full scene
     auto mesh = rt_meshes_.find(instance.mesh);
     if (mesh == rt_meshes_.end() || !mesh->second.blas) continue;
     const float* t = instance.transform;
@@ -326,12 +393,27 @@ bool Renderer::RtBuildCityTlas(const float anchor[3]) {
     d.InstanceID = UINT(materials.size());
     // Mask 1: has a material (reflection rays try these first), 2: none.
     d.InstanceMask = mat.texture != kRtNoAlbedo || ((mat.tint_flags >> 9) & 1) ? 0x01 : 0x02;
-    materials.push_back(mat);
     d.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
+    // Alpha test (flag bit 12, threshold in byte 124): the rays look at the
+    // colour texture's alpha at the hit (non-opaque candidates).
+    if (src && src->alpha_ref >= 0.0f && mat.texture != kRtNoAlbedo && mat.uv_base != 0xFFFFFFFFu &&
+        !((mat.tint_flags >> 9) & 1) && (REXCVAR_GET(sr_rt_alpha_test) && !ab_all)) {
+      mat.tint_flags |= 1u << 12;
+      mat.a_tint[3] = src->alpha_ref;
+      d.Flags |= D3D12_RAYTRACING_INSTANCE_FLAG_FORCE_NON_OPAQUE;
+      ++alpha_instances;
+    }
+    materials.push_back(mat);
     d.AccelerationStructure = mesh->second.blas->GetGPUVirtualAddress();
     descs.push_back(d);
     if (descs.size() >= 31744) break;  // room for the character draws' materials
   }
+  city_descs = descs.size();
+  city_materials = materials.size();
+  city_alpha = alpha_instances;
+  city_hulls = hulls_skipped;
+  }
+  if (rebuild_city) city_swap = swap_number_;
   if (rt_skin_ready_ && !(excluded & 8)) {
     D3D12_RAYTRACING_INSTANCE_DESC d{};
     std::memcpy(d.Transform, rt_skin_transform_, sizeof(d.Transform));
@@ -359,6 +441,8 @@ bool Renderer::RtBuildCityTlas(const float anchor[3]) {
     descs.push_back(d);
   }
   if (descs.empty()) return false;
+  // The whole table every frame (uploading only the characters' entries between
+  // rebuilds gave wrong colours in game, 2026-11-08).
   RtUploadMaterials(materials.data(), materials.size() * sizeof(Material));
   RtUploadPalettes();
   static uint64_t last_material_log = 0;
@@ -376,8 +460,9 @@ bool Renderer::RtBuildCityTlas(const float anchor[3]) {
                SrvGeneration(instance.material.albedo & 0x7FFFu) != instance.material.albedo_gen;
     }
     REXLOG_INFO("native: rt materials: {} instances, {} with a colour texture, {} tint blends, {} with texture "
-                "coordinates; {} copies drawn textured, {} of them with a retired texture",
-                materials.size(), textured, tinted, with_uv, own, stale);
+                "coordinates; {} copies drawn textured, {} of them with a retired texture; {} alpha-tested, {} "
+                "shadow-pass hulls left out",
+                materials.size(), textured, tinted, with_uv, own, stale, alpha_instances, hulls_skipped);
   }
   UploadAlloc up;
   const size_t bytes = descs.size() * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
@@ -424,11 +509,12 @@ bool Renderer::RtBuildCityTlas(const float anchor[3]) {
 
 // The frame's material table (kRtMaterialSrv): copied from the upload ring
 // into a default-heap buffer the reflection rays read by InstanceID.
-void Renderer::RtUploadMaterials(const void* data, size_t bytes) {
-  bytes = std::min(bytes, kRtMaterialBytes);
+bool Renderer::RtUploadMaterials(const void* data, size_t bytes, size_t offset) {
+  if (offset >= kRtMaterialBytes) return false;
+  bytes = std::min(bytes, kRtMaterialBytes - offset);
   if (!rt_material_buffer_) {
     rt_material_buffer_ = MakeBuffer(device_, kRtMaterialBytes + kRtPaletteBytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST, false);
-    if (!rt_material_buffer_) return;
+    if (!rt_material_buffer_) return false;
     rt_material_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -441,12 +527,14 @@ void Renderer::RtUploadMaterials(const void* data, size_t bytes) {
         provider_->OffsetViewDescriptor(srv_heap_->GetCPUDescriptorHandleForHeapStart(), kRtMaterialSrv));
   }
   UploadAlloc up;
-  if (!bytes || !Upload(bytes, 256, up)) return;
+  if (!bytes) return true;
+  if (!Upload(bytes, 256, up)) return false;
   std::memcpy(up.cpu, data, bytes);
   Transition(rt_material_buffer_.Get(), rt_material_state_, D3D12_RESOURCE_STATE_COPY_DEST);
-  command_list_->CopyBufferRegion(rt_material_buffer_.Get(), 0, up.resource, up.offset, bytes);
+  command_list_->CopyBufferRegion(rt_material_buffer_.Get(), offset, up.resource, up.offset, bytes);
   Transition(rt_material_buffer_.Get(), rt_material_state_,
              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  return true;
 }
 
 // Scratch memory shared by every acceleration structure build of the frame.
@@ -528,9 +616,60 @@ void Renderer::RtCaptureSkinned(uint8_t* base, uint32_t u, uint32_t v, uint32_t 
   if (logged_ps.size() < 16 && logged_ps.insert(current_ps_hash_).second)
     REXLOG_INFO("native: rt character ps {:016X}: uv interpolant {}, material {} (texture {:X} uv {})",
                 current_ps_hash_, uv_interp, draw.has_material, draw.material.albedo, draw.material.uv_interp);
+  draw.vs = current_vs_hash_;
   rt_so_pending_.push_back(draw);
   rt_so_cursor_ += uint64_t(vertices) * 32;
   ++rt_stats_.skinned_draws;
+}
+
+// Superman's cape (vertex shader 4536A1CD): cloth simulated on the CPU, world-
+// space vertices in a new buffer every frame, drawn with the camera only (no
+// world matrix, no light rows), so neither the city nor the character capture
+// took it and reflections showed Superman without it. Its vertex shader
+// writes TEXCOORD0 = UV and TEXCOORD1 = camera - world; stream output keeps
+// both in the character soup, and the build maps the view vector into light
+// space (light = rows * (camera - v)) so it shares the characters' BLAS,
+// instance and materials.
+void Renderer::RtCaptureCape(uint8_t* base, bool indexed, uint32_t start, uint32_t count, int32_t base_vertex,
+                             uint32_t so_vertices) {
+  if (!REXCVAR_GET(sr_rt_characters) || !REXCVAR_GET(sr_rt_cape) || SkipGpuDraw() ||
+      rt_frame_swap_ != swap_number_ || !rt_so_target_.pso || !so_vertices || !rt_so_buffers_[0]) {
+    return;
+  }
+  if (rt_so_cursor_ + uint64_t(so_vertices) * 32 > kSoBytes) return;
+  const float* c = reinterpret_cast<const float*>(mirror_.regs() + Pm4Mirror::kAluConstantBase);
+  const float cam[3] = {c[0 * 4 + 3], c[1 * 4 + 3], c[2 * 4 + 3]};  // gViewInverse (register 0) column w
+  const int32_t uv_interp = RtDrawUvInterp();
+  ID3D12PipelineState* pso = RtSoPipeline(base, "TEXCOORD", uint32_t(uv_interp >= 0 ? uv_interp : 0), 4,
+                                          "TEXCOORD", 1, 4);
+  if (!pso || !RtSoBeginDraw()) return;
+  ID3D12Resource* buffer = rt_so_buffers_[rt_so_write_].Get();
+  Transition(buffer, rt_so_states_[rt_so_write_], D3D12_RESOURCE_STATE_STREAM_OUT);
+  if (rt_so_pending_.empty()) std::memcpy(rt_skin_transform_, rt_frame_inv_, sizeof(rt_skin_transform_));
+  RtSoDraw(pso, buffer->GetGPUVirtualAddress() + rt_so_cursor_, uint64_t(so_vertices) * 32, indexed, count, start,
+           base_vertex);
+  RtSkinDraw draw{rt_so_cursor_, so_vertices, {}, false};
+  draw.has_material = RtDrawMaterial(uv_interp, draw.material);
+  draw.cape = true;
+  for (int r = 0; r < 3; ++r) {
+    const float* row = rt_frame_rows_ + 4 * r;
+    draw.to_light[4 * r + 0] = -row[0];
+    draw.to_light[4 * r + 1] = -row[1];
+    draw.to_light[4 * r + 2] = -row[2];
+    draw.to_light[4 * r + 3] = row[0] * cam[0] + row[1] * cam[1] + row[2] * cam[2] + row[3];
+  }
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXLOG_INFO("native: rt cape: {} vertices, ps {:016X}, uv interpolant {}, material {} (texture {:X}), camera "
+                "{:.1f} {:.1f} {:.1f}",
+                so_vertices, current_ps_hash_, uv_interp, draw.has_material, draw.material.albedo, cam[0], cam[1],
+                cam[2]);
+  }
+  draw.vs = current_vs_hash_;
+  rt_so_pending_.push_back(draw);
+  rt_so_cursor_ += uint64_t(so_vertices) * 32;
+  ++rt_stats_.cape_draws;
 }
 
 // The stream-output pipeline repeating the current draw: its vertex shader,
@@ -543,7 +682,7 @@ ID3D12PipelineState* Renderer::RtSoPipeline(uint8_t* base, const char* semantic,
   const uint32_t decl = rt_so_target_.decl;
   uint64_t key = current_vs_hash_;
   auto mix = [&key](uint64_t x) { key ^= x + 0x9E3779B97F4A7C15ull + (key << 6) + (key >> 2); };
-  mix(decl);
+  mix(rt_so_target_.decl_hash);
   mix(rt_so_target_.rt_count);
   for (DXGI_FORMAT f : rt_so_target_.rtv) mix(uint64_t(f));
   mix(uint64_t(rt_so_target_.dsv));
@@ -591,13 +730,15 @@ ID3D12PipelineState* Renderer::RtSoPipeline(uint8_t* base, const char* semantic,
     }
     if (rt_so_target_.rt_count == 5) desc.RTVFormats[4] = kDlssMotionFormat;  // DLSS objects' motion
     desc.SampleDesc.Count = bound_samples_;
+    const auto t0 = std::chrono::steady_clock::now();
     const HRESULT hr = device_->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pit->second));
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (FAILED(hr)) {
       REXLOG_ERROR("native: rt stream-output pipeline for vs {:016X} {}{} failed ({:08X})", current_vs_hash_,
                    semantic, index, uint32_t(hr));
     } else {
-      REXLOG_INFO("native: rt stream-output pipeline for vs {:016X} {}{} ({} pipelines)", current_vs_hash_,
-                  semantic, index, rt_so_pipelines_.size());
+      REXLOG_INFO("native: rt stream-output pipeline for vs {:016X} {}{} ({} pipelines) in {:.1f} ms",
+                  current_vs_hash_, semantic, index, rt_so_pipelines_.size(), ms);
     }
   }
   return pit->second.Get();
@@ -649,7 +790,7 @@ void Renderer::RtSoDraw(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_ADDRESS dst,
 // offset), as a triangle soup in BLAS primitive order: vertex 3p + j of the
 // pool is corner j of primitive p. Once per mesh, at most 64 meshes a frame.
 void Renderer::RtCaptureUv(RtMesh& mesh, uint8_t* base, int32_t interp, int32_t palette_interp, bool indexed,
-                           uint32_t count, uint32_t start, int32_t base_vertex) {
+                           uint32_t count, uint32_t start, int32_t base_vertex, uint32_t so_count) {
   if (interp < 0 || mesh.uv_tried || !rt_so_target_.pso || SkipGpuDraw()) return;
   if (rt_uv_swap_ != swap_number_) {
     rt_uv_swap_ = swap_number_;
@@ -658,7 +799,7 @@ void Renderer::RtCaptureUv(RtMesh& mesh, uint8_t* base, int32_t interp, int32_t 
   if (rt_uv_this_frame_ >= 64) return;
   ++rt_uv_this_frame_;
   mesh.uv_tried = true;
-  const uint32_t vertices = count - count % 3;
+  const uint32_t vertices = so_count ? so_count : count - count % 3;
   constexpr uint64_t kUvVertices = (192ull << 20) / 32;  // 32 bytes: UV interpolant, palette interpolant
   if (!vertices || rt_uv_cursor_ + vertices > kUvVertices) return;
   if (!rt_uv_pool_) {
@@ -706,7 +847,18 @@ bool Renderer::RtBuildSkinnedBlas() {
   }
   std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geometry(rt_so_pending_.size());
   uint64_t triangles = 0;
+  // The cape's view-vector soups into light space (RtCaptureCape).
+  size_t capes = 0;
+  for (const RtSkinDraw& d : rt_so_pending_) capes += d.cape;
+  UploadAlloc xforms{};
+  if (capes && !Upload(capes * 48, 16, xforms)) return false;
+  size_t cape_slot = 0;
   for (size_t i = 0; i < geometry.size(); ++i) {
+    if (rt_so_pending_[i].cape) {
+      std::memcpy(static_cast<uint8_t*>(xforms.cpu) + cape_slot * 48, rt_so_pending_[i].to_light, 48);
+      geometry[i].Triangles.Transform3x4 = xforms.gpu + cape_slot * 48;
+      ++cape_slot;
+    }
     D3D12_RAYTRACING_GEOMETRY_DESC& g = geometry[i];
     g.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
     g.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
@@ -714,6 +866,11 @@ bool Renderer::RtBuildSkinnedBlas() {
     g.Triangles.VertexBuffer.StrideInBytes = 32;
     g.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
     g.Triangles.VertexCount = rt_so_pending_[i].vertices;
+    // A/B by shader (sr_rt_ab_vs): the draw stays (its material slot) but empty.
+    if (!RtAbAll() && RtAbHidesVs(rt_so_pending_[i].vs) &&
+        (REXCVAR_GET(sr_rt_ab_max_vertices) <= 0 ||
+         rt_so_pending_[i].vertices <= uint32_t(REXCVAR_GET(sr_rt_ab_max_vertices))))
+      g.Triangles.VertexCount = 0;
     triangles += rt_so_pending_[i].vertices / 3;
   }
   const size_t draws = rt_so_pending_.size();
@@ -757,9 +914,10 @@ bool Renderer::RtBuildSkinnedBlas() {
   static uint64_t last_log = 0;
   if (swap_number_ >= last_log + 600) {
     last_log = swap_number_;
-    REXLOG_INFO("native: rt characters: {} draws, {} triangles in one BLAS ({} KB); captured {} skipped {}",
-                draws, triangles, info.ResultDataMaxSizeInBytes >> 10, rt_stats_.skinned_draws,
-                rt_stats_.skip_skinned);
+    REXLOG_INFO("native: rt characters: {} draws ({} cape), {} triangles in one BLAS ({} KB); captured {} "
+                "(capes {}) skipped {}",
+                draws, capes, triangles, info.ResultDataMaxSizeInBytes >> 10, rt_stats_.skinned_draws,
+                rt_stats_.cape_draws, rt_stats_.skip_skinned);
   }
   return true;
 }

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 
@@ -18,6 +19,7 @@
 #include "mem_stats.h"
 #include "native_renderer/native_bridge.h"
 #include "renderdoc_capture.h"
+#include "skip_intro.h"
 
 namespace {
 
@@ -55,13 +57,37 @@ void MaybeLogFps(uint64_t frames) {
   hitches = 0;
 }
 
+// SR_FRAME_TIMES=<file.csv> writes every guest frame's time (present to
+// present, ms) with the time since start (s): the stutter measurement
+// (frames well over the frame-rate limit's period).
+void MaybeWriteFrameTime() {
+  using clock = std::chrono::steady_clock;
+  static FILE* file = [] {
+    const char* path = std::getenv("SR_FRAME_TIMES");
+    FILE* f = path && *path ? std::fopen(path, "w") : nullptr;
+    if (f) std::fputs("t_s,frame_ms\n", f);
+    return f;
+  }();
+  if (!file) return;
+  static const clock::time_point start = clock::now();
+  static clock::time_point last = start;
+  const auto now = clock::now();
+  std::fprintf(file, "%.4f,%.3f\n", std::chrono::duration<double>(now - start).count(),
+               std::chrono::duration<double, std::milli>(now - last).count());
+  last = now;
+  static uint32_t lines = 0;
+  if (++lines % 120 == 0) std::fflush(file);
+}
+
 }  // namespace
 
 REX_HOOK_RAW(sub_82112050) {
   const uint64_t frames = g_frames.fetch_add(1, std::memory_order_relaxed) + 1;
   MaybeLogFps(frames);
+  MaybeWriteFrameTime();
   superman_returns::MaybeLogMemory(base);
   OnGuestFrameForCapture(frames);
+  superman_returns::IntroSkipOnFrame(ctx, base);
   // sub_82112050 is also the candidate D3DDevice_Swap(dev, front_buffer, ...)
   // of the native renderer (game_profile.h); a no-op unless that is built,
   // confirmed and active.
@@ -69,6 +95,8 @@ REX_HOOK_RAW(sub_82112050) {
   __imp__sub_82112050(ctx, base);
   superman_returns::native::OnFrameStatsSwap(base, device, front_buffer);
 }
+
+uint64_t GuestFrameCount() { return g_frames.load(std::memory_order_relaxed); }
 
 rex::ui::FrameStats SampleGuestFrameStats() {
   using clock = std::chrono::steady_clock;

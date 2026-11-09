@@ -1,0 +1,132 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index ecb05a7..62734c7 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -289,6 +289,16 @@ float3 srLampWorldPos(float4 pos)
+                       dot(asfloat(b.Load4(224)), clip), dot(asfloat(b.Load4(240)), clip));
+     return p.xyz / p.w;
+ }
++// The camera of that view-projection: the clip point (0, 0, 1, 0) (the eye has
++// clip w = 0, whatever the depth convention). Zero when the lamps' data is off.
++float3 srLampCamera()
++{
++    ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
++    if (b.Load(160) == 0)
++        return 0.0;
++    float4 c = float4(asfloat(b.Load(192 + 8)), asfloat(b.Load(208 + 8)), asfloat(b.Load(224 + 8)), asfloat(b.Load(240 + 8)));
++    return abs(c.w) > 1e-12 ? c.xyz / c.w : 0.0;
++}
+ float3 srLampLight(float3 worldPos, float3 color)
+ {
+     ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
+@@ -659,6 +669,86 @@ float3 srSkyBodies(float4 pos, float4 sun, float4 moon, float4 vp, float4 r0, fl
+ // facade itself (axes from the surface normal, 2-unit bays, 3.6-unit floors,
+ // frames between the panes, rooms three bays wide, whole floors mostly dark),
+ // fading to its mean where the panes are smaller than a pixel.
++// Night rooms behind the windows (patch 0036): interior mapping (Joost van
++// Dongen's technique) with the room atlas of Gaxil/Unity-InteriorMapping (MIT,
++// textures/windows/gaxil_building_atlas.dds in descriptor SR_WINDOW_ATLAS_INDEX:
++// 4 x 4 cells, columns floor, ceiling, side wall, back wall, rows four rooms).
++// Each window's rectangle comes from its window map (make_window_map.py, the
++// host's descriptor cfg.x, size cfg.yz): per texel of the material map, the
++// window's (u0, v0, u1, v1) encoded as (x + 0.5) / 2, zero outside windows.
++// The room is a box behind the window: as wide and high as the window in the
++// world, as deep as it is wide (2 .. 6 m); a ray from the camera through the
++// pixel picks the wall it meets. A window's room is lit or dark as a whole.
++// Rooms are photographed offices now: Poly Haven indoor HDRIs (CC0) as panoramas stacked in
++// bands of textures/windows/office_room_panoramas.dds (make_room_panos.py); each window picks one.
++#define SR_WINDOW_ATLAS_INDEX 32759  // kSrvHeapSize - 9
++#define SR_WINDOW_ROOMS 3.0
++#define SR_WINDOW_BANDS 4.0
++float3 srWindowRoom(float3 p, float3 cam, float glass, float2 uv, float4 cfg, uint samplerIndex, out float lit)
++{
++    // Derivatives first: every lane must take part.
++    float3 dpx = ddx(p), dpy = ddy(p);
++    float2 dux = ddx(uv), duy = ddy(uv);
++    lit = 0.0;
++    float2 f = frac(uv);
++    int2 texel = clamp(int2(f * cfg.yz), int2(0, 0), int2(cfg.yz) - 1);
++    float4 rect = g_Texture2DDescriptorHeap[uint(cfg.x)].Load(int3(texel, 0)) * 2.0 - 0.5;
++    if (all(rect == -0.5) || glass <= 0.0)
++        return 0.0;
++    float2 size = max(rect.zw - rect.xy, 1e-4);
++    float2 local = saturate((f - rect.xy) / size);
++    // Room identity: the material tile and the window in it.
++    float3 id = float3(floor(uv) + (rect.xy + rect.zw) * 3.7, 11.0);
++    float h = srWindowHash(id);
++    float tone = frac(h * 17.31);
++    lit = h < 0.42 ? 0.7 + 0.3 * tone : 0.0;
++    // World axes of the texture (dP/du, dP/dv) from the screen derivatives.
++    float det = dux.x * duy.y - dux.y * duy.x;
++    if (abs(det) < 1e-12)
++        return 0.0;
++    float3 T = (dpx * duy.y - dpy * dux.y) / det;
++    float3 B = (dpy * dux.x - dpx * duy.x) / det;
++    float3 N = normalize(cross(T, B));
++    float3 v = normalize(p - cam);
++    if (dot(N, v) > 0.0) N = -N;  // N faces the camera; the room is behind
++    float W = length(T) * size.x, H = length(B) * size.y;
++    // Only upright glass of a real window's size has an office behind it: skylights and
++    // sloped roofs (N not level), spires and crowns (panels of many metres) stay glass.
++    if (abs(N.y) > 0.3 || W > 6.0 || H > 6.0 || W < 0.4 || H < 0.6)
++    {
++        lit = 0.0;
++        return 0.0;
++    }
++    // The room is wider and higher than its window (an office, not a slot behind one pane):
++    // the window is an opening in the middle of the room's front wall.
++    float Wr = max(W, 4.5), Hr = max(H, 3.2), D = 5.0;
++    // The ray in room units (x across, y down the texture, z into the room).
++    float3 d = float3(dot(v, normalize(T)) / Wr, dot(v, normalize(B)) / Hr, dot(v, -N) / D);
++    float3 o = float3(0.5 + (local.x - 0.5) * (W / Wr), 0.5 + (local.y - 0.5) * (H / Hr), 0.0);
++    float tx = d.x > 0.0 ? (1.0 - o.x) / d.x : -o.x / min(d.x, -1e-6);
++    float ty = d.y > 0.0 ? (1.0 - o.y) / d.y : -o.y / min(d.y, -1e-6);
++    float tz = 1.0 / max(d.z, 1e-6);
++    float t = min(tz, min(tx, ty));
++    float3 hit = o + d * t;
++    // Box projection onto the room's panorama: the exit point seen from the box centre
++    // (x right, y up, z out of the room), turned by a random quarter turn plus a little and
++    // mirrored at random, so neighbouring windows of one office never look alike.
++    float3 q = float3(hit.x * 2.0 - 1.0, 1.0 - hit.y * 2.0, 1.0 - hit.z * 2.0);
++    float yaw = floor(frac(h * 3.11) * 4.0) * 1.5707963 + (frac(h * 9.71) - 0.5) * 0.6;
++    float cy = cos(yaw), sy = sin(yaw);
++    float3 r = float3(q.x * cy - q.z * sy, q.y, q.x * sy + q.z * cy);
++    if (frac(h * 2.37) < 0.5) r.x = -r.x;
++    r = normalize(r);
++    float band = floor(frac(h * 5.37) * SR_WINDOW_ROOMS);
++    // The mip for the window's size on screen (about a quarter turn of the panorama across it).
++    float lod = clamp(log2(max(length(dux / size), length(duy / size)) * 512.0), 0.0, 4.0);
++    float pv = clamp(acos(clamp(r.y, -1.0, 1.0)) / 3.14159265, 0.02, 0.98);  // off the band edges
++    float2 auv = float2(atan2(r.x, -r.z) / 6.2831853 + 0.5, (band + pv) / SR_WINDOW_BANDS);
++    float3 c = g_Texture2DDescriptorHeap[SR_WINDOW_ATLAS_INDEX].SampleLevel(g_SamplerDescriptorHeap[samplerIndex], auv, lod).rgb;
++    float3 warm = lerp(float3(1.0, 0.92, 0.8), float3(0.92, 0.96, 1.0), tone * tone);
++    return c * (lit > 0.0 ? warm * lit : float3(0.03, 0.035, 0.045)) * glass;
++}
++
+ float srWindowLight(float3 p, bool hasPos, float glass, float glassCoarse, float2 uv, out float tone)
+ {
+     // Rooms by the material map's tile (whole UV repeats): a facade texture repeats per bay or
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 1d27e63..42e116b 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -2961,11 +2961,18 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                         indent();
+                         out += "{ float4 srWin = CONST_REL(201); if (srWin.w == 12345.0 && any(srWin.rgb > 0.0)) { "
+                                "float3 srK = max(Kenv.xyz, 0.0); float srKmax = max(max(srK.x, srK.y), max(srK.z, 1e-3)); "
++                               "float4 srRoomCfg = CONST_REL(202); "
++                               // Patch 0036: rooms from the window map (host c202 = map SRV, size, 12345).
++                               "[branch] if (srRoomCfg.w == 12345.0) { float srLit; float3 srRoom = srWindowRoom(";
++                        out += srShadowReceiver ? "srRtWorldPos(iSrLight.xyz), " : "srLampWorldPos(iPos), ";
++                        // The camera: host c203 (from gViewInverse, every frame), else the lamps' one.
++                        out += "(CONST_REL(203).w == 12345.0 ? CONST_REL(203).xyz : srLampCamera()), smoothstep(0.35, 0.65, dot(g_srMat.xyz, srK) / srKmax), g_srMatUV, srRoomCfg, "
++                               "mat_map_SamplerDescriptorIndex, srLit); oC0.rgb += srWin.rgb * srRoom * 0.9; } else { "
+                                "float srTk; float srA = srWindowLight(";
+                         out += srShadowReceiver ? "srRtWorldPos(iSrLight.xyz), true, " : "float3(0.0, 0.0, 0.0), false, ";
+                         out += "dot(g_srMatMid.xyz, srK) / srKmax, dot(g_srMatCoarse.xyz, srK) / srKmax, g_srMatUV, srTk); "
+                                "float3 srTone = lerp(float3(1.0, 0.72, 0.42), float3(0.85, 0.92, 1.0), srTk * srTk); "
+-                               "oC0.rgb += srWin.rgb * srTone * srA; "
++                               "oC0.rgb += srWin.rgb * srTone * srA; } "
+                                "if (srRtDebug() == 14) oC0 = float4(g_srWinDebug, 1.0); "
+                                "else if (srRtDebug() == 15) oC0 = float4(dot(g_srMatMid.xyz, srK) / srKmax, dot(g_srMat.xyz, srK) / srKmax, 0.0, 1.0); } }\n";
+                     }

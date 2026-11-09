@@ -93,6 +93,7 @@ private:
       return;
     if (index - kAluConstantBase < 0x800u && regs_[index] != value) {
       ++(index < kAluConstantBase + 0x400 ? vs_version : ps_version);
+      MarkDirty(index - kAluConstantBase);
     }
     regs_[index] = value;
     if (index >= kAluConstantBase && index < kAluConstantBase + kTrackedCount) {
@@ -103,6 +104,12 @@ private:
   bool written_[kTrackedCount] = {};
   mutable std::array<std::array<uint32_t,1024>,2> float_cache_{};
   mutable std::array<uint64_t,2> float_cache_version_{};
+  // Float constants changed since FloatConstants last sanitized them (bit per
+  // register, vertex bank then pixel bank): only those are redone (a draw
+  // usually changes a few world-matrix registers, not all 1024).
+  mutable std::array<uint64_t,32> dirty_{};
+  mutable std::array<bool,2> float_cache_full_{};
+  void MarkDirty(uint32_t alu_index) const { dirty_[alu_index >> 6] |= 1ull << (alu_index & 63); }
 };
 
 } // namespace superman_returns::native

@@ -1,0 +1,96 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -339,6 +339,8 @@
+ // the sun; 72: scene valid). 1 = sun visible, 0 = an occluder is hit.
+ #if __SHADER_TARGET_MAJOR > 6 || (__SHADER_TARGET_MAJOR == 6 && __SHADER_TARGET_MINOR >= 5)
+ RaytracingAccelerationStructure g_RtTlas : register(t32767, space8);
++// Alpha test of a non-opaque candidate hit (defined after the sampler heap).
++bool srRtAlphaPass(uint id, uint prim, float2 bary);
+ float srRtVisibility(float3 worldPos)
+ {
+     ByteAddressBuffer b = g_RtBuffers[SR_RT_FRAME_INDEX];
+@@ -355,7 +357,9 @@
+     ray.TMax = 20000.0;
+     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+     q.TraceRayInline(g_RtTlas, RAY_FLAG_NONE, 0xFF, ray);
+-    q.Proceed();
++    while (q.Proceed())
++        if (srRtAlphaPass(q.CandidateInstanceID() + q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics()))
++            q.CommitNonOpaqueTriangleHit();
+     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
+ }
+ // Debug: distance along the sun ray to the nearest occluder, -1 = none.
+@@ -374,7 +378,8 @@
+     RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+     q.TraceRayInline(g_RtTlas, RAY_FLAG_NONE, 0xFF, ray);
+     while (q.Proceed())
+-        q.CommitNonOpaqueTriangleHit();
++        if (srRtAlphaPass(q.CandidateInstanceID() + q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics()))
++            q.CommitNonOpaqueTriangleHit();
+     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? q.CommittedRayT() : -1.0;
+ }
+ // Ray-traced shadows replace the cascades (byte 80: on; not in the debug views):
+@@ -395,7 +400,9 @@
+     ray.TMax = 20000.0;
+     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+     q.TraceRayInline(g_RtTlas, RAY_FLAG_NONE, 0xFF, ray);
+-    q.Proceed();
++    while (q.Proceed())
++        if (srRtAlphaPass(q.CandidateInstanceID() + q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics()))
++            q.CommitNonOpaqueTriangleHit();
+     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0u : 1u;
+ }
+ // Penumbra: the fraction of the sun's disc visible from worldPos, from N rays
+@@ -461,7 +468,9 @@
+     // Two separate queries: a RayQuery inside a loop hung the GPU.
+     RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q;
+     q.TraceRayInline(g_RtTlas, RAY_FLAG_NONE, 0x01, ray);
+-    while (q.Proceed()) {}
++    while (q.Proceed())
++        if (srRtAlphaPass(q.CandidateInstanceID() + q.CandidateGeometryIndex(), q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics()))
++            q.CommitNonOpaqueTriangleHit();
+     if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+     {
+         t = q.CommittedRayT();
+@@ -472,7 +481,9 @@
+     }
+     RayQuery<RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES> q2;
+     q2.TraceRayInline(g_RtTlas, RAY_FLAG_NONE, 0x02, ray);
+-    while (q2.Proceed()) {}
++    while (q2.Proceed())
++        if (srRtAlphaPass(q2.CandidateInstanceID() + q2.CandidateGeometryIndex(), q2.CandidatePrimitiveIndex(), q2.CandidateTriangleBarycentrics()))
++            q2.CommitNonOpaqueTriangleHit();
+     if (q2.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+     {
+         t = q2.CommittedRayT();
+@@ -542,6 +553,29 @@
+ [[vk::binding(0,2)]] SamplerState g_SamplerDescriptorHeap[32];
+ #else
+ SamplerState g_SamplerDescriptorHeap[] : register(s0, space3);
++#endif
++#if (__SHADER_TARGET_MAJOR > 6 || (__SHADER_TARGET_MAJOR == 6 && __SHADER_TARGET_MINOR >= 5))
++// Alpha-tested instances (tree leaves, fences: material flag bit 12, threshold
++// at byte 124 of the 128-byte entry) are non-opaque: a candidate hit counts
++// only where the colour texture's alpha at its UV passes the game's test
++// (alpha > threshold), so light goes through the gaps between the leaves.
++bool srRtAlphaPass(uint id, uint prim, float2 bary)
++{
++    ByteAddressBuffer materials = g_RtBuffers[SR_RT_MATERIAL_INDEX];
++    uint4 m = materials.Load4(id * 128);
++    uint flags = materials.Load(id * 128 + 20);
++    if ((flags & (1u << 12)) == 0 || m.x == 0xFFFFFFFFu || m.y == 0xFFFFFFu)
++        return true;
++    ByteAddressBuffer pool = g_RtBuffers[SR_RT_UV_INDEX];
++    uint b = (m.x + prim * 3) * 32;
++    float w0 = 1.0 - bary.x - bary.y;
++    float4 a = asfloat(pool.Load4(b)) * w0 + asfloat(pool.Load4(b + 32)) * bary.x + asfloat(pool.Load4(b + 64)) * bary.y;
++    float4 xf = asfloat(materials.Load4(id * 128 + 32));
++    float2 uv = float2(a[m.z & 3u], a[(m.z >> 2) & 3u]) * xf.xy + xf.zw;
++    Texture2D<float4> tex = g_Texture2DDescriptorHeap[NonUniformResourceIndex(m.y & 0x7FFFu)];
++    SamplerState samp = g_SamplerDescriptorHeap[NonUniformResourceIndex((m.z >> 8) & 0xFFFFu)];
++    return tex.SampleLevel(samp, uv, 0.0).a > asfloat(materials.Load(id * 128 + 124));
++}
+ #endif
+ 
+ uint2 getTexture2DDimensions(Texture2D<float4> texture)

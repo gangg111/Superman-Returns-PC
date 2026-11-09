@@ -84,6 +84,12 @@ class PipelineCache {
   enum class Poll { kPending, kReady, kFailed };
   // Non-blocking: kReady moves the pipeline into `out`.
   Poll TryTake(uint64_t key, Microsoft::WRL::ComPtr<ID3D12PipelineState>& out);
+  // Startup precompilation: pipelines finished (compiled, failed or already
+  // made by the renderer) of `total`. Done when they are equal.
+  void StartupProgress(size_t& done, size_t& total);
+  // `count` more threads at normal priority that leave once the startup list
+  // is dispatched (the first start's progress screen).
+  void AddStartupThreads(unsigned count);
 
   // Builds the D3D12 description of a record (element storage in `elements`).
   static D3D12_GRAPHICS_PIPELINE_STATE_DESC MakeDesc(
@@ -92,7 +98,7 @@ class PipelineCache {
       std::vector<D3D12_INPUT_ELEMENT_DESC>& elements);
 
  private:
-  void Worker();
+  void Worker(bool startup_only = false);
 
   ID3D12Device* device_ = nullptr;
   ID3D12RootSignature* root_signature_ = nullptr;

@@ -32,6 +32,7 @@
 #include "shared_constants_cache.h"
 
 #include <array>
+#include <cstring>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -50,6 +51,8 @@
 #include "../graphics/guest/captured_batch.h"
 #include "../graphics/guest/texture_capture.h"
 #include "../graphics/guest/render_packet.h"
+#include "buffer_stock.h"
+#include "texture_heap.h"
 #include "pipeline_cache.h"
 #include "pm4_mirror.h"
 
@@ -64,6 +67,7 @@ class IGraphicsSystem;
 #include <vector>
 
 #include <rex/ui/d3d12/d3d12_api.h>
+#include <rex/ui/presenter.h>
 
 namespace rex::ui::d3d12 {
 class D3D12Presenter;
@@ -71,6 +75,8 @@ class D3D12Provider;
 }  // namespace rex::ui::d3d12
 
 namespace superman_returns::native {
+
+struct DecodedTexture;  // texture_decode.h
 
 bool Enabled();
 
@@ -281,6 +287,7 @@ class Renderer : public NativeFrontend {
   std::shared_ptr<graphics::guest::CaptureBatchPool> batch_pool_=std::make_shared<graphics::guest::CaptureBatchPool>();
   uint64_t batches_submitted_ = 0, batches_done_ = 0;
   uint64_t prev_swap_batches_ = 0;  // batches submitted up to the previous swap
+  uint64_t prev2_swap_batches_ = 0;  // and up to the one before (sr_native_worker_lag_frames 2)
   // Worker-side executors of the guest entry points.
   void ExecDrawVertices(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd);
   void ExecDrawIndexedVertices(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd);
@@ -328,8 +335,18 @@ class Renderer : public NativeFrontend {
   };
   bool SkipGpuDraw() const;
   int32_t RtDebugMode() const;
+  bool RtAbOldSwap() const;  // sr_rt_full_scene_hide_swap / sr_rt_ab_period: render as before
+  bool RtAbHidesVs(uint64_t vs) const;
+  bool RtAbAll() const;
+  static uint64_t RtXformKey(const float* t) {
+    uint64_t k = 0x2545F4914F6CDD1Dull;
+    for (int i = 0; i < 12; ++i) k = (k ^ uint64_t(int64_t(std::lround(double(t[i]) * 64.0)))) * 0x100000001B3ull;
+    return k;
+  }  // an A/B swap rendering everything as before (no sr_rt_ab_vs list)
   std::vector<int32_t> RtDebugModes() const;  // sr_rt_debug_modes  // sr_rt_shadow_debug, or this frame's step of sr_rt_shadow_debug_cycle
   uint64_t rt_measure_base_ = 0;  // first swap of the sr_rt_measure_at_s dumps
+  float rt_camera_[3] = {};  // the camera position (gViewInverse translation), for reflection rays
+  bool rt_camera_valid_ = false;
   float rt_frame_rows_[12] = {};  // light rows U, V, Z the frame's world reconstruction inverts
   bool ReadbackSubresource(
       ID3D12Resource* resource, D3D12_RESOURCE_STATES* state, uint32_t subresource,
@@ -369,6 +386,28 @@ class Renderer : public NativeFrontend {
   uint64_t overflow_pages_created_ = 0;
   size_t upload_peak_ = 0;
   bool Upload(size_t size, size_t alignment, UploadAlloc& out);
+  bool EnsureSkyMoon();  // uploads textures/sky_moon.dds once; true when it is in kSkyMoonSrv
+  Microsoft::WRL::ComPtr<ID3D12Resource> sky_moon_;
+  int sky_moon_state_ = 0;  // 0 not tried, 1 ready, -1 missing
+  // A 2D texture with mips into a fixed descriptor (static, uploaded once).
+  bool UploadStaticTexture(const DecodedTexture& tex, Microsoft::WRL::ComPtr<ID3D12Resource>& out, uint32_t srv);
+  // Open water ripples (patch 0035): textures/water/crest_wave_normals.dds
+  // (Crest's WaveNormals.png, MIT) once into kWaterNormalsSrv.
+  bool EnsureWaterNormals();
+  // Night rooms (patch 0036): Gaxil's room atlas once into kWindowAtlasSrv, and
+  // per material map its window map (textures/windows/<name>_win.dds) on demand.
+  bool EnsureWindowAtlas();
+  bool WindowMapFor(uint8_t* base, uint32_t dev, float out[4]);
+  const std::string* FetchSlotName(uint8_t* base, uint32_t dev, uint32_t slot);
+  Microsoft::WRL::ComPtr<ID3D12Resource> window_atlas_;
+  int window_atlas_state_ = 0;
+  struct WindowMap {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    uint32_t srv = 0, width = 0, height = 0;
+  };
+  std::unordered_map<std::string, WindowMap> window_maps_;  // srv 0: none for that texture
+  Microsoft::WRL::ComPtr<ID3D12Resource> water_normals_;
+  int water_normals_state_ = 0;  // 0 not tried, 1 ready, -1 missing
 
   // Host render target for a guest surface.
   struct HostSurface {
@@ -413,6 +452,8 @@ class Renderer : public NativeFrontend {
     uint32_t width = 0, height = 0;  // guest pixels
     uint32_t layers = 1;             // stacked destinations: one array slice per layer
     float scale = 1.0f;              // host pixels per guest pixel (source surface)
+    bool color_rt = false;           // drawable: the resolve exponent bias is applied in place
+    D3D12_CPU_DESCRIPTOR_HANDLE layer_rtvs[4] = {};  // color_rt: one view per layer (kept on recreation)
     bool shadow = false;             // resolved from a shadow map target
     uint32_t plain_srv = 0;          // default-mapped SRV (soft particles' scene depth)
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
@@ -478,11 +519,21 @@ class Renderer : public NativeFrontend {
   // Ray-traced sun shadows (docs/cienie-rt-projekt.md): fixed descriptors the
   // receivers address directly (SR_RT_FRAME_INDEX in XenosRecomp patch 0017).
   static constexpr uint32_t kRtFrameSrv = kSrvHeapSize - 2;
+  // Night street lamps: a hashed grid over x/z (kLampGridOffset, kLampCells cells of kLampSlots
+  // 16-bit lamp indices) and the lamps (kLampListOffset, xyz per 16 bytes); SR_LAMP_* in
+  // XenosRecomp's shader_common.h must match.
+  static constexpr uint32_t kLampCells = 32768, kLampMax = 16384;
+  static constexpr uint32_t kLampSlots = 16;  // lamps per cell (16-bit indices)
+  static constexpr uint32_t kLampGridOffset = 1312, kLampListOffset = kLampGridOffset + kLampCells * kLampSlots * 2;
+  static constexpr uint32_t kRtFrameBytes = kLampListOffset + kLampMax * 16;  // frame data, viewport, lamp grid
   static constexpr uint32_t kRtTlasSrv = kSrvHeapSize - 1;
   static constexpr uint32_t kRtMaterialSrv = kSrvHeapSize - 3;  // per TLAS instance (reflections)
   static constexpr uint32_t kRtUvSrv = kSrvHeapSize - 4;        // mesh texture coordinates (reflections)
   static constexpr uint32_t kRtSkinSrv0 = kSrvHeapSize - 5;  // character buffers 0 and 1 (-6)
-  static constexpr uint32_t kSrvAllocLimit = kSrvHeapSize - 6;
+  static constexpr uint32_t kSkyMoonSrv = kSrvHeapSize - 7;  // the sky's moon (textures/sky_moon.dds, patch 0034)
+  static constexpr uint32_t kWaterNormalsSrv = kSrvHeapSize - 8;  // Crest's wave normals (patch 0035 SR_WATER_NORMALS_INDEX)
+  static constexpr uint32_t kWindowAtlasSrv = kSrvHeapSize - 9;  // Gaxil's rooms (patch 0036 SR_WINDOW_ATLAS_INDEX)
+  static constexpr uint32_t kSrvAllocLimit = kSrvHeapSize - 9;
   static constexpr uint32_t kSamplerHeapSize = 2048;
   static constexpr uint32_t kRtvHeapSize = 256;
   static constexpr uint32_t kDsvHeapSize = 64;
@@ -525,7 +576,11 @@ class Renderer : public NativeFrontend {
   // EDRAM same-base reinterpretation (edram_alias.hlsl), one PSO per format.
   Microsoft::WRL::ComPtr<ID3D12RootSignature> alias_root_signature_;
   std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> alias_pipelines_;
+  // Resolve exponent bias (RB_COPY_DEST_INFO copy_dest_exp_bias): scales a
+  // region of a colour target in place by a power of two (exact in float).
+  std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> resolve_scale_pipelines_;
   bool ReinterpretSurface(HostSurface& dst, HostSurface& src);
+  bool ScaleResolveLayer(ResolveTexture& dst, uint32_t layer, const D3D12_RECT& rect, float factor);
   // FXAA graphics option (EXP-045): applied to the "Upscale" pass target when
   // the HUD pass starts, so the HUD stays sharp.
   void ApplyFxaa(HostSurface& target);
@@ -537,6 +592,7 @@ class Renderer : public NativeFrontend {
   Microsoft::WRL::ComPtr<ID3D12Resource> rt_frame_buffer_;
   D3D12_RESOURCE_STATES rt_frame_state_ = D3D12_RESOURCE_STATE_COMMON;
   uint64_t rt_frame_swap_ = ~0ull;
+  uint64_t lamp_view_swap_ = ~0ull;  // the frame whose view-projection the night lamps use
   // DXR scene (rt_shadows.cpp): step 2 holds one test cube.
   bool EnsureRtScene(const float inv_light[16]);
   Microsoft::WRL::ComPtr<ID3D12Device5> rt_device_;
@@ -545,9 +601,22 @@ class Renderer : public NativeFrontend {
       rt_instances_, rt_scratch_;
   bool rt_scene_ready_ = false;
   float rt_cube_center_[3] = {};
+  // Ocean waves (water.cpp): the open-water draw gets a dense disc of rings in
+  // the game's vertex format, which its vertex shader moves (g_SrWaterWaves).
+  bool IsOceanDraw() const;
+  float WaterWaveScale() const;
+  bool DrawOceanMesh();
+  // Physics reverse engineering (sr_water_probe_at_s, sr_water_watch): finds the
+  // water level in guest memory and logs the host code reading it.
+  void WaterProbe(uint8_t* base);
+  Microsoft::WRL::ComPtr<ID3D12Resource> ocean_vb_, ocean_ib_;
+  uint32_t ocean_index_count_ = 0, ocean_vb_size_ = 0;
+  bool ocean_failed_ = false;
   // City geometry (step 3): one BLAS per static mesh drawn by the game, one
   // TLAS instance per (mesh, world matrix) seen recently.
   struct BufferEntry;
+  void LodProbe(const float* m, uint32_t count, char kind, const float* bounds);
+  void LodDistanceApply(uint8_t* base);
   void RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd, const BufferEntry* ib,
                      uint32_t start_index, uint32_t index_count, int32_t base_vertex, bool strip);
   // Non-indexed instanced draws (the instance_transforms vertex shaders): many
@@ -576,6 +645,8 @@ class Renderer : public NativeFrontend {
     int32_t palette = -1, palette_interp = -1;
     uint32_t palette_comp = 0;
     float palette_scale = 0.0f;
+    // Alpha test of the draw (RB_COLORCONTROL, colour texture alpha > alpha_ref); -1 = none.
+    float alpha_ref = -1.0f;
   };
   bool RtDrawMaterial(int32_t captured_uv_interp, RtMaterial& out);
   struct RtMesh {
@@ -593,6 +664,8 @@ class Renderer : public NativeFrontend {
     uint64_t mesh = 0;
     float transform[12] = {};
     uint64_t first_swap = 0, last_swap = 0;
+    uint64_t vs = 0;     // the vertex shader of the draw that captured it (A/B by shader)
+    uint64_t xform = 0;  // hash of the transform alone (an alpha-tested copy hides the shadow pass's hull)
     uint8_t source = 0;  // 1 = indexed scene draw, 2 = shadow caster pass (Mobj), 4 = instanced draw
     RtMaterial material;  // from the last draw of it that had a colour texture
   };
@@ -605,7 +678,7 @@ class Renderer : public NativeFrontend {
                                     const char* semantic2 = nullptr, uint32_t index2 = 0, uint32_t components2 = 0);
   int32_t RtDrawUvInterp() const;
   bool RtSoBeginDraw();
-  void RtUploadMaterials(const void* data, size_t bytes);
+  bool RtUploadMaterials(const void* data, size_t bytes, size_t offset = 0);
   void RtUploadPalettes();
   // Material buffer (kRtMaterialSrv): 128-byte entries for every TLAS instance,
   // then the building palettes (16 x 8 float4 colours).
@@ -613,7 +686,7 @@ class Renderer : public NativeFrontend {
   void RtSoDraw(ID3D12PipelineState* pso, D3D12_GPU_VIRTUAL_ADDRESS dst, uint64_t bytes, bool indexed,
                 uint32_t count, uint32_t start, int32_t base_vertex);
   void RtCaptureUv(RtMesh& mesh, uint8_t* base, int32_t interp, int32_t palette_interp, bool indexed,
-                   uint32_t count, uint32_t start, int32_t base_vertex);
+                   uint32_t count, uint32_t start, int32_t base_vertex, uint32_t so_count = 0);
   uint64_t rt_uv_swap_ = 0;
   uint32_t rt_uv_this_frame_ = 0;
   Microsoft::WRL::ComPtr<ID3D12Resource> rt_uv_pool_, rt_material_buffer_;
@@ -634,12 +707,17 @@ class Renderer : public NativeFrontend {
   // all of them become one BLAS, instanced with the inverse light rows.
   struct RtSoTarget {  // render state of the draw the stream-output pass repeats
     uint32_t decl = 0, rt_count = 0;
+    // Content of the vertex declaration: the pipeline key. Its guest address
+    // differs per character instance, which compiled a new pipeline for each.
+    uint64_t decl_hash = 0;
     DXGI_FORMAT rtv[4] = {}, dsv = DXGI_FORMAT_UNKNOWN;
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
     ID3D12PipelineState* pso = nullptr;
   } rt_so_target_;
   void RtCaptureSkinned(uint8_t* base, uint32_t u, uint32_t v, uint32_t z, uint32_t start_index,
                         uint32_t index_count, int32_t base_vertex, uint32_t so_vertices);
+  void RtCaptureCape(uint8_t* base, bool indexed, uint32_t start, uint32_t count, int32_t base_vertex,
+                     uint32_t so_vertices);
   bool RtBuildSkinnedBlas();
   bool RtEnsureScratch(uint64_t size);
   std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> rt_so_pipelines_;
@@ -657,6 +735,11 @@ class Renderer : public NativeFrontend {
     uint32_t vertices;
     RtMaterial material;
     bool has_material;
+    // Superman's cape (RtCaptureCape): its soup holds the view vector, not the
+    // light-space position; this 3x4 maps it into light space for the build.
+    bool cape = false;
+    float to_light[12] = {};
+    uint64_t vs = 0;  // the draw's vertex shader (diagnostics, A/B by shader)
   };
   std::vector<RtSkinDraw> rt_so_pending_;  // this frame's character draws
   std::vector<RtSkinDraw> rt_skin_draws_;  // the ones the current character BLAS holds
@@ -666,6 +749,9 @@ class Renderer : public NativeFrontend {
   bool RtMakeIndexBuffer(const std::vector<uint32_t>& indices, RtMesh& mesh);
   std::unordered_map<uint64_t, RtMesh> rt_meshes_;
   std::unordered_map<uint64_t, RtInstance> rt_city_instances_;
+  // Keys of instances inserted in the last frames: moving objects get a new key
+  // every frame and are dropped from here after 3 (RtBuildCityTlas).
+  std::deque<std::pair<uint64_t, uint64_t>> rt_young_instances_;  // key, swap inserted
   Microsoft::WRL::ComPtr<ID3D12Resource> rt_city_tlas_, rt_build_scratch_;
   uint64_t rt_city_tlas_size_ = 0, rt_build_scratch_size_ = 0;
   uint64_t rt_builds_swap_ = 0;
@@ -673,7 +759,7 @@ class Renderer : public NativeFrontend {
   bool rt_city_ready_ = false;
   struct RtStats {
     uint64_t captured = 0, new_meshes = 0, skip_format = 0, skip_prim = 0, skip_budget = 0,
-             skip_skinned = 0, skinned_draws = 0, uv_meshes = 0, instanced_draws = 0, instanced_copies = 0, skip_instanced = 0;
+             skip_skinned = 0, skinned_draws = 0, cape_draws = 0, full_scene = 0, strip_meshes = 0, uv_meshes = 0, instanced_draws = 0, instanced_copies = 0, skip_instanced = 0;
   } rt_stats_;
   bool rt_scene_failed_ = false;
   bool ssao_ = false;
@@ -747,9 +833,14 @@ class Renderer : public NativeFrontend {
   std::unordered_map<uint64_t, std::unique_ptr<std::vector<uint8_t>>> shader_bytecode_;
   std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> pipelines_;
   PipelineCache pipeline_cache_;  // precompiled / recorded PSOs (EXP-044)
+  TextureHeap texture_heap_;  // game textures placed in pre-made heaps (texture_heap.h)
+  BufferStock buffer_stock_;      // buffers made ahead of the worker (buffer_stock.h)
   // Pipelines compiling asynchronously for draws that were skipped (EXP-053).
   std::unordered_set<uint64_t> async_pipelines_;
 
+  // Content names of the game's textures by SRV index (texture_replace.h names), for logs and
+  // per-texture companions (patch 0036 window maps).
+  std::vector<std::string> srv_names_;
   struct TextureEntry {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     uint32_t srv_index = 0;
@@ -764,6 +855,8 @@ class Renderer : public NativeFrontend {
     uint64_t hashed_frame = 0;
     // Write watch: page write sequence when the watch was armed.
     uint32_t watch_seq = 0;
+    // Its content changed with no write notification: hashed every frame.
+    bool unwatched_writer = false;
     uint32_t guest_format = 0;
     D3D12_RESOURCE_STATES debug_state = D3D12_RESOURCE_STATE_COMMON;  // frame dumps
   };
@@ -782,7 +875,11 @@ class Renderer : public NativeFrontend {
   void RetireSrvIndex(uint32_t index);
   void CopyDepthRegion(HostSurface& src, ResolveTexture& dst, uint32_t x1, uint32_t y1,
                        uint32_t x2, uint32_t y2, uint32_t dx, uint32_t dy);
-  std::vector<std::pair<uint64_t, uint32_t>> retired_srvs_;
+  std::deque<std::pair<uint64_t, uint32_t>> retired_srvs_;  // deque: AllocSrvIndex pops the front per draw
+  // Buffers holding a raw SRV for shader vertex fetch across frames
+  // (BindVertexStreams); unused ones give it back every 32 swaps.
+  std::vector<uint64_t> raw_srv_buffers_;
+  uint64_t raw_srv_sweep_swap_ = 0;
   std::unordered_map<uint64_t, TextureEntry> textures_;
   std::unordered_map<uint64_t, uint32_t> samplers_;
   std::unordered_map<uint64_t, HostSurface> surfaces_;
@@ -817,6 +914,41 @@ class Renderer : public NativeFrontend {
   rex::system::IGraphicsSystem* graphics_ = nullptr;
   uint64_t current_ps_hash_ = 0;
   uint64_t current_vs_hash_ = 0;
+
+  // The presenter's refresh callback of inline presents (EndFrameAndPresent).
+  bool CopyFrameToPresenter(rex::ui::Presenter::GuestOutputRefreshContext& context);
+  // First start (precompile_screen.cpp): the recorded pipelines are compiled on
+  // all cores before the game's first frame, behind a progress screen.
+  void RunPrecompileScreen();
+  void DrawPrecompileFrame(size_t done, size_t total);
+
+  // Frame pacing (frame_pacing.cpp): with sr_frame_pacing a present thread
+  // shows each frame once its GPU work is done, a period of the frame rate
+  // limit after the previous one; the worker only submits. SR_PRESENT_TIMES
+  // writes each frame's present and GPU end time.
+  bool PacedPresentActive() const;
+  // Worker, after submitting the frame's work (signalled at `fence`).
+  void QueuePacedPresent(uint64_t fence);
+  // Worker, before reusing frame slot `slot`: its present was issued.
+  void WaitPacedPresent(uint32_t slot);
+  void StopPresentThread();
+  void PresentThreadMain();
+  void RecordGpuEnd(uint32_t slot, uint64_t gpu_end_ticks);
+  struct PresentJob {
+    uint32_t slot = 0;
+    uint64_t fence = 0;
+    uint64_t serial = 0;
+    ID3D12Resource* output = nullptr;  // the slot's output target
+  };
+  std::thread present_thread_;
+  std::mutex present_mutex_;
+  std::condition_variable present_cv_;
+  std::deque<PresentJob> present_jobs_;
+  uint64_t present_jobs_queued_ = 0, present_jobs_done_ = 0;
+  uint64_t present_slot_job_[kFramesInFlight] = {};
+  bool present_stop_ = false;
+  int64_t present_qpc_[kFramesInFlight] = {};
+  float present_call_ms_[kFramesInFlight] = {};
 
   // DLSS (dlss.cpp): the scene is the colour surface resolved right after the
   // full-size depth resolve that ends the 3D draws (learned each frame); its
@@ -856,9 +988,73 @@ class Renderer : public NativeFrontend {
   // The draw without its vertex buffer address: a mesh rebuilt every frame in
   // a new buffer still has the same one (DlssPrevVsConstants).
   uint64_t dlss_draw_loose_key_ = 0;
-  std::unordered_set<uint64_t> dlss_prev_loose_, dlss_cur_loose_;
   std::array<uint32_t, 1024> cb_vs_cpu_{};  // the current VS constants as uploaded
-  std::unordered_map<uint64_t, std::array<uint32_t, 1024>> dlss_prev_consts_, dlss_cur_consts_;
+  // A frame's VS constants per draw key, for the next frame's motion vectors:
+  // arrays in a reused pool and a key list sorted once at the frame's end (a
+  // map node with 4 KB per draw, freed every frame, was a tenth of the worker).
+  // VS constants per draw key for the previous frame, in slots shared by
+  // both frames' stores: a draw whose constants did not change since the last
+  // frame (most of the city) refers to the previous frame's slot instead of
+  // copying 4 KB again.
+  struct DlssConstArena {
+    std::vector<std::array<uint32_t, 1024>> slots;
+    std::vector<uint64_t> frame;  // last frame a store referred to the slot
+    std::vector<uint32_t> free;
+    uint64_t current = 1;
+    uint32_t Take() {
+      if (free.empty()) {
+        slots.emplace_back();
+        frame.push_back(0);
+        return uint32_t(slots.size() - 1);
+      }
+      const uint32_t s = free.back();
+      free.pop_back();
+      return s;
+    }
+    // After the frame: the slots it did not refer to are free; the ones it
+    // did stay for the next frame (they are its previous constants).
+    void EndFrame() {
+      free.clear();
+      for (uint32_t s = uint32_t(slots.size()); s-- > 0;)
+        if (frame[s] != current) free.push_back(s);
+      ++current;
+    }
+  };
+  struct DlssConstStore {
+    std::vector<std::pair<uint64_t, uint32_t>> keys;  // key, arena slot (later writes win)
+    std::vector<uint64_t> loose;                       // loose keys seen
+    void Clear() {
+      keys.clear();
+      loose.clear();
+    }
+    void Put(DlssConstArena& arena, uint64_t key, uint64_t loose_key, const std::array<uint32_t, 1024>& v,
+             size_t bytes) {
+      const uint32_t slot = arena.Take();
+      std::memcpy(arena.slots[slot].data(), v.data(), bytes);  // the registers the shader reads
+      arena.frame[slot] = arena.current;
+      keys.emplace_back(key, slot);
+      loose.push_back(loose_key);
+    }
+    void PutSame(DlssConstArena& arena, uint64_t key, uint64_t loose_key, uint32_t slot) {
+      arena.frame[slot] = arena.current;
+      keys.emplace_back(key, slot);
+      loose.push_back(loose_key);
+    }
+    void Sort() {
+      std::stable_sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+      std::sort(loose.begin(), loose.end());
+    }
+    // The slot of the key's last write, or UINT32_MAX.
+    uint32_t Find(uint64_t key) const {
+      auto it = std::upper_bound(keys.begin(), keys.end(), key,
+                                 [](uint64_t k, const auto& e) { return k < e.first; });
+      if (it == keys.begin() || std::prev(it)->first != key) return UINT32_MAX;
+      return std::prev(it)->second;
+    }
+    bool HasLoose(uint64_t key) const { return std::binary_search(loose.begin(), loose.end(), key); }
+  };
+  DlssConstArena dlss_const_arena_;
+  DlssConstStore dlss_prev_store_, dlss_cur_store_;
   std::unordered_map<uint64_t, uint32_t> dlss_occurrence_;
   bool bound_motion_ = false;
   std::unique_ptr<DlssState, DlssDeleter> dlss_;
@@ -897,6 +1093,7 @@ class Renderer : public NativeFrontend {
   // Float constant buffers of the previous draw, reused while the mirror's
   // constants are unchanged (valid within one frame's upload ring).
   uint64_t cb_vs_version_ = 0, cb_ps_version_ = 0;
+  uint32_t cb_vs_regs_ = 256, cb_ps_regs_ = 256;  // registers written to the uploaded VS / PS constants
   D3D12_GPU_VIRTUAL_ADDRESS cb_vs_gpu_ = 0, cb_ps_gpu_ = 0;
   SharedConstantsCache shared_constants_cache_;
   // Per fetch slot: last fetch constant and its SRV index this frame.
@@ -928,6 +1125,8 @@ class Renderer : public NativeFrontend {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     uint32_t raw_srv = 0;
     uint64_t raw_srv_fence = 0;
+    uint64_t raw_srv_used = 0;  // swap of the last draw that read raw_srv
+    bool raw_srv_listed = false;  // in raw_srv_buffers_
     uint32_t address = 0, size = 0;
     uint32_t decl = 0, stride = 0, index_format = 0, phase = 0;
     uint32_t reset_index = UINT32_MAX;

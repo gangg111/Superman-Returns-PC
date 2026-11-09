@@ -1,6 +1,9 @@
 #include "input/gameinput_driver.h"
+#include "input/input_recorder.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -85,8 +88,24 @@ X_STATUS GameInputDriver::Setup() {
   return X_STATUS_SUCCESS;
 }
 
+namespace {
+std::atomic<int> g_connected_pads{0};
+std::atomic<int64_t> g_last_pad_use_ms{0};
+}  // namespace
+
+int ConnectedPads() { return g_connected_pads.load(std::memory_order_relaxed); }
+int64_t LastPadUseMs() { return g_last_pad_use_ms.load(std::memory_order_relaxed); }
+int64_t NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 void GameInputDriver::OnDevice(IGameInputDevice* device, bool connected) {
   std::lock_guard lock(mutex_);
+  struct Count {
+    std::vector<Pad>& pads;
+    ~Count() { g_connected_pads.store(int(pads.size()), std::memory_order_relaxed); }
+  } count{pads_};
   auto it = std::find_if(pads_.begin(), pads_.end(),
                          [device](const Pad& p) { return p.device == device; });
   if (connected && it == pads_.end()) {
@@ -126,6 +145,11 @@ X_RESULT GameInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) 
   if (SUCCEEDED(input_->GetCurrentReading(GameInputKindGamepad, pad->device, &reading)) &&
       reading) {
     ok = reading->GetGamepadState(&s);
+    // In use: a button, a trigger or a stick past its rest (the cursor hides).
+    if (ok && (s.buttons != 0 || s.leftTrigger > 0.2f || s.rightTrigger > 0.2f ||
+               std::fabs(s.leftThumbstickX) > 0.3f || std::fabs(s.leftThumbstickY) > 0.3f ||
+               std::fabs(s.rightThumbstickX) > 0.3f || std::fabs(s.rightThumbstickY) > 0.3f))
+      g_last_pad_use_ms.store(NowMs(), std::memory_order_relaxed);
     const uint64_t t = reading->GetTimestamp();
     if (t != pad->last_timestamp) {
       pad->last_timestamp = t;
@@ -148,6 +172,7 @@ X_RESULT GameInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) 
       out_state->gamepad.thumb_rx = Axis(s.rightThumbstickX);
       out_state->gamepad.thumb_ry = Axis(s.rightThumbstickY);
     }
+    RecordInputState(id, *out_state);
   }
   return X_ERROR_SUCCESS;
 }

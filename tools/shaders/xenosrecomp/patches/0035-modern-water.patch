@@ -1,0 +1,104 @@
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index af0ad5d..ecb05a7 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -1095,6 +1095,48 @@ float4 srWaterDisplaceImpl(float4 p, float4 m0, float4 m1, float4 m2, float t, f
+ // Rays below the horizon are lifted to graze it: they would only find the
+ // water itself.
+ static float3 g_srRtCameraPos = 0.0;  // water: the camera's world position
++// Patch 0035: the open water's small ripples from Crest's wave normal map
++// (wave-harmonic/crest, MIT: Textures/WaveNormals.png and its SampleNormalMaps,
++// OceanNormalMapping.hlsl), added to the game's own normal; the game's shading
++// stays. Crest's level of detail: the cascade scale is the camera height over
++// the water as a power of two (8 .. 512), cascade k is 2^k times that, the map
++// repeats every 40% of a cascade's scale, two copies scroll against each other
++// (directions v0, v1, speeds from the cascade's texel width), the next cascade's
++// copy is blended in across the cascade, strength 0.36. The host keeps the map
++// in descriptor SR_WATER_NORMALS_INDEX (kSrvHeapSize - 8) and enables this with
++// c201 = (strength scale, debug split pixel column or 0, -, 12345).
++#define SR_WATER_NORMALS_INDEX 32760
++float2 srCrestNormalPair(float2 xz, float t, float scale, float spd, uint s)
++{
++    const float2 v0 = float2(0.94, 0.34), v1 = float2(-0.85, -0.53);
++    float nstretch = 40.0 * scale / 100.0;
++    Texture2D<float4> tex = g_Texture2DDescriptorHeap[SR_WATER_NORMALS_INDEX];
++    return tex.Sample(g_SamplerDescriptorHeap[s], (v0 * t * spd + xz) / nstretch).xy * 2.0 - 1.0 +
++           tex.Sample(g_SamplerDescriptorHeap[s], (v1 * t * spd + xz) / nstretch).xy * 2.0 - 1.0;
++}
++float srCrestScrollSpeed(float scale, float texels)
++{
++    float texelWidth = scale / 96.0;  // grid width scale / (0.25 * 384 / 2), over the downsample factor 2
++    return pow(log(1.0 + texels * texelWidth) * 1.875, 1.4);
++}
++float2 srCrestNormals(float2 xz, float t, float3 camera, uint s)
++{
++    float level = clamp(max(abs(camera.y - 9.292) - 4.0, 0.0), 8.0, 1.99 * 256.0);
++    float scale = exp2(floor(log2(level)));
++    float lodF = clamp(log2(max(length(xz - camera.xz), 1.0) / (2.0 * scale)), 0.0, 6.0);
++    float lod = floor(lodF), alpha = lodF - lod;
++    float s0 = scale * exp2(lod);
++    float2 n = srCrestNormalPair(xz, t, s0, srCrestScrollSpeed(s0, 2.0), s);
++    if (alpha > 0.001)
++        n = lerp(n, srCrestNormalPair(xz, t, s0 * 2.0, srCrestScrollSpeed(s0, 4.0), s), alpha);
++    return 0.36 * n;
++}
++// The game's normal is r7.yzw after its normalisation (r7.w up): add the ripples' slope.
++#define srCrestWaterNormal(N, CFG, PX, S) \
++    if ((CFG).w == 12345.0 && ((CFG).y <= 0.0 || (PX) < (CFG).y)) { \
++        float2 srRipple = srCrestNormals(g_srRtPixelPos.xz, g_srWaterTime, g_srRtCameraPos, S) * (CFG).x; \
++        float3 srN = N; \
++        N = normalize(float3(srN.x + srRipple.x * srN.z, srN.y + srRipple.y * srN.z, srN.z)); }
+ #define srRtReflectWater(ENV, TC, CMD, SWAP) srRtReflectWaterImpl(ENV, TC, CMD, SWAP, g_SrWaterWaves)
+ float4 srRtReflectWaterImpl(float4 env, float3 texCoord, inout CubeMapData cubeMapData, bool swapRB, float waves)
+ {
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 7b0033a..1d27e63 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -1484,6 +1484,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         srWaterShader |= strcmp(reinterpret_cast<const char*>(constantTableData + constantInfo->name),
+                                 "gWaterSpec") == 0;
+     }
++    // The open water: gWaterSpec with the PCA wave maps (patch 0035).
++    srOceanShader = false;
++    for (uint32_t i = 0; i < constantTableContainer->constantTable.constants && srWaterShader; i++)
++    {
++        const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
++            constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
++        srOceanShader |= strcmp(reinterpret_cast<const char*>(constantTableData + constantInfo->name), "samp_pca0") == 0;
++    }
+     // The water vertex shader (constant gerstner_wave_amp; its Mobj and gTime
+     // name the object matrix and the time): ocean waves move its position.
+     srWaterVertexShader = false;
+@@ -2961,6 +2969,19 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                                "if (srRtDebug() == 14) oC0 = float4(g_srWinDebug, 1.0); "
+                                "else if (srRtDebug() == 15) oC0 = float4(dot(g_srMatMid.xyz, srK) / srKmax, dot(g_srMat.xyz, srK) / srKmax, 0.0, 1.0); } }\n";
+                     }
++                    // The open water (patch 0035): Crest's ripples on the game's
++                    // normal, right after the game normalises it (r7.yzw, r7.w up;
++                    // host constant c201, valid with w = 12345).
++                    if (srOceanShader)
++                    {
++                        static const char kAnchor[] = "r7.yzw = r7.zyw * r7.xxx;";
++                        const size_t at = out.find(kAnchor);
++                        if (at == std::string::npos)
++                            fmt::println(stderr, "XenosRecomp: open water: no normal anchor, ripples left out");
++                        else
++                            out.insert(at + sizeof(kAnchor) - 1,
++                                       " srCrestWaterNormal(r7.yzw, CONST_REL(201), iPos.x, samp_pca0_SamplerDescriptorIndex)");
++                    }
+                     // Day and night: the host's tint for colour the game's
+                     // lights do not reach (c200, valid with w = 12345).
+                     if (srDayNightTintShader && (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_COLOR0))
+diff --git a/XenosRecomp/shader_recompiler.h b/XenosRecomp/shader_recompiler.h
+index 3d73d7a..b9fc64c 100644
+--- a/XenosRecomp/shader_recompiler.h
++++ b/XenosRecomp/shader_recompiler.h
+@@ -63,6 +63,7 @@ struct ShaderRecompiler : StringBuffer
+     bool srShadowReceiverShader = false;
+     bool srWaterShader = false;  // gWaterSpec: ray-traced reflections from TEXCOORD4
+     bool srWaterVertexShader = false;
++    bool srOceanShader = false;  // the open water (gWaterSpec + samp_pca0): Crest ripples (patch 0035, c201)
+     bool srDayNightTintShader = false;  // sky, backdrop, water, sun flare: oC0.rgb *= c200 when tagged  // gerstner_wave_amp: ocean waves move its position input
+     bool srWindowShader = false;  // buildings (mat_map + Kenv): night window light from c201
+     bool srLampLitShader = false;

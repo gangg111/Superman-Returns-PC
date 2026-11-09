@@ -439,7 +439,7 @@ class Archive:
             raise NotImplementedError("compressed entry")
         return self.raw[e["offset"]:e["offset"] + e["zsize"]]
 
-    def build(self, replace=None, add=None):
+    def build(self, replace=None, add=None, suffix=None):
         """A new archive with the entries in `replace` ({name or hash bytes:
         data}) and the new ones in `add` ([(name, data, flags)], hashed by
         name) given new data.
@@ -447,7 +447,11 @@ class Archive:
         An archive with its TOC at the end (ui.AST) keeps its data where it is,
         the new data after it and the TOC after that. One with its TOC before
         the data (a screen's own archive) is laid out anew: header, TOC at its
-        place, then every entry's data in the original order."""
+        place, then every entry's data in the original order.
+
+        `suffix` (4 bytes) replaces the last four bytes of every hash: a
+        screen's files share them (its id), and a copy of a screen holding
+        other textures needs its own."""
         replace = dict(replace or {})
         unit = 1 << self.shift
         entries = [dict(e) for e in self.entries]
@@ -489,6 +493,9 @@ class Archive:
                             "offset": len(out), "zsize": len(d), "size": 0, "name": name})
             out += d
         pad(out)
+        if suffix is not None:
+            for e in entries:
+                e["hash"] = e["hash"][:4] + suffix
         toc = bytearray(self.prefix)
         for e in entries:
             if self.flag_w:

@@ -28,6 +28,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <string_view>
 
 #include <windows.h>
 
@@ -46,6 +47,11 @@ REXCVAR_DEFINE_INT32(sr_dlss, 0, "Superman Returns Native",
                      "NVIDIA DLSS on the 3D scene: 0 = off, 1 = DLAA (native resolution), 2 = Quality "
                      "(the scene at 2/3 of the output), 3 = Balanced (0.58), 4 = Performance (1/2)")
     .range(0, 4);
+REXCVAR_DEFINE_INT32(sr_dlss_preset, -1, "Superman Returns Native",
+                     "DLSS model preset: -1 = NVIDIA's recommended transformer per mode (K for DLAA, "
+                     "Quality and Balanced; M for Performance; L for Ultra Performance), 11 = K, 10 = J, "
+                     "13 = M, 12 = L for every mode, 0 = the library's default")
+    .range(-1, 13);
 REXCVAR_DEFINE_INT32(sr_dlss_debug, 0, "Superman Returns Native",
                      "DLSS debug: 1 = the motion vectors in place of the scene (red/green = x/y, 0.5 = "
                      "none, 8 render pixels = full; blue = the draw's own motion, else the camera's), "
@@ -56,6 +62,7 @@ REXCVAR_DEFINE_DOUBLE(sr_dlss_jitter_scale, 1.0, "Superman Returns Native",
     .range(-1.0, 1.0);
 
 namespace superman_returns::native {
+extern float g_dlss_mip_bias;  // native_renderer.cpp
 
 namespace {
 
@@ -217,10 +224,18 @@ static MotionStats g_motion_stats;
 D3D12_GPU_VIRTUAL_ADDRESS Renderer::DlssPrevVsConstants(bool& valid) {
   valid = false;
   if (!dlss_draw_key_ || !DlssMotionDraw()) return 0;
-  dlss_cur_consts_[dlss_draw_key_] = cb_vs_cpu_;
-  dlss_cur_loose_.insert(dlss_draw_loose_key_);
-  auto it = dlss_prev_consts_.find(dlss_draw_key_);
-  if (it == dlss_prev_consts_.end() && dlss_prev_loose_.count(dlss_draw_loose_key_)) {
+  const size_t vs_bytes = size_t(cb_vs_regs_) * 16;
+  const uint32_t prev_slot = dlss_prev_store_.Find(dlss_draw_key_);
+  const std::array<uint32_t, 1024>* prev_consts =
+      prev_slot != UINT32_MAX ? &dlss_const_arena_.slots[prev_slot] : nullptr;
+  // Not moved since the last frame (most of the city): this frame's entry is
+  // the previous frame's slot.
+  const bool same = prev_consts && std::memcmp(prev_consts->data(), cb_vs_cpu_.data(), vs_bytes) == 0;
+  if (same) dlss_cur_store_.PutSame(dlss_const_arena_, dlss_draw_key_, dlss_draw_loose_key_, prev_slot);
+  else dlss_cur_store_.Put(dlss_const_arena_, dlss_draw_key_, dlss_draw_loose_key_, cb_vs_cpu_, vs_bytes);
+  // Put may have grown the arena: the slot's address again.
+  if (prev_consts) prev_consts = &dlss_const_arena_.slots[prev_slot];
+  if (!prev_consts && dlss_prev_store_.HasLoose(dlss_draw_loose_key_)) {
     // A mesh rebuilt every frame in a new buffer (Superman's cape: cloth
     // simulated on the CPU, world-space vertices): its previous vertices are
     // gone. It moves with what carries it, which the camera follows, so it
@@ -231,7 +246,7 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::DlssPrevVsConstants(bool& valid) {
     return cb_vs_gpu_;
   }
   if (REXCVAR_GET(sr_dlss_debug)) {
-    if (it == dlss_prev_consts_.end()) {
+    if (!prev_consts) {
       ++g_motion_stats.unmatched;
       ++g_motion_stats.unmatched_vs[current_vs_hash_];
     } else {
@@ -239,10 +254,15 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::DlssPrevVsConstants(bool& valid) {
       ++g_motion_stats.matched_vs[current_vs_hash_];
     }
   }
-  if (it == dlss_prev_consts_.end()) return 0;
+  if (!prev_consts) return 0;
+  // The current constants serve as the previous ones, no second upload.
+  if (same) {
+    valid = true;
+    return cb_vs_gpu_;
+  }
   UploadAlloc prev;
   if (!Upload(4096, 256, prev)) return 0;
-  std::memcpy(prev.cpu, it->second.data(), 4096);
+  std::memcpy(prev.cpu, prev_consts->data(), vs_bytes);
   valid = true;
   return prev.gpu;
 }
@@ -280,6 +300,7 @@ void Renderer::DlssOnColorResolve(HostSurface& src) {
   const bool after_depth = dlss_depth_just_resolved_;
   dlss_depth_just_resolved_ = false;
   const int mode = REXCVAR_GET(sr_dlss);
+  if (!mode) g_dlss_mip_bias = 0.0f;
   if (!mode || dlss_scene_done_ || !after_depth || src.depth || src.samples != 1 || !src.resource ||
       !dlss_scene_depth_ || !dlss_scene_depth_->srv_index) {
     return;
@@ -304,13 +325,28 @@ void Renderer::DlssOnColorResolve(HostSurface& src) {
   const bool upscale = DlssSceneRatio() < 1.0f;
   const uint32_t out_w = upscale ? HostPx(src.width, render_scale_) : w;
   const uint32_t out_h = upscale ? HostPx(src.height, render_scale_) : h;
+  // Textures pick their mips for the output resolution, not the smaller scene (sr_texture_mip_bias).
+  const float bias = upscale && out_w > 0 ? std::log2(float(w) / float(out_w)) : 0.0f;
+  if (bias != g_dlss_mip_bias) REXLOG_INFO("dlss: texture mip bias {:.3f} (scene {} -> {})", bias, w, out_w);
+  g_dlss_mip_bias = bias;
 
   if (!s.initialized) {
     wchar_t module[MAX_PATH];
     GetModuleFileNameW(nullptr, module, MAX_PATH);
     const std::wstring dir = std::filesystem::path(module).parent_path().wstring();
+    // NGX's own log lines about the model (preset, version) go to our log, so
+    // which DLSS model really runs is on record.
+    NVSDK_NGX_FeatureCommonInfo info{};
+    info.LoggingInfo.LoggingCallback = [](const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
+      std::string_view m(message ? message : "");
+      if (m.find("reset") != m.npos || m.find("ersion") != m.npos || m.find("odel") != m.npos) {
+        while (!m.empty() && (m.back() == '\n' || m.back() == '\r')) m.remove_suffix(1);
+        REXLOG_INFO("dlss: ngx: {}", m);
+      }
+    };
+    info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
     NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init_with_ProjectID(
-        "6a0f5b5e-8a5c-4f8e-9d4c-5f2e1c3b7a90", NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", dir.c_str(), device_);
+        "6a0f5b5e-8a5c-4f8e-9d4c-5f2e1c3b7a90", NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", dir.c_str(), device_, &info);
     if (NVSDK_NGX_FAILED(r)) {
       REXLOG_ERROR("dlss: NGX init failed ({:08X}); is nvngx_dlss.dll next to the executable?", uint32_t(r));
       s.failed = true;
@@ -397,6 +433,20 @@ void Renderer::DlssOnColorResolve(HostSurface& src) {
                                   NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
                                   NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
                                   NVSDK_NGX_DLSS_Feature_Flags_AlphaUpscaling;
+    // The model: an explicit preset for every quality mode, so the transformer
+    // model is the one used whatever the driver's default is.
+    const int chosen = REXCVAR_GET(sr_dlss_preset);
+    const struct { const char* hint; unsigned recommended; } hints[] = {
+        {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_DLSS_Hint_Render_Preset_K},
+        {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality, NVSDK_NGX_DLSS_Hint_Render_Preset_K},
+        {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality, NVSDK_NGX_DLSS_Hint_Render_Preset_K},
+        {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, NVSDK_NGX_DLSS_Hint_Render_Preset_K},
+        {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance, NVSDK_NGX_DLSS_Hint_Render_Preset_M},
+        {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, NVSDK_NGX_DLSS_Hint_Render_Preset_L}};
+    for (const auto& h : hints)
+      NVSDK_NGX_Parameter_SetUI(s.params, h.hint, chosen < 0 ? h.recommended : unsigned(chosen));
+    // The preset of this mode (sr_dlss 1..4 = DLAA, Quality, Balanced, Performance).
+    const unsigned preset = chosen >= 0 ? unsigned(chosen) : mode == 4 ? 13u : 11u;
     NVSDK_NGX_Result r =
         NGX_D3D12_CREATE_DLSS_EXT(command_list_.Get(), 1, 1, &s.feature, s.params, &create);
     if (NVSDK_NGX_FAILED(r)) {
@@ -409,8 +459,9 @@ void Renderer::DlssOnColorResolve(HostSurface& src) {
     s.out_width = out_w;
     s.mode = mode;
     s.reset = true;
-    REXLOG_INFO("dlss: mode {} scene {}x{} -> {}x{} (scene format {})", mode, w, h, out_w, out_h,
-                uint32_t(src.view_format));
+    REXLOG_INFO("dlss: mode {} scene {}x{} -> {}x{} (scene format {}), preset {} ({})", mode, w, h, out_w, out_h,
+                uint32_t(src.view_format), preset ? char('A' + preset - 1) : '-',
+                preset >= 10 ? "transformer" : preset ? "other" : "library default");
   }
 
   // Motion vectors from the depth and the two cameras.
@@ -558,10 +609,10 @@ void Renderer::DlssOnColorResolve(HostSurface& src) {
 }
 
 void Renderer::DlssEndFrame() {
-  dlss_prev_consts_.swap(dlss_cur_consts_);
-  dlss_cur_consts_.clear();
-  dlss_prev_loose_.swap(dlss_cur_loose_);
-  dlss_cur_loose_.clear();
+  std::swap(dlss_prev_store_, dlss_cur_store_);
+  dlss_const_arena_.EndFrame();
+  dlss_prev_store_.Sort();
+  dlss_cur_store_.Clear();
   dlss_occurrence_.clear();
   if (REXCVAR_GET(sr_dlss_debug) && dlss_frame_ % 300 == 0 && g_motion_stats.matched + g_motion_stats.unmatched) {
     std::string top;

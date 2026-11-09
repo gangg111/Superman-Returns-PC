@@ -7,6 +7,7 @@
 #include <rex/logging.h>
 
 #include "input/gameinput_driver.h"
+#include "input/input_recorder.h"
 #include "input/rawinput_kbm_driver.h"
 
 REXCVAR_DEFINE_STRING(sr_input, "native", "Superman Returns",
@@ -22,6 +23,13 @@ std::unique_ptr<rex::system::IInputSystem> CreateInputSystem(bool tool_mode) {
     return rex::input::CreateDefaultInputSystem(tool_mode);
   }
   auto system = std::make_unique<rex::input::InputSystem>(nullptr);
+  // sr_input_replay: the recording is the only input.
+  if (auto replay = CreateReplayDriver()) {
+    system->AddDriver(std::move(replay));
+    system->AddDriver(std::make_unique<rex::input::nop::NopInputDriver>(nullptr, 1));
+    system->SetDeviceAssignment(std::make_unique<rex::input::SlotAssignment>());
+    return system;
+  }
   auto pads = std::make_unique<GameInputDriver>();
   if (pads->Setup() == X_STATUS_SUCCESS) system->AddDriver(std::move(pads));
   // Always present; it reports a device only while mnk_mode is on.
