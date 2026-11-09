@@ -2,7 +2,7 @@
 
 A native PC port of Superman Returns (Xbox 360). The game is built from your own copy of the game with the builder.
 
-![Superman Returns Builder](docs/builder.png)
+<img src="docs/builder.png" alt="Superman Returns Builder" width="602">
 
 ### Building the game
 
