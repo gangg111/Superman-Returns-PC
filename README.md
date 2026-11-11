@@ -2,6 +2,8 @@
 
 A native PC port of Superman Returns (Xbox 360). The game is built from your own copy of the game with the builder.
 
+> **Alpha version.** The port is still in development, so expect bugs. Please report every bug you find in [Issues](https://github.com/gangg111/Superman-Returns-PC/issues), with your CPU, GPU, a screenshot and the newest file from the `logs` folder next to `superman_returns.exe`.
+
 <p align="center"><img src="docs/builder.png" alt="Superman Returns Builder" width="592"></p>
 
 ### Building the game
