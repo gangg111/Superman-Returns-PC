@@ -42,6 +42,7 @@ class SupermanReturnsApp : public rex::ReXApp {
   // sr_renderer=native (docs/native-port-plan.md) uses the native renderer
   // when the build and the game profile allow it, else xenos.
   void OnPreSetup(rex::RuntimeConfig& config) override {
+    if (!user_data_note_.empty()) REXLOG_WARN("{}", user_data_note_);
     // Native Windows input: GameInput controllers, Raw Input keyboard and mouse.
     config.input_factory = REX_INPUT_BACKEND(superman_returns::input::CreateInputSystem);
     // Native Windows audio output (XAudio2) unless sr_audio_output=sdl.
@@ -153,6 +154,19 @@ class SupermanReturnsApp : public rex::ReXApp {
     superman_returns::WaitForPreviousInstance();
     if (paths.game_data_root.empty()) paths.game_data_root = superman_returns::DefaultGameDataRoot();
     superman_returns::MigrateLauncherSettings(paths.config_path);
+    // Saves: the runtime's default folder (Documents\superman_returns) when the
+    // game can write there, else a writable fallback (launcher_settings.h). An
+    // explicit user_data_root is left alone. Logged in OnPreSetup, once the log
+    // is open.
+    if (rex::cvar::Query<std::string>("user_data_root").empty()) {
+      const auto old_root = paths.user_data_root;
+      paths.user_data_root = superman_returns::WritableUserDataRoot(old_root, user_data_note_);
+      if (paths.user_data_root != old_root && rex::cvar::Query<std::string>("cache_root").empty())
+        paths.cache_root = paths.user_data_root / "cache";
+    }
   }
+
+ private:
+  std::string user_data_note_;
 };
 

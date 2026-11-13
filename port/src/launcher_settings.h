@@ -20,6 +20,16 @@ void MigrateLauncherSettings(const std::filesystem::path& config);
 // be written.
 bool SaveConfigSetting(const std::filesystem::path& config, const std::string& key, const std::string& value);
 
+// The folder for saves and achievements (`user_data` on entry: the runtime's
+// default, Documents\superman_returns). When the game cannot write there
+// (Windows' controlled folder access on Documents, a read-only or redirected
+// folder) the saves could not be made and the game asked to sign in, then
+// stopped at the save: falls back to %LOCALAPPDATA%\superman_returns, else to
+// user_data next to the executable, copying the saves already in the default
+// folder. Returns the folder to use; `note` says what was done (empty when the
+// default is writable).
+std::filesystem::path WritableUserDataRoot(const std::filesystem::path& user_data, std::string& note);
+
 // The options menu's "restart now": the executable started again with the same
 // command line (and this process's id in --sr_restart_wait_pid), then this game
 // closed as its window's close button does. False when nothing was started.

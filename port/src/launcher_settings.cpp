@@ -142,6 +142,44 @@ bool SaveConfigSetting(const std::filesystem::path& config, const std::string& k
   return bool(out);
 }
 
+namespace {
+
+// True when a file can be created in `dir` (made if missing). Controlled folder
+// access refuses exactly this, while reading the folder still works.
+bool CanWrite(const std::filesystem::path& dir) {
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  if (!std::filesystem::is_directory(dir, ec)) return false;
+  const HANDLE h = CreateFileW((dir / L".sr_write_test").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  CloseHandle(h);
+  return true;
+}
+
+}  // namespace
+
+std::filesystem::path WritableUserDataRoot(const std::filesystem::path& user_data, std::string& note) {
+  note.clear();
+  if (user_data.empty() || CanWrite(user_data)) return user_data;
+  std::vector<std::filesystem::path> fallbacks;
+  if (const char* local = std::getenv("LOCALAPPDATA")) fallbacks.push_back(std::filesystem::path(local) / "superman_returns");
+  fallbacks.push_back(ExeFolder() / "user_data");
+  for (const auto& dir : fallbacks) {
+    if (!CanWrite(dir)) continue;
+    // The saves made while the default folder was writable: copied once, never
+    // over a newer copy already in the fallback.
+    std::error_code ec;
+    std::filesystem::copy(user_data, dir,
+                          std::filesystem::copy_options::recursive | std::filesystem::copy_options::skip_existing, ec);
+    note = "saves: cannot write to " + user_data.string() + " (Windows controlled folder access?), using " +
+           dir.string() + (ec ? " (copying the old saves failed: " + ec.message() + ")" : "");
+    return dir;
+  }
+  note = "saves: cannot write to " + user_data.string() + " nor to any fallback folder; saving will fail";
+  return user_data;
+}
+
 void MigrateLauncherSettings(const std::filesystem::path& config) {
   const char* local = std::getenv("LOCALAPPDATA");
   if (!local) return;
