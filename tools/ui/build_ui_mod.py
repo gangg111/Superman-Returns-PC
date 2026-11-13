@@ -94,6 +94,8 @@ def key_texts():
     mouse = {"LMB": "Left Mouse", "RMB": "Right Mouse", "MMB": "Middle Mouse"}
     out = [("Label_ScrOptionsMenu", "OPTIONS"), ("Label_ScrKeysOpt", "KEYS MAPPING"),
            ("Label_ScrMouseOpt", "MOUSE OPTIONS"), ("KEYS_DEFAULTS", "DEFAULTS"), ("MouseOpt_Sens_Slider", "Mouse Sensitivity"),
+           ("Label_ScrTuningOpt", "DISPLAY TUNING"), ("TuningOpt_Brightness_Slider", "Brightness"),
+           ("TuningOpt_Contrast_Slider", "Contrast"),
            ("KEYS_PRESS", "PRESS A KEY..."), ("KEYNAME_NONE", "-"),
            ("KEYMOD_SHIFT", "Shift+"), ("KEYMOD_CTRL", "Ctrl+"), ("KEYMOD_ALT", "Alt+")]
     for title_key, title, page_rows in KEY_PAGES:
@@ -107,6 +109,7 @@ DISPLAY_SCREEN_PATH = "screens/misc/ScrDisplayOpt"
 OPTIONS_SCREEN_PATH = "screens/misc/ScrOptionsMenu"
 KEYS_SCREEN_PATH = "screens/misc/ScrKeysOpt"
 MOUSE_SCREEN_PATH = "screens/misc/ScrMouseOpt"
+TUNING_SCREEN_PATH = "screens/misc/ScrTuningOpt"
 # The mouse poll: the focus manager's first items looked at, and their parents up to the stage.
 MOUSE_ITEMS, MOUSE_DEPTH = 16, 6
 # The mouse poll's wait around a screen change (polls of 33 ms): until the new
@@ -199,6 +202,7 @@ def edit_main(data, const):
     code.set_member(("_global", "SCREEN"), "OPTIONS_MENU", OPTIONS_SCREEN_PATH)
     code.set_member(("_global", "SCREEN"), "KEYS_OPT", KEYS_SCREEN_PATH)
     code.set_member(("_global", "SCREEN"), "MOUSE_OPT", MOUSE_SCREEN_PATH)
+    code.set_member(("_global", "SCREEN"), "TUNING_OPT", TUNING_SCREEN_PATH)
     code.set_member(("_global", "ICON"), "GRAPHICS_OPT", ICON_PATH)
 
     # Every 100 ms: is a menu open? (FlowMgr.CurInterfaceState "IG" is the game,
@@ -1328,6 +1332,7 @@ OPTIONS_BUTTONS = [
     ("btn5", "Label_ScrDisplayOpt", "DISPLAY_OPT"),
     ("btn6", "Label_ScrKeysOpt", "KEYS_OPT"),
     ("btn7", "Label_ScrMouseOpt", "MOUSE_OPT"),
+    ("btn8", "Label_ScrTuningOpt", "TUNING_OPT"),
 ]
 
 
@@ -1405,7 +1410,7 @@ def make_options_menu(data, const):
         for button, key, _ in OPTIONS_BUTTONS:
             code.call_method(this + (button,), "SetWidth", [791])
             code.call_method(this + (button,), "SetText", [localized(key)])
-        for button in ("btn8", "btn9"):
+        for button in [b for b in ("btn8", "btn9") if b not in {o[0] for o in OPTIONS_BUTTONS}]:
             code.call_method(this + (button,), "disable")
             code.call_method(this + (button,), "hide")
         # the button the screen was left from, else the first
@@ -1513,6 +1518,25 @@ def make_mouse_screen(data, const):
     screen = m.character(2)
     srec, sitems = m.frame_items(screen)
     m.set_frame_items(srec, [it for it in sitems if m.placement_name(it) != "SoundFX"])
+    return m.write()
+
+
+def make_tuning_screen(data, const):
+    """Audio Options (already made to go back to OPTIONS) made into DISPLAY
+    TUNING: its Music slider is Brightness, its Sound FX slider Contrast (0..10
+    by 1, 5 unchanged) through the natives Get/SetBrightness and
+    Get/SetContrast (graphics_menu.cpp, sr_display_brightness and
+    sr_display_contrast), so the screen never sets the volume."""
+    m = apt_edit.MovieEdit(data, const)
+    for old, new in (("ScrAudioOpt", "ScrTuningOpt"), ("__Packages.ScrAudioOpt", "__Packages.ScrTuningOpt")):
+        m.rename_export(old, new)
+        m.c.rename(old, new)
+    for old, new in (("Label_ScrAudioOpt", "Label_ScrTuningOpt"),
+                     ("AudioOpt_Music_Slider", "TuningOpt_Brightness_Slider"),
+                     ("AudioOpt_SoundFX_Slider", "TuningOpt_Contrast_Slider"),
+                     ("GetMusicVol", "GetBrightness"), ("SetMusicVol", "SetBrightness"),
+                     ("GetSFXVol", "GetContrast"), ("SetSFXVol", "SetContrast")):
+        m.c.rename(old, new)
     return m.write()
 
 
@@ -2516,6 +2540,10 @@ def build(data_dir, out_dir):
     audio_data, audio_const = edit_game_options_screen(d[1], c[1], "ScrAudioOpt")
     add.append(("SCRMOUSEOPT", repack(inner, d, c, *make_mouse_screen(audio_data, audio_const), name="SCRMOUSEOPT"),
                 ENTRY_FLAGS))
+    inner, d, c = movie_of(ui, "SCRAUDIOOPT")
+    audio_data, audio_const = edit_game_options_screen(d[1], c[1], "ScrAudioOpt")
+    add.append(("SCRTUNINGOPT", repack(inner, d, c, *make_tuning_screen(audio_data, audio_const),
+                                       name="SCRTUNINGOPT"), ENTRY_FLAGS))
     inner, d, c = movie_of(ui, "SCRGAMEPLAYOPT")
     add.append(("SCRKEYSOPT", repack(inner, d, c, *make_keys_screen(d[1], c[1]), name="SCRKEYSOPT"), ENTRY_FLAGS))
     for cls_name, label_key, title_key, _, id_base, screen_rows, row_step in SCREENS:

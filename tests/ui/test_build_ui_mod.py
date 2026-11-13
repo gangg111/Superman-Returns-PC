@@ -60,8 +60,9 @@ def test_game_entries_untouched(built):
     # sensitivity slider, 2026-11-09), and HINTKEY0, the empty key of Keys Mapping's second
     # column (the user's request 2026-11-10), and 28 HINTPS<name> icons of the PlayStation pads
     # (the user's request 2026-11-11): the game's 31 hints less the 4 plain arrows and the question
-    # mark, plus the LB and RB names the hints also ask for
-    assert len(ui.entries) == len(orig.entries) + 5 + 111 + 1 + 1 + 1 + 28
+    # mark, plus the LB and RB names the hints also ask for, and SCRTUNINGOPT (Brightness and
+    # Contrast sliders, the user's request 2026-11-13)
+    assert len(ui.entries) == len(orig.entries) + 5 + 111 + 1 + 1 + 1 + 28 + 1
     for name in ('HINTPSA', 'HINTPSSTART', 'HINTPSRSTICK_UD', 'HINTPSLB'):
         assert ui.find(name) is not None, name
 
@@ -212,12 +213,15 @@ def test_options_menu(built):
     rows = {it['name']: it for it in m.frames(m.u32(screen + 16), m.u32(screen + 20))[0] if it['type'] == 3}
     # source: 58 + 38 * i, by hand
     assert [round(rows['btn%d' % i]['pos'][1], 2) for i in range(1, 7)] == [58.0, 96.0, 134.0, 172.0, 210.0, 248.0]
+    # DISPLAY TUNING, the eighth button (2026-11-13): 58 + 38 * 7, by hand
+    assert round(rows['btn8']['pos'][1], 2) == 324.0
     items = m.frames(*m.header()['frames'])[0]
     texts = []
     for it in items:
         if it['type'] == 8:
             texts += strings_pushed(m, it['code'])
     for t in ("'GAMEPLAY_OPT'", "'CONTROLLER_OPT'", "'AUDIO_OPT'", "'GRAPHICS_OPT'", "'DISPLAY_OPT'", "'KEYS_OPT'",
+              "'TUNING_OPT'", "'Label_ScrTuningOpt'",
               "'PAUSEMENU'", "'OptionsSelectedItem'", "'Label_ScrKeysOpt'"):
         assert t in texts, t
 
@@ -455,3 +459,31 @@ def test_sliders_and_icon_arrows_answer_the_mouse(built):
                        for t in strings_pushed(main, it['code']))
     for t in ("'mMaxValue'", "'mStepValue'", "'SetValue'", "'CheckArrows'", "'INACTIVE_ALPHA'", "'ACTIVE_ALPHA'"):
         assert t in texts, t
+
+
+def test_tuning_screen(built):
+    # DISPLAY TUNING (the user's request 2026-11-13, "suwakiem jasności i kontrastu"): Audio Options'
+    # movie with both sliders kept (apt.py dump of SCRAUDIOOPT: Music and SoundFX), Music through
+    # Get/SetBrightness, SoundFX through Get/SetContrast, no volume natives left
+    ui, text = built
+    m = movie(ui, 'SCRTUNINGOPT')
+    exports = [name for name, _ in m.header()['exports']]
+    assert 'ScrTuningOpt' in exports and 'ScrAudioOpt' not in exports
+    screen = m.characters()[2]
+    names = [it['name'] for it in m.frames(m.u32(screen + 16), m.u32(screen + 20))[0] if it['type'] == 3]
+    assert names == ['Music', 'SoundFX']
+    texts = ' | '.join(t for f in m.frames(*m.header()['frames']) for it in f if it.get('code')
+                       for t in strings_pushed(m, it['code']))
+    for t in ("'GetBrightness'", "'SetBrightness'", "'GetContrast'", "'SetContrast'",
+              "'TuningOpt_Brightness_Slider'", "'TuningOpt_Contrast_Slider'", "'Label_ScrTuningOpt'"):
+        assert t in texts, t
+    for t in ("'GetSFXVol'", "'SetSFXVol'", "'GetMusicVol'", "'SetMusicVol'"):
+        assert t not in texts, t
+    main = movie(ui, 'MAIN')
+    main_texts = [t for f in main.frames(*main.header()['frames']) for it in f if it.get('code')
+                  for t in strings_pushed(main, it['code'])]
+    assert "'screens/misc/ScrTuningOpt'" in main_texts
+    xml = text.data(text.find('INTERFACETEXT')).decode('utf-8-sig')
+    for key, value in (("Label_ScrTuningOpt", "DISPLAY TUNING"), ("TuningOpt_Brightness_Slider", "Brightness"),
+                       ("TuningOpt_Contrast_Slider", "Contrast")):
+        assert '<uitext id="%s" value="%s"/>' % (key, value) in xml

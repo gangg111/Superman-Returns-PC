@@ -182,6 +182,12 @@ REXCVAR_DEFINE_STRING(sr_native_dump_texture_addr, "", "Superman Returns Native"
                       "sr_native_dump_dir whenever it is (re)created");
 REXCVAR_DEFINE_BOOL(sr_native_gamma_ramp, true, "Superman Returns Native",
                     "Apply the guest display gamma ramp when presenting the front buffer");
+// DISPLAY TUNING (graphics_menu.cpp), applied to the whole frame when it is
+// presented (blit.hlsl), read every frame.
+REXCVAR_DEFINE_DOUBLE(sr_display_brightness, 1.0, "Superman Returns Native",
+                      "Brightness as display gamma: 1 unchanged, above 1 brighter (0.5..2)");
+REXCVAR_DEFINE_DOUBLE(sr_display_contrast, 1.0, "Superman Returns Native",
+                      "Contrast, black and white kept: 1 unchanged, above 1 more (0.5..1.5)");
 REXCVAR_DEFINE_INT32(sr_native_trace_swap, 0, "Superman Returns Native",
                      "Debug: trace the frame presented by this guest swap number");
 REXCVAR_DEFINE_BOOL(sr_native_debug_no_present, false, "Superman Returns Native",
@@ -8838,6 +8844,9 @@ void Renderer::EndFrameAndPresent(uint32_t front_buffer_address) {
       if (!GuestGammaRamp256(g)) std::memset(g, 0, 1024);
       for (uint32_t i = 0; i < 256; ++i) any |= g[i] != 0;
       g[256] = (any && REXCVAR_GET(sr_native_gamma_ramp)) ? 1 : 0;
+      const float tuning[2] = {float(std::clamp(REXCVAR_GET(sr_display_brightness), 0.5, 2.0)),
+                               float(std::clamp(REXCVAR_GET(sr_display_contrast), 0.5, 1.5))};
+      std::memcpy(g + 257, tuning, sizeof(tuning));
       command_list_->SetGraphicsRootConstantBufferView(1, gamma.gpu);
     }
     command_list_->SetPipelineState(blit_pipeline_.Get());

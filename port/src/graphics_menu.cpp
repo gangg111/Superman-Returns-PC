@@ -90,6 +90,11 @@ const std::vector<Row> kRows = {
     // MOUSE OPTIONS' slider (0..10): the mouse camera, read live by the Raw
     // Input driver. From 6x: the user found 6x (the old top) the slowest usable.
     {105, {"sr_mouse_sensitivity"}, {"6", "8", "10", "12", "15", "18", "22", "26", "30", "40", "50"}},
+    // DISPLAY TUNING's sliders (0..10, 5 unchanged): the presented frame
+    // (blit.hlsl), read every frame. Brightness is a display gamma, so black
+    // stays black; contrast keeps black, white and the average (blit.hlsl).
+    {106, {"sr_display_brightness"}, {"0.5", "0.6", "0.7", "0.8", "0.9", "1", "1.15", "1.3", "1.5", "1.75", "2"}},
+    {107, {"sr_display_contrast"}, {"0.5", "0.6", "0.7", "0.8", "0.9", "1", "1.1", "1.2", "1.3", "1.4", "1.5"}},
 };
 
 }  // namespace
@@ -211,6 +216,25 @@ extern "C" void GetMouseSensNative(PPCContext& ctx, uint8_t* base) {
 }
 extern "C" void SetMouseSensNative(PPCContext& ctx, uint8_t* base) {
   SetRow(105, ArgInt(ctx, base, 0));
+  sub_82686910(ctx, base);
+}
+
+// DISPLAY TUNING (the Audio screen's two sliders, its natives renamed):
+// GetBrightness/GetContrast() -> 0..10, SetBrightness/SetContrast(v).
+extern "C" void GetBrightnessNative(PPCContext& ctx, uint8_t* base) {
+  ctx.r3.u64 = uint32_t(RowIndex(*FindRow(106)));
+  sub_82698550(ctx, base);
+}
+extern "C" void SetBrightnessNative(PPCContext& ctx, uint8_t* base) {
+  SetRow(106, ArgInt(ctx, base, 0));
+  sub_82686910(ctx, base);
+}
+extern "C" void GetContrastNative(PPCContext& ctx, uint8_t* base) {
+  ctx.r3.u64 = uint32_t(RowIndex(*FindRow(107)));
+  sub_82698550(ctx, base);
+}
+extern "C" void SetContrastNative(PPCContext& ctx, uint8_t* base) {
+  SetRow(107, ArgInt(ctx, base, 0));
   sub_82686910(ctx, base);
 }
 
@@ -349,6 +373,10 @@ REX_HOOK_RAW(sub_822AF3E8) {
       {"MenuHintKey", &MenuHintKeyNative},
       {"GetMouseSens", &GetMouseSensNative},
       {"SetMouseSens", &SetMouseSensNative},
+      {"GetBrightness", &GetBrightnessNative},
+      {"SetBrightness", &SetBrightnessNative},
+      {"GetContrast", &GetContrastNative},
+      {"SetContrast", &SetContrastNative},
   };
   for (const auto& [name, func] : natives) {
     const uint32_t code = dispatcher->AllocateThunk(func, 0);
