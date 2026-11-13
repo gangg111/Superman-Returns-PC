@@ -17,3 +17,7 @@ A native PC port of Superman Returns (Xbox 360). The game is built from your own
 7. Start `superman_returns.exe` from that folder. Every setting is in the game's menus: pause menu (Esc) > OPTIONS.
 
 The finished game holds data from your own disc: it is for your private use only, do not share it.
+
+### Texture mods
+
+You can replace any texture, for example Superman's suit, with your own PNG. How to find a texture's name and where to put your file: [docs/MODS.md](docs/MODS.md).
