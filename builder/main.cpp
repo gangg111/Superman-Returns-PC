@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstdio>
 #include <fstream>
+#include <array>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -28,48 +29,165 @@ namespace {
 
 // --- words ------------------------------------------------------------------
 
-int g_lang = 0;  // 0 English, 1 Polish
+int g_lang = 0;  // kLangs: 0 English, 1 Polish, 2 Spanish, 3 German, 4 Italian
+constexpr const wchar_t* kLangs[] = {L"en", L"pl", L"es", L"de", L"it"};
+constexpr const wchar_t* kLangLabels[] = {L"EN", L"PL", L"ES", L"DE", L"IT"};
+constexpr int kLangCount = 5;
 
-const std::map<std::string, std::pair<const wchar_t*, const wchar_t*>> kWords = {
-    {"subtitle", {L"NATIVE PC PORT", L"NATYWNY PORT NA PC"}},
+const std::map<std::string, std::array<const wchar_t*, 5>> kWords = {
+    {"subtitle", {L"NATIVE PC PORT",
+                 L"NATYWNY PORT NA PC",
+                 L"PORT NATIVO PARA PC",
+                 L"NATIVER PC-PORT",
+                 L"PORT NATIVO PER PC"}},
     {"source", {L"Superman Returns (USA), Xbox 360: disc image (.iso) or game folder",
-                L"Superman Returns (USA), Xbox 360: obraz płyty (.iso) albo folder gry"}},
-    {"output", {L"Folder for the finished game", L"Folder na gotową grę"}},
-    {"choose", {L"Choose", L"Wybierz"}},
-    {"folder", {L"Folder", L"Folder"}},
-    {"build", {L"BUILD GAME", L"ZBUDUJ GRĘ"}},
-    {"cancel", {L"Cancel", L"Anuluj"}},
-    {"open", {L"Open folder", L"Otwórz folder"}},
-    {"none", {L"not chosen", L"nie wybrano"}},
-    {"checking", {L"checking…", L"sprawdzam…"}},
+               L"Superman Returns (USA), Xbox 360: obraz płyty (.iso) albo folder gry",
+               L"Superman Returns (USA), Xbox 360: imagen del disco (.iso) o carpeta del juego",
+               L"Superman Returns (USA), Xbox 360: Disc-Image (.iso) oder Spielordner",
+               L"Superman Returns (USA), Xbox 360: immagine del disco (.iso) o cartella del gioco"}},
+    {"output", {L"Folder for the finished game",
+               L"Folder na gotową grę",
+               L"Carpeta para el juego terminado",
+               L"Ordner für das fertige Spiel",
+               L"Cartella per il gioco finito"}},
+    {"choose", {L"Choose",
+               L"Wybierz",
+               L"Elegir",
+               L"Auswählen",
+               L"Scegli"}},
+    {"folder", {L"Folder",
+               L"Folder",
+               L"Carpeta",
+               L"Ordner",
+               L"Cartella"}},
+    {"build", {L"BUILD GAME",
+              L"ZBUDUJ GRĘ",
+              L"CREAR JUEGO",
+              L"SPIEL ERSTELLEN",
+              L"CREA GIOCO"}},
+    {"cancel", {L"Cancel",
+               L"Anuluj",
+               L"Cancelar",
+               L"Abbrechen",
+               L"Annulla"}},
+    {"open", {L"Open folder",
+             L"Otwórz folder",
+             L"Abrir carpeta",
+             L"Ordner öffnen",
+             L"Apri cartella"}},
+    {"none", {L"not chosen",
+             L"nie wybrano",
+             L"sin elegir",
+             L"nicht gewählt",
+             L"non scelto"}},
+    {"checking", {L"checking…",
+                 L"sprawdzam…",
+                 L"comprobando…",
+                 L"wird geprüft…",
+                 L"controllo…"}},
     // short: shown at the right of the source's label, which names the release
-    {"recognized", {L"recognized", L"rozpoznano"}},
-    {"not_game", {L"not an Xbox 360 game", L"to nie gra z Xbox 360"}},
-    {"wrong_release", {L"another release", L"inne wydanie"}},
-    {"step_check", {L"Checking the game", L"Sprawdzam grę"}},
-    {"step_port", {L"Writing the port", L"Zapisuję port"}},
-    {"step_game", {L"Copying the game", L"Kopiuję grę"}},
-    {"step_patch", {L"Making the menus", L"Tworzę menu"}},
-    {"step_textures", {L"Making the textures", L"Tworzę tekstury"}},
-    {"step_audio", {L"Converting the sounds", L"Konwertuję dźwięki"}},
-    {"textures", {L"Remastered textures", L"Odświeżone tekstury"}},
-    {"step_finish", {L"Finishing", L"Kończę"}},
-    {"done", {L"Done: the game is in ", L"Gotowe: gra jest w "}},
-    {"failed", {L"The build stopped: ", L"Budowa przerwana: "}},
-    {"cancelled", {L"cancelled", L"anulowano"}},
-    {"space", {L"not enough free space in the output folder", L"za mało wolnego miejsca w folderze docelowym"}},
-    {"missing", {L"the game has no ", L"w grze brakuje "}},
-    {"wrong_game", {L"a file differs from Superman Returns (USA): ", L"plik różni się od Superman Returns (USA): "}},
+    {"recognized", {L"recognized",
+                   L"rozpoznano",
+                   L"reconocido",
+                   L"erkannt",
+                   L"riconosciuto"}},
+    {"not_game", {L"not an Xbox 360 game",
+                 L"to nie gra z Xbox 360",
+                 L"no es un juego de Xbox 360",
+                 L"kein Xbox-360-Spiel",
+                 L"non è un gioco Xbox 360"}},
+    {"wrong_release", {L"another release",
+                      L"inne wydanie",
+                      L"otra edición",
+                      L"andere Version",
+                      L"altra edizione"}},
+    {"step_check", {L"Checking the game",
+                   L"Sprawdzam grę",
+                   L"Comprobando el juego",
+                   L"Spiel wird geprüft",
+                   L"Controllo del gioco"}},
+    {"step_port", {L"Writing the port",
+                  L"Zapisuję port",
+                  L"Escribiendo el port",
+                  L"Port wird geschrieben",
+                  L"Scrittura del port"}},
+    {"step_game", {L"Copying the game",
+                  L"Kopiuję grę",
+                  L"Copiando el juego",
+                  L"Spiel wird kopiert",
+                  L"Copia del gioco"}},
+    {"step_patch", {L"Making the menus",
+                   L"Tworzę menu",
+                   L"Creando los menús",
+                   L"Menüs werden erstellt",
+                   L"Creazione dei menu"}},
+    {"step_textures", {L"Making the textures",
+                      L"Tworzę tekstury",
+                      L"Creando las texturas",
+                      L"Texturen werden erstellt",
+                      L"Creazione delle texture"}},
+    {"step_audio", {L"Converting the sounds",
+                   L"Konwertuję dźwięki",
+                   L"Convirtiendo los sonidos",
+                   L"Sounds werden umgewandelt",
+                   L"Conversione dei suoni"}},
+    {"textures", {L"Remastered textures",
+                 L"Odświeżone tekstury",
+                 L"Texturas remasterizadas",
+                 L"Überarbeitete Texturen",
+                 L"Texture rimasterizzate"}},
+    {"step_finish", {L"Finishing",
+                    L"Kończę",
+                    L"Terminando",
+                    L"Abschluss",
+                    L"Completamento"}},
+    {"done", {L"Done: the game is in ",
+             L"Gotowe: gra jest w ",
+             L"Listo: el juego está en ",
+             L"Fertig: das Spiel ist in ",
+             L"Fatto: il gioco è in "}},
+    {"failed", {L"The build stopped: ",
+               L"Budowa przerwana: ",
+               L"La creación se detuvo: ",
+               L"Erstellung abgebrochen: ",
+               L"Creazione interrotta: "}},
+    {"cancelled", {L"cancelled",
+                  L"anulowano",
+                  L"cancelado",
+                  L"abgebrochen",
+                  L"annullato"}},
+    {"space", {L"not enough free space in the output folder",
+              L"za mało wolnego miejsca w folderze docelowym",
+              L"no hay espacio libre suficiente en la carpeta de destino",
+              L"nicht genug freier Speicher im Zielordner",
+              L"spazio libero insufficiente nella cartella di destinazione"}},
+    {"missing", {L"the game has no ",
+                L"w grze brakuje ",
+                L"al juego le falta ",
+                L"im Spiel fehlt ",
+                L"nel gioco manca "}},
+    {"wrong_game", {L"a file differs from Superman Returns (USA): ",
+                   L"plik różni się od Superman Returns (USA): ",
+                   L"un archivo no coincide con Superman Returns (USA): ",
+                   L"eine Datei weicht von Superman Returns (USA) ab: ",
+                   L"un file non corrisponde a Superman Returns (USA): "}},
     {"no_payload", {L"This builder has no port inside (the developer's build).",
-                    L"Ten kompilator nie ma w sobie portu (wersja deweloperska)."}},
+                   L"Ten kompilator nie ma w sobie portu (wersja deweloperska).",
+                   L"Este creador no lleva el port dentro (versión de desarrollo).",
+                   L"Dieser Builder enthält keinen Port (Entwicklerversion).",
+                   L"Questo builder non contiene il port (versione di sviluppo)."}},
     {"note", {L"The finished game holds data from your disc: for your own private use only.",
-              L"Gotowa gra zawiera dane z Twojej płyty: tylko do Twojego prywatnego użytku."}},
+             L"Gotowa gra zawiera dane z Twojej płyty: tylko do Twojego prywatnego użytku.",
+             L"El juego terminado contiene datos de tu disco: solo para tu uso privado.",
+             L"Das fertige Spiel enthält Daten von deiner Disc: nur für den privaten Gebrauch.",
+             L"Il gioco finito contiene dati del tuo disco: solo per uso privato."}},
 };
+
 
 std::wstring W(const std::string& key) {
   auto it = kWords.find(key);
   if (it == kWords.end()) return Widen(key);
-  return g_lang ? it->second.second : it->second.first;
+  return it->second[g_lang];
 }
 
 // A Failure's key ("missing:DATA/x.AST") in words.
@@ -171,7 +289,7 @@ struct App {
   Step step = Step::Check;
   double fraction = 0;
   std::wstring status;
-  RECT en{}, pl{};
+  RECT langs[5]{};  // the language buttons, kLangs' order
 };
 App g;
 
@@ -183,17 +301,22 @@ void LoadSettings() {
   std::wifstream in(SettingsPath());
   std::wstring line;
   while (std::getline(in, line)) {
-    if (line.rfind(L"lang=", 0) == 0) g_lang = line.substr(5) == L"pl";
+    if (line.rfind(L"lang=", 0) == 0)
+      for (int i = 0; i < kLangCount; ++i)
+        if (line.substr(5) == kLangs[i]) g_lang = i;
     if (line.rfind(L"source=", 0) == 0) g.source = line.substr(7);
     if (line.rfind(L"output=", 0) == 0) g.output = line.substr(7);
     if (line.rfind(L"textures=", 0) == 0) g.textures = line.substr(9) != L"0";
   }
-  if (!fs::exists(SettingsPath())) g_lang = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_POLISH;
+  if (!fs::exists(SettingsPath())) {
+    const LANGID ui = PRIMARYLANGID(GetUserDefaultUILanguage());
+    g_lang = ui == LANG_POLISH ? 1 : ui == LANG_SPANISH ? 2 : ui == LANG_GERMAN ? 3 : ui == LANG_ITALIAN ? 4 : 0;
+  }
 }
 
 void SaveSettings() {
   std::wofstream out(SettingsPath());
-  out << L"lang=" << (g_lang ? L"pl" : L"en") << L"\nsource=" << g.source.wstring() << L"\noutput="
+  out << L"lang=" << kLangs[g_lang] << L"\nsource=" << g.source.wstring() << L"\noutput="
       << g.output.wstring() << L"\ntextures=" << (g.textures ? L"1" : L"0") << L"\n";
 }
 
@@ -252,10 +375,12 @@ void Paint(HDC dc) {
   GetTextExtentPoint32W(dc, L"SUPERMAN RETURNS", 16, &ts);
   Text(dc, W("subtitle"), {pad + ts.cx + S(16), S(24), c.right, S(66)}, g.sub, kAccent,
        DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-  g.pl = {c.right - pad - S(28), S(28), c.right - pad, S(56)};
-  g.en = {g.pl.left - S(40), S(28), g.pl.left - S(8), S(56)};
-  Text(dc, L"EN", g.en, g.label, g_lang ? kMuted : kAccent, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-  Text(dc, L"PL", g.pl, g.label, g_lang ? kAccent : kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+  // the language buttons, the last at the right edge
+  for (int i = kLangCount - 1; i >= 0; --i) {
+    const LONG right = i == kLangCount - 1 ? c.right - pad : g.langs[i + 1].left - S(8);
+    g.langs[i] = {right - S(28), S(28), right, S(56)};
+    Text(dc, kLangLabels[i], g.langs[i], g.label, g_lang == i ? kAccent : kMuted, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+  }
   // the panel with the two fields
   Fill(dc, {pad, S(80), c.right - pad, S(322)}, kPanel);
   auto field = [&](int y, const std::wstring& label, const std::wstring& note, COLORREF note_color,
@@ -323,7 +448,8 @@ void Relabel() {
   SetWindowTextW(g.btn_build, W("build").c_str());
   SetWindowTextW(g.btn_cancel, W("cancel").c_str());
   SetWindowTextW(g.btn_open, W("open").c_str());
-  SetWindowTextW(g.wnd, g_lang ? L"Kompilator Superman Returns" : L"Superman Returns Builder");
+  static const wchar_t* const kTitles[] = {L"Superman Returns Builder", L"Kompilator Superman Returns", L"Creador de Superman Returns", L"Superman Returns Builder", L"Superman Returns Builder"};
+  SetWindowTextW(g.wnd, kTitles[g_lang]);
   EnableWindow(g.btn_build, g.has_pack && g.source_ok && !g.output.empty() && !g.building);
   InvalidateRect(g.wnd, nullptr, TRUE);
 }
@@ -419,6 +545,13 @@ HWND MakeButton(int id) {
                        reinterpret_cast<HMENU>(INT_PTR(id)), nullptr, nullptr);
 }
 
+// The point is on a language button (the hand cursor).
+bool OnLanguage(POINT p) {
+  for (int i = 0; i < kLangCount; ++i)
+    if (PtInRect(&g.langs[i], p)) return true;
+  return false;
+}
+
 LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
     case WM_CREATE: {
@@ -485,8 +618,11 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
       return TRUE;
     case WM_LBUTTONDOWN: {
       const POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-      if (!g.building && (PtInRect(&g.en, p) || PtInRect(&g.pl, p))) {
-        g_lang = PtInRect(&g.pl, p);
+      int lang = -1;
+      for (int i = 0; i < kLangCount; ++i)
+        if (PtInRect(&g.langs[i], p)) lang = i;
+      if (!g.building && lang >= 0) {
+        g_lang = lang;
         SaveSettings();
         Relabel();
         if (!g.source.empty()) CheckSource();
@@ -501,7 +637,7 @@ LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp) {
       POINT p;
       GetCursorPos(&p);
       ScreenToClient(wnd, &p);
-      if (LOWORD(lp) == HTCLIENT && (PtInRect(&g.en, p) || PtInRect(&g.pl, p) || PtInRect(&g.textures_hit, p))) {
+      if (LOWORD(lp) == HTCLIENT && (OnLanguage(p) || PtInRect(&g.textures_hit, p))) {
         SetCursor(LoadCursor(nullptr, IDC_HAND));
         return TRUE;
       }

@@ -410,6 +410,26 @@ REXCVAR_DEFINE_INT32(sr_rt_shadow_debug_cycle, 0, "Superman Returns Native",
                      "all four images; "
                      "0 = off")
     .range(0, 100000);
+REXCVAR_DEFINE_BOOL(sr_native_no_inline_rt, false, "Superman Returns Native",
+                    "Debug: behave as on a GPU without inline ray tracing (DXR 1.1, shader model "
+                    "6.5): pixel shaders from the pack's variants without RayQuery, no ray tracing")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// False on GPUs without DXR 1.1 / shader model 6.5 (GTX 10xx and older, many
+// integrated GPUs): the 6.5 pixel shaders (RayQuery shadow receivers, water)
+// fail pipeline creation there, so the pack's 6.0 variants replace them and
+// nothing is ray traced. Set once in Initialize, before any shader lookup.
+static bool g_inline_rt = true;
+static bool RtShadowsOn() { return g_inline_rt && REXCVAR_GET(sr_rt_shadows); }
+// DLSS can run here (NVIDIA RTX); cleared by dlss.cpp when NGX refuses.
+bool g_dlss_hardware = true;
+int SrDlssMode();  // dlss.cpp: sr_dlss, 0 without DLSS hardware
+
+// For the Graphics Options screen (graphics_menu.cpp): rows the GPU cannot use are greyed out.
+namespace superman_returns::native {
+bool InlineRayTracingSupported() { return g_inline_rt; }
+bool DlssSupported() { return g_dlss_hardware; }
+}  // namespace superman_returns::native
 REXCVAR_DEFINE_INT32(sr_native_shadow_quality, 4, "Superman Returns Native",
                      "Shadow map resolution multiplier (1 = original 1024, 2 = 2048, 4 = 4096)")
     .range(1, 4);
@@ -1319,7 +1339,7 @@ bool Renderer::EnsureInitialized() {
   // their resolution buys nothing there: at 4 they cost 6.3 ms of GPU time per
   // frame in the city flight (15.05 -> 8.75 ms at 1). Chosen at start: the
   // surfaces keep their scale, so RT shadows switched off later keep these maps.
-  if (REXCVAR_GET(sr_rt_shadows) && REXCVAR_GET(sr_rt_shadows_replace)) {
+  if (RtShadowsOn() && REXCVAR_GET(sr_rt_shadows_replace)) {
     shadow_scale_ = std::min(shadow_scale_,
                              float(std::clamp(REXCVAR_GET(sr_rt_shadow_map_quality), 1, 4)));
   }
@@ -1384,6 +1404,27 @@ bool Renderer::EnsureInitialized() {
     REXLOG_INFO("native: raytracing tier {:X} (1.1 = 11), highest shader model {:X}",
                 have5 ? uint32_t(options5.RaytracingTier) : 0u,
                 have_sm ? uint32_t(shader_model.HighestShaderModel) : 0u);
+    g_inline_rt = have5 && options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_1 && have_sm &&
+                  shader_model.HighestShaderModel >= D3D_SHADER_MODEL_6_5 &&
+                  !REXCVAR_GET(sr_native_no_inline_rt);
+    if (!g_inline_rt) {
+      REXLOG_WARN("native: no inline ray tracing on this GPU{}: shaders without RayQuery, ray "
+                  "tracing off",
+                  REXCVAR_GET(sr_native_no_inline_rt) ? " (sr_native_no_inline_rt)" : "");
+      shadow_scale_ = float(std::clamp(REXCVAR_GET(sr_native_shadow_quality), 1, 4));
+    }
+    // DLSS needs an NVIDIA RTX card (tensor cores): NVIDIA with DXR 1.1 is the
+    // closest test without starting NGX; NGX refusing later clears it too (dlss.cpp).
+    DXGI_ADAPTER_DESC1 adapter_desc{};
+    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) &&
+        SUCCEEDED(factory->EnumAdapterByLuid(device_->GetAdapterLuid(), IID_PPV_ARGS(&adapter)))) {
+      adapter->GetDesc1(&adapter_desc);
+    }
+    g_dlss_hardware = adapter_desc.VendorId == 0x10DE && g_inline_rt;
+    REXLOG_INFO("native: GPU vendor {:04X}, DLSS {}", adapter_desc.VendorId,
+                g_dlss_hardware ? "possible" : "unavailable");
   }
   queue_ = provider_->GetDirectQueue();
   if (REXCVAR_GET(sr_native_own_queue)) {
@@ -2848,13 +2889,13 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   if (len <= 0.0f) return;
   for (float& v : sun) v /= len;
   std::memcpy(rt_frame_inv_, inv, sizeof(rt_frame_inv_));
-  if (REXCVAR_GET(sr_rt_shadows)) {
+  if (RtShadowsOn()) {
     // Anchor of the city instance window: the first cascade's centre.
     float anchor[3];
     for (int r = 0; r < 3; ++r) anchor[r] = inv[r * 4] * 0.5f + inv[r * 4 + 1] * 0.5f + inv[r * 4 + 2] * 0.5f + inv[r * 4 + 3];
     RtBuildSkinnedBlas();
     RtBuildCityTlas(anchor);
-  } else {
+  } else if (g_inline_rt) {
     EnsureRtScene(inv);
   }
   UploadAlloc up;
@@ -2865,17 +2906,17 @@ void Renderer::UpdateRtFrame(uint8_t* base) {
   std::memcpy(&data[12], sun, 12);
   data[16] = uint32_t(RtDebugMode());
   data[17] = 1;
-  data[18] = (REXCVAR_GET(sr_rt_shadows) ? rt_city_ready_ : rt_scene_ready_) ? 1u : 0u;
+  data[18] = (RtShadowsOn() ? rt_city_ready_ : rt_scene_ready_) ? 1u : 0u;
   const float bias = float(REXCVAR_GET(sr_rt_shadow_bias));
   std::memcpy(&data[19], &bias, 4);
   const int32_t debug_mode = RtDebugMode();
-  data[20] = REXCVAR_GET(sr_rt_shadows) && REXCVAR_GET(sr_rt_shadows_replace) && (debug_mode == 0 || debug_mode == 5)
+  data[20] = RtShadowsOn() && REXCVAR_GET(sr_rt_shadows_replace) && (debug_mode == 0 || debug_mode == 5)
                  ? 1u : 0u;
   data[21] = uint32_t(REXCVAR_GET(sr_rt_shadow_rays));
   const float spread = float(std::tan(REXCVAR_GET(sr_rt_sun_angle) * 0.5 * 3.14159265358979 / 180.0));
   std::memcpy(&data[22], &spread, 4);
   // Reflections in the game view and in their own debug views (6 seen colour, 7 hit path, 8).
-  data[23] = REXCVAR_GET(sr_rt_shadows) && REXCVAR_GET(sr_rt_reflections) &&
+  data[23] = RtShadowsOn() && REXCVAR_GET(sr_rt_reflections) &&
                      (debug_mode == 0 || (debug_mode >= 6 && debug_mode <= 8))
                  ? 1u
                  : 0u;
@@ -3492,7 +3533,7 @@ constexpr uint64_t kCapeVs = 0x4536A1CD0C92C7C9ull;
 void Renderer::RtCaptureDraw(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd,
                              const BufferEntry* ib, uint32_t start_index, uint32_t index_count,
                              int32_t base_vertex, bool strip) {
-  if (!REXCVAR_GET(sr_rt_shadows)) return;
+  if (!RtShadowsOn()) return;
   static uint64_t calls = 0, no_receiver = 0, no_world = 0, no_pos = 0, bad_args = 0, last_diag = 0;
   ++calls;
   if (swap_number_ >= last_diag + 600) {
@@ -3860,7 +3901,7 @@ void Renderer::RtAddInstance(const RtInstance& instance) {
 // z' = c0.z + x*c1.y + z*c1.x), 4 = world = x*c0 + y*c1 + z*c2 + c3.
 void Renderer::RtCaptureInstanced(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd,
                                   uint32_t start_vertex, uint32_t vertex_count) {
-  if (!REXCVAR_GET(sr_rt_shadows)) return;
+  if (!RtShadowsOn()) return;
   const InstancedRegs* iend = std::end(kInstancedRegs);
   const InstancedRegs* iit = std::lower_bound(std::begin(kInstancedRegs), iend, current_vs_hash_,
                                               [](const InstancedRegs& e, uint64_t h) { return e.hash < h; });
@@ -4643,7 +4684,7 @@ bool Renderer::BindRenderTargets(uint8_t* base, uint32_t dev, DXGI_FORMAT rtv_fo
   // DLSS: the scene's draws also write the objects' motion (SV_Target4);
   // rt_count 5 tells GetPipeline (slot 4 is always R16G16_FLOAT).
   const D3D12_CPU_DESCRIPTOR_HANDLE* motion = nullptr;
-  if (rts[0] && REXCVAR_GET(sr_dlss) && dlss_scene_ && !dlss_scene_done_ &&
+  if (rts[0] && SrDlssMode() && dlss_scene_ && !dlss_scene_done_ &&
       rts[0]->resource.Get() == dlss_scene_ && rts[0]->samples == 1) {
     motion = DlssMotionTarget();
   }
@@ -4679,8 +4720,21 @@ bool Renderer::BindRenderTargets(uint8_t* base, uint32_t dev, DXGI_FORMAT rtv_fo
 // Order everywhere: sr_native_shader_dir (explicit loose files), the
 // pre-shader library (sr_native_preshaders), the embedded pack, the default
 // loose-file directory.
+// Without inline ray tracing a pixel shader's 6.0 variant (no RayQuery) comes first: the
+// library's and the pack's main entries of the RayQuery receivers are 6.5 and fail there.
+static bool NoRtVariant(uint64_t hash, bool vertex, const void** data, size_t* size) {
+  if (vertex || g_inline_rt || REXCVAR_GET(sr_native_ignore_pack)) return false;
+  const ShaderPackView& pack = EmbeddedShaderPack();
+  ShaderPackEntry e;
+  if (!pack.FindStage(hash, ShaderPackView::kStagePixelNoRt, e)) return false;
+  *data = pack.base() + e.offset;
+  *size = e.size;
+  return true;
+}
+
 bool PackShaderLookup(uint64_t hash, bool vertex, const void** data, size_t* size) {
   if (!REXCVAR_GET(sr_native_shader_dir).empty()) return false;
+  if (NoRtVariant(hash, vertex, data, size)) return true;
   if (const ShaderLibrary* lib = PreShaderLibrary()) {
     if (const PreShader* s = lib->Find(hash, vertex)) {
       *data = s->dxil.data();
@@ -4745,6 +4799,16 @@ const std::vector<uint8_t>* Renderer::LoadShader(uint64_t hash, bool vertex) {
   std::snprintf(name, sizeof(name), "%016llX.%s.dxil", (unsigned long long)hash,
                 vertex ? "vs" : "ps");
   std::unique_ptr<std::vector<uint8_t>> data;
+  if (const void* p; REXCVAR_GET(sr_native_shader_dir).empty()) {
+    size_t n = 0;
+    if (NoRtVariant(hash, vertex, &p, &n)) {
+      data = std::make_unique<std::vector<uint8_t>>(static_cast<const uint8_t*>(p),
+                                                    static_cast<const uint8_t*>(p) + n);
+      auto* result = data.get();
+      shader_bytecode_[hash] = std::move(data);
+      return result;
+    }
+  }
   const ShaderLibrary* lib =
       REXCVAR_GET(sr_native_shader_dir).empty() ? PreShaderLibrary() : nullptr;
   if (lib) {
@@ -7977,7 +8041,7 @@ void Renderer::ExecDrawVertices(uint8_t* base, const WorkBatch& batch, const Wor
     // The cloth comes as a list or a strip; stream output writes either as a list.
     const uint32_t so = topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP ? (vertex_count >= 3 ? (vertex_count - 2) * 3 : 0)
                                                                          : vertex_count - vertex_count % 3;
-    if (REXCVAR_GET(sr_rt_shadows)) RtCaptureCape(base, false, start_vertex, vertex_count, 0, so);
+    if (RtShadowsOn()) RtCaptureCape(base, false, start_vertex, vertex_count, 0, so);
   } else if (topology == D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST && !quads) {
     RtCaptureInstanced(base, batch, cmd, start_vertex, vertex_count);
   }

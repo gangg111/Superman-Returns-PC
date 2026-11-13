@@ -7,12 +7,16 @@
 #include <rex/logging.h>
 
 #include "input/gameinput_driver.h"
+#include "input/ps_pad_driver.h"
 #include "input/input_recorder.h"
 #include "input/rawinput_kbm_driver.h"
 
 REXCVAR_DEFINE_STRING(sr_input, "native", "Superman Returns",
                       "Input drivers: native (GameInput controllers, Raw Input keyboard and "
                       "mouse) or sdk (the SDK's SDL/XInput and SDL-event drivers)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_BOOL(sr_playstation_pads, true, "Superman Returns",
+                    "DualShock 4 and DualSense pads through SDL (ps_pad_driver.h), beside GameInput's Xbox pads")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace superman_returns::input {
@@ -32,12 +36,16 @@ std::unique_ptr<rex::system::IInputSystem> CreateInputSystem(bool tool_mode) {
   }
   auto pads = std::make_unique<GameInputDriver>();
   if (pads->Setup() == X_STATUS_SUCCESS) system->AddDriver(std::move(pads));
+  if (REXCVAR_GET(sr_playstation_pads)) {
+    auto ps = std::make_unique<PlayStationPadDriver>();
+    if (ps->Setup() == X_STATUS_SUCCESS) system->AddDriver(std::move(ps));
+  }
   // Always present; it reports a device only while mnk_mode is on.
   auto kbm = std::make_unique<RawInputKbmDriver>();
   if (kbm->Setup() == X_STATUS_SUCCESS) system->AddDriver(std::move(kbm));
   system->AddDriver(std::make_unique<rex::input::nop::NopInputDriver>(nullptr, 1));
   system->SetDeviceAssignment(std::make_unique<rex::input::SlotAssignment>());
-  REXLOG_INFO("input: native (GameInput, Raw Input)");
+  REXLOG_INFO("input: native (GameInput, SDL PlayStation pads, Raw Input)");
   return system;
 }
 

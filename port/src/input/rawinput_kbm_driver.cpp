@@ -382,6 +382,9 @@ void RawInputKbmDriver::OnCursorTimer() {
   // Strictly later: at the start neither was used and the cursor shows.
   const bool pad_last = ConnectedPads() > 0 && LastPadUseMs() > last_kbm_use_ms_.load(std::memory_order_relaxed);
   SetPadIcons(pad_last);
+  // Which pad's icons: kept while the keyboard and mouse are in use, so the
+  // next pad hint shows the pad the player had.
+  if (pad_last) SetPlayStationIcons(PlayStationPadLast());
   const bool hide = REXCVAR_GET(sr_hide_cursor_with_pad) && pad_last;
   if (window_ && pad_hides_cursor_.exchange(hide) != hide) {
     REXLOG_INFO("input: cursor {} (pads connected: {})", hide ? "hidden" : "shown", ConnectedPads());

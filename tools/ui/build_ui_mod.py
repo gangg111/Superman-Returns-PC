@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import apt  # noqa: E402
 import apt_edit  # noqa: E402
 import key_icons  # noqa: E402
+import ps_icons  # noqa: E402
 
 # The rows: (row name, label key, label, options key, options). A row's id is
 # its screen's id base plus its index; port/src/graphics_menu.cpp maps the ids
@@ -125,12 +126,19 @@ SLIDER_LEFT_END, SLIDER_RIGHT_END = 4550, 7000
 # scroll arrows of Moves List and Statistics, the page arrows of Keys Mapping.
 ARROW_HIT = 22
 # Keys Mapping's page row: at the title's height (rows' units: the first row's text
-# at stage y 274, the title at 154), the title centred at the row's x 495 (stage 640),
-# about 14 units a character (the user's screenshot 2026-11-09: 27 characters, 384 wide).
-KEY_TITLE_Y, KEY_TITLE_CENTER, KEY_TITLE_CHAR = 103, 495, 14.2
+# at stage y 274, the title at 154). The arrows' _x is in their own units, not the
+# row text's: stage x = 1.038 * _x + 223 (the user's screenshot 2026-11-10: arrows set
+# to 280 and 698 drawn at stage 514 and 948). The arrows stay put whatever the
+# title's length (the user 2026-11-10): the right one at the title bar's right end
+# (stage 952, where the user saw it), the left one mirrored about the stage's
+# centre (left edge at stage 319, the arrow ~9 wide); the longest title (2/3)
+# spans stage 388..895.
+KEY_TITLE_Y, KEY_ARROW_LEFT_X, KEY_ARROW_RIGHT_X = 103, 93, 702
 ICON_PATH = "artassets/MenuIcons/IconGraphicsOpt"
 # Gameplay Options' rows: 32.8 apart from the top one (X-Axis Inversion).
 ROW_X, ROW_FIRST_Y, ROW_STEP = -394.0, 222.85, 32.8
+# _alpha of a row the GPU cannot use (SettingsAdapter.GraphicsOptionAvailable() == 0)
+ROW_UNAVAILABLE_ALPHA = 35
 
 ENTRY_FLAGS = 272  # as the game's screens have them in ui.AST
 
@@ -797,6 +805,8 @@ def edit_main(data, const):
         none = code.branch_if_true()
         for arrow, press in (("mLeftArrow", 3), ("mRightArrow", 2)):
             skips = near_clip(lambda a=arrow: code.path(g_main, "srPageRow", a))
+            # turn the page even from a column (Keys Mapping's LEFT/RIGHT move between them)
+            code.set_member((g_main,), "srPageArrowClick", True)
             code.call_method((g_main, "SettingsAdapter"), "PressPad", [press])
             for s in skips:
                 code.land(s)
@@ -1083,6 +1093,11 @@ def edit_main(data, const):
         code.path(("r", 8), "srKeyRow")
         code.op("Not")
         not_key = code.branch_if_true()
+        # the column clicked: right of KEY_COL_SPLIT (the row's units, x - left
+        # over its scale r10) the second
+        code.set_member((g,), "srKeyClickCol", lambda: (
+            code.push(KEY_COL_SPLIT), code.push(("r", 3), ("r", 13)), code.op("Subtract"),
+            code.push(("r", 10)), code.op("Divide"), code.op("LessThan2")))
         code.call_method(sa, "PressPad", [1])
         key_done = code.branch()
         code.land(not_key)
@@ -1602,6 +1617,15 @@ def make_options_screen(data, const, cls_name, label_key, title_key, id_base, sc
                 code.push("|", 1), localized(k)(), code.push("split"), code.op("CallMethod"))])
             code.call_method(row, "SetIndex", [lambda i=i: code.call_method(
                 (g, "SettingsAdapter"), "GetGraphicsOption", [id_base + i], keep=True)])
+            # A row this GPU cannot use (ray tracing without DXR 1.1, DLSS without an
+            # RTX card): greyed out and disabled, the focus manager skips it as it
+            # skips the pause menu's hidden buttons.
+            code.call_method((g, "SettingsAdapter"), "GraphicsOptionAvailable", [id_base + i], keep=True)
+            usable = code.branch_if_true()
+            code.call_method(row, "disable")
+            code.set_member(row, "m_bEnabled", False)
+            code.set_member(row, "_alpha", ROW_UNAVAILABLE_ALPHA)
+            code.land(usable)
         code.end_method(body)
 
     def handle_input():
@@ -1755,10 +1779,16 @@ KEY_PAGES = [
         (13, "KEY_MOVE_RIGHT", "Move Right")]),
 ]
 KEY_ROWS = ["Key%d" % i for i in range(8)]
-# A key's icon in its row: centred between the Toggle's arrows (TOGGLE: right
-# arrow at 597.8, the left one mArrowWidth 200 before it, ~12 wide), on the
-# row's highlight bar (y -2.1, 32 high).
-KEY_ICON_X, KEY_ICON_Y = 482, 0
+# A binding's two keys (two columns, key_capture.h kKeySlotStride: the screen's
+# id of column c is binding + 32 * c): icons 32 wide in the row's units, the
+# first centred between the Toggle's arrows (right arrow at 597.8, the left one
+# mArrowWidth 200 before it), the second right of it where the user marked it
+# (2026-11-10), on the row's highlight bar (y -2.1, 32 high). A click left of
+# KEY_COL_SPLIT is the first column. The column not selected is dimmed, an
+# empty key (HintKey0) fainter still.
+KEY_ICON_X, KEY_ICON2_X, KEY_ICON_Y, KEY_COL_SPLIT = 482, 558, 0, 536
+KEY_SLOT_STRIDE = 32
+KEY_EMPTY_ALPHA, KEY_OTHER_COLUMN_PERCENT = 35, 45  # (the code pushes no floats)
 
 # --- BUTTONICON: keys instead of the pad's buttons --------------------------
 #
@@ -1875,6 +1905,24 @@ def define_set_icon(code):
         # the pad's icon (as the game's SetIcon)
         for b in to_pad:
             code.land(b)
+        # a PlayStation pad used last (SettingsAdapter.PadStyle 1): its icon,
+        # HintPs<name> (ps_icons.py), for the hints that have one
+        code.call_method((g, "SettingsAdapter"), "PadStyle", keep=True)
+        code.op("Not")
+        xbox = code.branch_if_true()
+        code.call_method((("r", 3),), "toUpperCase", keep=True)
+        code.set_register(4)
+        for name in ps_icons.ICONS:
+            code.push(("r", 4), name)
+            code.op("Equals2")
+            code.op("Not")
+            other = code.branch_if_true()
+            code.call_method((("r", 7),), "loadMovie", [lambda name=name: (
+                code.path(("r", 1), "mFilePath"), code.path(("r", 1), "mPlatform"), code.op("Add2"),
+                code.push("/HintPs" + name + ".swf"), code.op("Add2"))])
+            done.append(code.branch())
+            code.land(other)
+        code.land(xbox)
         code.call_method((("r", 7),), "loadMovie", [lambda: (
             code.path(("r", 1), "mFilePath"), code.path(("r", 1), "mPlatform"), code.op("Add2"),
             code.push("/Hint"), code.op("Add2"), code.push(("r", 3)), code.op("Add2"),
@@ -1893,6 +1941,11 @@ def define_set_icon(code):
         code.push(256)
         code.op("Multiply")
         code.call_method((g, "SettingsAdapter"), "MenuHintKey", [0], keep=True)
+        code.op("Add2")
+        # + PadStyle() * 512: the icons change between an Xbox and a PlayStation pad
+        code.call_method((g, "SettingsAdapter"), "PadStyle", keep=True)
+        code.push(512)
+        code.op("Multiply")
         code.op("Add2")
 
     def enter_frame():
@@ -2072,62 +2125,96 @@ def make_keys_screen(data, const):
         code.push(name)
         code.op("CallFunction")
 
-    def key_text(binding):
-        """Push the binding's first key as text: [Shift+][Ctrl+][Alt+]name, or
-        KEYNAME_NONE. Uses r3 (the code) and r4 (the text)."""
-        code.call_method((g, "SettingsAdapter"), "GetKeyBind", [binding], keep=True)
-        code.set_register(3)
+    # srSetRow(row, binding): this r1, _global r2, the row r3, the binding r4,
+    # a key's code r5, the text r6, an icon's clip r7
+    ROW, CODE, TEXT, CLIP = ("r", 3), ("r", 5), ("r", 6), ("r", 7)
+
+    def key_text():
+        """r6 = the first column's key (r5) as text: [Shift+][Ctrl+][Alt+]name,
+        or KEYNAME_NONE."""
         code.push("")
-        code.set_register(4)
+        code.set_register(6)
         for bit, key in ((0x100, "KEYMOD_SHIFT"), (0x200, "KEYMOD_CTRL"), (0x400, "KEYMOD_ALT")):
-            code.push(("r", 3), bit)
+            code.push(CODE, bit)
             code.op("BitwiseAnd")
             code.op("Not")
             skip = code.branch_if_true()
-            code.push(("r", 4))
+            code.push(TEXT)
             localized(key)()
             code.op("Add2")
-            code.set_register(4)
+            code.set_register(6)
             code.land(skip)
-        code.push(("r", 3), 255)
+        code.push(CODE, 255)
         code.op("BitwiseAnd")
         code.op("Not")
         # name: KEYNAME_<code & 255>, or KEYNAME_NONE when the code is 0
         zero = code.branch_if_true()
-        code.push(("r", 4))
+        code.push(TEXT)
         code.call_method((g, "LocalizationAdapter"), "GetLocalizedText", [lambda: (
-            code.push("KEYNAME_"), code.push(("r", 3), 255), code.op("BitwiseAnd"), code.op("Add2"))], keep=True)
+            code.push("KEYNAME_"), code.push(CODE, 255), code.op("BitwiseAnd"), code.op("Add2"))], keep=True)
         code.op("Add2")
+        code.set_register(6)
         joined = code.branch()
         code.land(zero)
         localized("KEYNAME_NONE")()
+        code.set_register(6)
         code.land(joined)
 
-    def key_icon(row):
-        """The key's icon (key_icons.py) in the row's value, between its arrows,
-        when the binding is one key without Shift/Ctrl/Alt; the text stays for
-        the others (and is emptied for the icon). Right after key_text: r3
-        still holds the binding's code; r4 is reused for the icon's clip."""
-        code.call_method(this + (row, "srKey"), "removeMovieClip")
-        code.push(("r", 3), 0xF00)
-        code.op("BitwiseAnd")
-        no_icon = code.branch_if_true()
-        code.push(("r", 3), 0)
-        code.op("Equals2")
-        none = code.branch_if_true()
-        code.call_method(this + (row,), "SetData", [lambda: code.array([""])])
-        code.call_method(this + (row,), "SetIndex", [0])
-        code.call_method(this + (row,), "createEmptyMovieClip", ["srKey", 100], keep=True)
-        code.set_register(4)
-        code.set_member((("r", 4),), "_x", KEY_ICON_X)
-        code.set_member((("r", 4),), "_y", KEY_ICON_Y)
-        code.call_method((("r", 4),), "loadMovie", [lambda: (
+    def key_icon(slot):
+        """Column `slot`'s key icon (key_icons.py) in the row: HintKey<code & 255>,
+        an empty key (HintKey0, fainter) when there is none. The first column
+        keeps the text instead for a key with Shift/Ctrl/Alt (and empties the
+        text for an icon). The column not selected (srCol) is dimmed."""
+        clip, x = ("srKey", KEY_ICON_X) if slot == 0 else ("srKey2", KEY_ICON2_X)
+        code.call_method((ROW, clip), "removeMovieClip")
+        no_icon = None
+        if slot == 0:
+            code.push(CODE, 0xF00)
+            code.op("BitwiseAnd")
+            no_icon = code.branch_if_true()
+            code.call_method((ROW,), "SetData", [lambda: code.array([""])])
+            code.call_method((ROW,), "SetIndex", [0])
+        code.call_method((ROW,), "createEmptyMovieClip", [clip, 100 + slot], keep=True)
+        code.set_register(7)
+        code.set_member((CLIP,), "_x", x)
+        code.set_member((CLIP,), "_y", KEY_ICON_Y)
+        code.call_method((CLIP,), "loadMovie", [lambda: (
             code.push("../common/ButtonHints/"),
             code.call_method((g, "GlobalAdapter"), "GetPlatform", keep=True), code.op("Add2"),
-            code.push("/HintKey"), code.op("Add2"), code.push(("r", 3)), code.op("Add2"),
-            code.push(".swf"), code.op("Add2"))])
-        code.land(none)
-        code.land(no_icon)
+            code.push("/HintKey"), code.op("Add2"), code.push(CODE, 255), code.op("BitwiseAnd"),
+            code.op("Add2"), code.push(".swf"), code.op("Add2"))])
+        code.set_member((CLIP,), "_alpha", 100)
+        code.push(CODE, 255)
+        code.op("BitwiseAnd")
+        has_key = code.branch_if_true()
+        code.set_member((CLIP,), "_alpha", KEY_EMPTY_ALPHA)
+        code.land(has_key)
+        code.path(("r", 1), "srCol")
+        code.push(slot)
+        code.op("Equals2")
+        selected = code.branch_if_true()
+        code.set_member((CLIP,), "_alpha", lambda: (
+            code.path(CLIP, "_alpha"), code.push(KEY_OTHER_COLUMN_PERCENT), code.op("Multiply"),
+            code.push(100), code.op("Divide")))
+        code.land(selected)
+        if no_icon is not None:
+            code.land(no_icon)
+
+    def set_row():
+        """A shown row's value: the first key as text (kept for Shift/Ctrl/Alt),
+        then both columns' icons."""
+        body = code.begin_method(["row", "binding"], registers=8)
+        code.call_method((g, "SettingsAdapter"), "GetKeyBind", [("r", 4)], keep=True)
+        code.set_register(5)
+        key_text()
+        code.call_method((ROW,), "SetData", [lambda: code.array([TEXT])])
+        code.call_method((ROW,), "SetIndex", [0])
+        key_icon(0)
+        code.call_method((g, "SettingsAdapter"), "GetKeyBind", [lambda: (
+            code.push(("r", 4), KEY_SLOT_STRIDE), code.op("Add2"))], keep=True)
+        code.set_register(5)
+        key_icon(1)
+        code.end_method(body)
 
     def refresh():
         body = code.begin_method(registers=5)
@@ -2138,20 +2225,18 @@ def make_keys_screen(data, const):
             code.op("Not")
             other = code.branch_if_true()
             code.call_method((g,), "SetScreenTitle", [localized(title_key)])
-            # the page arrows just outside this page's title
-            half = int(len(KEY_PAGES[p][1]) * KEY_TITLE_CHAR / 2)
-            code.set_member(this + ("srPageRow", "mLeftArrow"), "_x", KEY_TITLE_CENTER - half - 24)
-            code.set_member(this + ("srPageRow", "mRightArrow"), "_x", KEY_TITLE_CENTER + half + 12)
+            # the page arrows at the title bar's ends, the same on every page
+            code.set_member(this + ("srPageRow", "mLeftArrow"), "_x", KEY_ARROW_LEFT_X)
+            code.set_member(this + ("srPageRow", "mRightArrow"), "_x", KEY_ARROW_RIGHT_X)
             code.set_member(this, "srIds", lambda ids=[b for b, *_ in page_rows]: code.array(ids))
             for row, (binding, label_key, _) in zip(KEY_ROWS, page_rows):
                 code.call_method(this + (row,), "show")
                 code.call_method(this + (row,), "enable")
                 code.call_method(this + (row,), "SetLabel", [localized(label_key)])
-                code.call_method(this + (row,), "SetData", [lambda b=binding: code.array([lambda: key_text(b)])])
-                code.call_method(this + (row,), "SetIndex", [0])
-                key_icon(row)
+                code.call_method(this, "srSetRow", [lambda r=row: code.path(("r", 1), r), binding])
             for row in KEY_ROWS[len(page_rows):]:
                 code.call_method(this + (row, "srKey"), "removeMovieClip")
+                code.call_method(this + (row, "srKey2"), "removeMovieClip")
                 code.call_method(this + (row,), "disable")
                 code.call_method(this + (row,), "hide")
             # a hidden row selected (the page turned from a lower row): the first
@@ -2192,6 +2277,9 @@ def make_keys_screen(data, const):
         code.land(known)
         code.set_member(this, "srPage", lambda: code.path(g, "KeysPage"))
         code.set_member(this, "srCapturing", False)
+        code.set_member(this, "srCol", 0)
+        code.set_member((g,), "srPageArrowClick", False)
+        code.set_member((g,), "srKeyClickCol", None)
         # the rows' arrows never shown (LEFT/RIGHT turn the page, not a row's value;
         # the user 2026-11-09), the page row's always: their Show and Hide swapped
         for row in KEY_ROWS:
@@ -2270,11 +2358,28 @@ def make_keys_screen(data, const):
         code.push(False)
         code.op("Return")
         code.land(not_reset)
-        # LEFT / RIGHT: the previous / next page
-        for key, step in (("LEFT", len(KEY_PAGES) - 1), ("RIGHT", 1)):
+        # LEFT / RIGHT: the other column, past the last column the previous /
+        # next page (on the first column); a click on a page arrow
+        # (srPageArrowClick, MAIN's arrow_clicks) always turns the page
+        for key, step, edge in (("LEFT", len(KEY_PAGES) - 1, 0), ("RIGHT", 1, 1)):
             key_is(key)
             code.op("Not")
             other = code.branch_if_true()
+            code.path(g, "srPageArrowClick")
+            clicked = code.branch_if_true()
+            code.path(("r", 1), "srCol")
+            code.push(edge)
+            code.op("Equals2")
+            at_edge = code.branch_if_true()
+            code.set_member(this, "srCol", edge)
+            code.call_method((g,), "playSound", [lambda: code.path(g, "SOUND", "OPEN")])
+            code.call_method(this, "srRefresh")
+            code.push(False)
+            code.op("Return")
+            code.land(clicked)
+            code.land(at_edge)
+            code.set_member((g,), "srPageArrowClick", False)
+            code.set_member(this, "srCol", 0)
             code.set_member((g,), "KeysPage", lambda st=step: (
                 code.path(("r", 1), "srPage"), code.push(st), code.op("Add2"), code.push(len(KEY_PAGES)),
                 code.op("Modulo")))
@@ -2288,6 +2393,14 @@ def make_keys_screen(data, const):
         key_is("CROSS")
         code.op("Not")
         not_cross = code.branch_if_true()
+        # a mouse click: the column it was on (srKeyClickCol, MAIN's mouse poll)
+        code.path(g, "srKeyClickCol")
+        code.push(None)
+        code.op("Equals2")
+        no_click = code.branch_if_true()
+        code.set_member(this, "srCol", lambda: code.path(g, "srKeyClickCol"))
+        code.set_member((g,), "srKeyClickCol", None)
+        code.land(no_click)
         for i, row in enumerate(KEY_ROWS):
             code.call_method((g, "gFM"), "getSelectedItem", keep=True)
             code.push("_name")
@@ -2296,8 +2409,13 @@ def make_keys_screen(data, const):
             code.op("Equals2")
             code.op("Not")
             skip = code.branch_if_true()
+            # the selected column's key: binding + 32 * srCol
             code.call_method((g, "SettingsAdapter"), "BeginKeyCapture", [lambda i=i: (
-                code.path(("r", 1), "srIds"), code.push(i), code.op("GetMember"))])
+                code.path(("r", 1), "srIds"), code.push(i), code.op("GetMember"),
+                code.path(("r", 1), "srCol"), code.push(KEY_SLOT_STRIDE), code.op("Multiply"), code.op("Add2"))])
+            # the keys' icons off while the row asks for a key (they covered the text)
+            code.call_method(this + (row, "srKey"), "removeMovieClip")
+            code.call_method(this + (row, "srKey2"), "removeMovieClip")
             code.call_method(this + (row,), "SetData", [lambda: code.array([localized("KEYS_PRESS")])])
             code.call_method(this + (row,), "SetIndex", [0])
             code.set_member(this, "srCapturing", True)
@@ -2330,6 +2448,7 @@ def make_keys_screen(data, const):
         code.op("Pop")
         code.end_method(body)
 
+    code.set_member(proto, "srSetRow", set_row)
     code.set_member(proto, "srRefresh", refresh)
     code.set_member(proto, "srPoll", poll)
     code.set_member(proto, "InitGui", init_gui)
@@ -2412,6 +2531,9 @@ def build(data_dir, out_dir):
         inner, d, c = movie_of(ui, entry)
         replace[entry] = repack(inner, d, c, *edit_scroll_screen(d[1], c[1], sprite, cls_name))
     add += key_icons.entries(ui)
+    # the PlayStation pads' icons (HINTPS<name>), made as the keys' (a hint movie with a 128 x 128 texture)
+    hint_flags = ui.find("HINTA")["flags"]
+    add += [(name, key_icons.hint_entry(ui, name, image), hint_flags) for name, image in ps_icons.icons()]
     with open(os.path.join(out_dir, "ui_sr.AST"), "wb") as f:
         f.write(ui.build(replace=replace, add=add))
 

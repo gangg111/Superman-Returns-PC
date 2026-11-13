@@ -92,6 +92,25 @@ const std::vector<Row> kRows = {
     {105, {"sr_mouse_sensitivity"}, {"6", "8", "10", "12", "15", "18", "22", "26", "30", "40", "50"}},
 };
 
+}  // namespace
+
+namespace superman_returns::native {
+bool InlineRayTracingSupported();
+bool DlssSupported();
+}  // namespace superman_returns::native
+
+namespace {
+
+// False for a row the GPU cannot use: the screen greys it out and skips it, and
+// it reads as its first choice (Off). The RT rows need DXR 1.1 (inline ray
+// tracing), DLSS an NVIDIA RTX card.
+bool RowAvailable(int32_t id) {
+  using namespace superman_returns::native;
+  if (id >= 0 && id <= 3) return InlineRayTracingSupported();
+  if (id == 4) return DlssSupported();
+  return true;
+}
+
 const Row* FindRow(int32_t id) {
   for (const Row& row : kRows)
     if (row.id == id) return &row;
@@ -148,12 +167,20 @@ std::filesystem::path ConfigPath() {
 }
 
 extern "C" void GetGraphicsOption(PPCContext& ctx, uint8_t* base) {
-  const Row* row = FindRow(ArgInt(ctx, base, 0));
-  ctx.r3.u64 = uint32_t(row ? RowIndex(*row) : 0);
+  const int32_t id = ArgInt(ctx, base, 0);
+  const Row* row = FindRow(id);
+  ctx.r3.u64 = uint32_t(row && RowAvailable(id) ? RowIndex(*row) : 0);
+  sub_82698550(ctx, base);
+}
+
+// GraphicsOptionAvailable(id) -> 1, or 0 when this GPU cannot use the row.
+extern "C" void GraphicsOptionAvailableNative(PPCContext& ctx, uint8_t* base) {
+  ctx.r3.u64 = RowAvailable(ArgInt(ctx, base, 0)) ? 1 : 0;
   sub_82698550(ctx, base);
 }
 
 void SetRow(int32_t id, int32_t index) {
+  if (!RowAvailable(id)) return;
   if (const Row* row = FindRow(id)) {
     const std::string value = row->values[std::clamp(index, 0, int(row->values.size()) - 1)];
     const size_t x = value.find('x');
@@ -187,11 +214,14 @@ extern "C" void SetMouseSensNative(PPCContext& ctx, uint8_t* base) {
   sub_82686910(ctx, base);
 }
 
-// Keys Mapping (input/key_capture.h): GetKeyBind(i) -> the binding's first key
-// (code | 0x100 Shift | 0x200 Ctrl | 0x400 Alt), BeginKeyCapture(i),
+// Keys Mapping (input/key_capture.h): GetKeyBind(i + 32 * column) -> that key of
+// the binding (code | 0x100 Shift | 0x200 Ctrl | 0x400 Alt), BeginKeyCapture(the same id),
 // KeyCaptureActive() -> 1 while waiting for a key, CancelKeyCapture().
 extern "C" void GetKeyBindNative(PPCContext& ctx, uint8_t* base) {
-  ctx.r3.u64 = uint32_t(superman_returns::input::KeyBindCode(ArgInt(ctx, base, 0)));
+  // id: binding + kKeySlotStride * column (Keys Mapping's two columns)
+  using namespace superman_returns::input;
+  const int32_t id = ArgInt(ctx, base, 0);
+  ctx.r3.u64 = id < 0 ? 0u : uint32_t(KeyBindCode(id % kKeySlotStride, id / kKeySlotStride));
   sub_82698550(ctx, base);
 }
 extern "C" void BeginKeyCaptureNative(PPCContext& ctx, uint8_t* base) {
@@ -239,6 +269,11 @@ extern "C" void MenuHintKeyNative(PPCContext& ctx, uint8_t* base) {
 }
 extern "C" void KbmActiveNative(PPCContext& ctx, uint8_t* base) {
   ctx.r3.u64 = superman_returns::input::PadIcons() ? 0 : 1;
+  sub_82698550(ctx, base);
+}
+// PadStyle() -> 1 when a pad's hints show PlayStation icons, 0 Xbox's.
+extern "C" void PadStyleNative(PPCContext& ctx, uint8_t* base) {
+  ctx.r3.u64 = superman_returns::input::PlayStationIcons() ? 1 : 0;
   sub_82698550(ctx, base);
 }
 
@@ -296,6 +331,7 @@ REX_HOOK_RAW(sub_822AF3E8) {
   const std::pair<const char*, PPCFunc*> natives[] = {
       {"GetGraphicsOption", &GetGraphicsOption},
       {"SetGraphicsOption", &SetGraphicsOption},
+      {"GraphicsOptionAvailable", &GraphicsOptionAvailableNative},
       {"RestartGame", &RestartGameNative},
       {"GetKeyBind", &GetKeyBindNative},
       {"BeginKeyCapture", &BeginKeyCaptureNative},
@@ -309,6 +345,7 @@ REX_HOOK_RAW(sub_822AF3E8) {
       {"PressPad", &PressPadNative},
       {"MenuMouseLog", &MenuMouseLogNative},
       {"KbmActive", &KbmActiveNative},
+      {"PadStyle", &PadStyleNative},
       {"MenuHintKey", &MenuHintKeyNative},
       {"GetMouseSens", &GetMouseSensNative},
       {"SetMouseSens", &SetMouseSensNative},

@@ -154,6 +154,8 @@ def icons():
     """[(entry name, image)]: every key the bindings know, and the moving mouse."""
     out = [("HINTKEY%d" % code, key_image(name)) for code, name in key_names.sdk_key_names()]
     out.append(("HINTKEYMOUSE", mouse_image("move")))
+    # code 0: an empty key, Keys Mapping's column without a key
+    out.append(("HINTKEY0", key_image("")))
     return out
 
 

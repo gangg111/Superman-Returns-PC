@@ -3,12 +3,14 @@ superman_returns.exe as an RCDATA resource, see port/CMakeLists.txt SR_NATIVE;
 reader: port/src/native_renderer/shader_pack.h).
 
 Ported from crazyriddler/rexglue-native-kit @136bc6c4, tools/shaders/pack_shaders.py;
-unchanged apart from this docstring.
+stage 2 (<hash>.ps.nort.dxil, build_catalog.compile_no_rt) added for GPUs without
+inline ray tracing.
 usage: pack_shaders.py <dxil_dir> <out.pak>
 
 Format (little-endian):
   'CNSH' u32 version(1) u32 count
-  count x { u64 hash, u32 stage (0 = vs, 1 = ps), u32 offset, u32 size }  sorted by (hash, stage)
+  count x { u64 hash, u32 stage (0 = vs, 1 = ps, 2 = ps without RayQuery), u32 offset, u32 size }
+  sorted by (hash, stage)
   data"""
 import os
 import re
@@ -18,9 +20,9 @@ import sys
 src, out = sys.argv[1], sys.argv[2]
 entries = []
 for name in os.listdir(src):
-    m = re.fullmatch(r'([0-9A-F]{16})\.(vs|ps)\.dxil', name)
+    m = re.fullmatch(r'([0-9A-F]{16})\.(vs|ps\.nort|ps)\.dxil', name)
     if m:
-        entries.append((int(m.group(1), 16), 0 if m.group(2) == 'vs' else 1, name))
+        entries.append((int(m.group(1), 16), {'vs': 0, 'ps': 1, 'ps.nort': 2}[m.group(2)], name))
 entries.sort()
 header = struct.pack('<4sII', b'CNSH', 1, len(entries))
 table_size = len(entries) * 20

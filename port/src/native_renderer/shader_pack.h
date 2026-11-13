@@ -4,7 +4,7 @@
 // unit-tested without the game (tests/native).
 //
 // Little-endian: 'CNSH' u32 version(1) u32 count, then count x
-// {u64 hash, u32 stage (0 = vs, 1 = ps), u32 offset, u32 size} sorted by
+// {u64 hash, u32 stage (0 = vs, 1 = ps, 2 = ps without RayQuery), u32 offset, u32 size} sorted by
 // (hash, stage), then the DXIL blobs. Entries are 20 bytes and unaligned:
 // read with memcpy, never as an aligned struct.
 #pragma once
@@ -57,7 +57,15 @@ class ShaderPackView {
   // Binary search over (hash, stage). Entries whose blob would lie outside the
   // pack are treated as missing.
   bool Find(uint64_t hash, bool vertex, ShaderPackEntry& out) const {
-    const uint32_t stage = vertex ? 0 : 1;
+    return FindStage(hash, vertex ? kStageVertex : kStagePixel, out);
+  }
+
+  static constexpr uint32_t kStageVertex = 0, kStagePixel = 1;
+  // Pixel shader compiled for shader model 6.0 without RayQuery, for GPUs
+  // without inline ray tracing (only for pixel shaders whose main entry is 6.5).
+  static constexpr uint32_t kStagePixelNoRt = 2;
+
+  bool FindStage(uint64_t hash, uint32_t stage, ShaderPackEntry& out) const {
     uint32_t lo = 0, hi = count_;
     while (lo < hi) {
       const uint32_t mid = lo + (hi - lo) / 2;

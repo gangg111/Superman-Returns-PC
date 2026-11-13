@@ -136,6 +136,19 @@ def shader_profile(kind: str, src: str) -> str:
     return "ps_6_0" if kind == "ps" else "vs_6_0"
 
 
+# Variant of a ps_6_5 shader for GPUs without inline ray tracing (GTX 10xx and older,
+# many integrated GPUs): the same standalone HLSL as ps_6_0, where shader_common.h's
+# srRtVisibility and the reflection rays compile to their no-RayQuery stubs.
+# Packed as stage 2 (pack_shaders.py), chosen by the renderer when the device lacks
+# DXR 1.1 or shader model 6.5.
+NO_RT_SUFFIX = ".nort.dxil"
+
+
+def compile_no_rt(dxc, std_src, out):
+    return run([str(dxc), "-T", "ps_6_0", "-HV", "2021", "-all-resources-bound",
+                "-Wno-ignored-attributes", "-Qstrip_debug", str(std_src), "-Fo", str(out)])
+
+
 def run(cmd, timeout=120):
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -207,6 +220,12 @@ def process(s, a, dirs):
         res["failure"] = "dxc: " + first_error(err + out)
         return res
     res["dxil_size"] = dx.stat().st_size
+    if prof == "ps_6_5":
+        rc, out, err = compile_no_rt(a.dxc, std_src, dirs["dxil"] / f"{stem}{NO_RT_SUFFIX}")
+        if rc != 0:
+            (dirs["logs"] / f"{stem}.nort.log").write_text(err + out)
+            res["failure"] = "dxc ps_6_0 (no RT): " + first_error(err + out)
+            return res
     if spec:
         lib = dirs["dxil"] / f"{stem}.lib.dxil"
         lib_prof = "lib_6_5" if prof == "ps_6_5" else "lib_6_3"  # RayQuery receivers

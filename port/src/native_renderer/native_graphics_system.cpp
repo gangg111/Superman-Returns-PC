@@ -110,8 +110,12 @@ bool ResolveLauncherGpu() {
       return rex::cvar::SetFlagByName("d3d12_adapter", std::to_string(index));
     }
   }
-  REXLOG_ERROR("native graphics: selected launcher GPU {} is unavailable", text);
-  return false;
+  // A LUID lasts only until the next restart of Windows or of the driver: an
+  // old one in the settings file must not stop the game (the user 2026-11-11:
+  // the game did not start the morning after). The automatic GPU then.
+  REXLOG_WARN("native graphics: selected launcher GPU {} is no longer present (a LUID changes after a restart); "
+              "using the automatic GPU", text);
+  return true;
 }
 }  // namespace
 

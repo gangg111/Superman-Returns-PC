@@ -61,6 +61,7 @@ const char* NameOf(int vk) {
 }
 
 std::atomic<int> g_target{-1};         // binding being captured, -1 none
+std::atomic<int> g_slot{0};            // its column
 std::atomic<int> g_held{0};            // the captured key, muted until let go
 std::atomic<int64_t> g_started_ms{0};
 
@@ -123,11 +124,13 @@ void ResetKeyBinds() {
   REXLOG_INFO("keys: all bindings back to the defaults");
 }
 
-void BeginKeyCapture(int index) {
-  if (index < 0 || index >= kKeyBindCount) return;
+void BeginKeyCapture(int id) {
+  const int index = id % kKeySlotStride, slot = id / kKeySlotStride;
+  if (id < 0 || index >= kKeyBindCount || slot >= kKeySlots) return;
   g_started_ms.store(NowMs());
+  g_slot.store(slot);
   g_target.store(index);
-  REXLOG_INFO("keys: press a key for {}", kKeyBindCvars[index]);
+  REXLOG_INFO("keys: press a key for {} (key {})", kKeyBindCvars[index], slot + 1);
 }
 
 bool KeyCaptureActive() { return g_target.load() >= 0; }
@@ -136,11 +139,11 @@ void CancelKeyCapture() {
   if (g_target.exchange(-1) >= 0) REXLOG_INFO("keys: capture cancelled");
 }
 
-int KeyBindCode(int index) {
-  if (index < 0 || index >= kKeyBindCount) return 0;
+int KeyBindCode(int index, int slot) {
+  if (index < 0 || index >= kKeyBindCount || slot < 0) return 0;
   const auto tokens = Tokens(rex::cvar::GetFlagByName(kKeyBindCvars[index]));
-  if (tokens.empty()) return 0;
-  std::string_view t = tokens[0];
+  if (size_t(slot) >= tokens.size()) return 0;
+  std::string_view t = tokens[slot];
   int mods = 0;
   for (size_t plus; (plus = t.find('+')) != std::string_view::npos && plus > 0;) {
     const std::string_view head = t.substr(0, plus);
@@ -176,9 +179,11 @@ bool OfferCapturedKey(int vk) {
   REXLOG_INFO("keys: offered VK 0x{:02X} ({})", vk, name ? name : "no name, still waiting");
   if (!name) return true;  // no name the bindings know: keep waiting
   if (g_target.exchange(-1) != index) return false;
+  const int slot = g_slot.load();
   g_held.store(vk);
   // The key leaves every other binding (two pad buttons on one key would
-  // press both), then becomes this one's only key.
+  // press both), then becomes this one's key in the captured column; the
+  // other column keeps its key (dropped when it was this same key).
   // Action (X, 2) and Superpower (right trigger, 7) may share a key: the Raw
   // Input driver presses Action with it, Superpower while Target Lock is held.
   auto partners = [](int a, int b) { return (a == 2 && b == 7) || (a == 7 && b == 2); };
@@ -197,8 +202,16 @@ bool OfferCapturedKey(int vk) {
     if (removed) Set(kKeyBindCvars[i], kept);
   }
   // Shared with its partner: the partner keeps the key, this binding gets it too.
-  Set(kKeyBindCvars[index], name);
-  REXLOG_INFO("keys: {} = {}", kKeyBindCvars[index], name);
+  auto keys = Tokens(rex::cvar::GetFlagByName(kKeyBindCvars[index]));
+  keys.resize(std::max<size_t>(keys.size(), kKeySlots));
+  for (auto& k : keys)
+    if (k == name) k.clear();
+  keys[slot] = name;
+  std::string value;
+  for (const auto& k : keys)
+    if (!k.empty()) value += (value.empty() ? "" : ",") + k;
+  Set(kKeyBindCvars[index], value);
+  REXLOG_INFO("keys: {} = {}", kKeyBindCvars[index], value);
   return true;
 }
 
@@ -226,6 +239,14 @@ void SetPadIcons(bool pad) {
   if (g_pad_icons.exchange(pad) != pad) REXLOG_INFO("input: button icons {}", pad ? "of the pad" : "of the keys");
 }
 bool PadIcons() { return g_pad_icons.load(); }
+namespace {
+std::atomic<bool> g_playstation_icons{false};
+}
+void SetPlayStationIcons(bool playstation) {
+  if (g_playstation_icons.exchange(playstation) != playstation)
+    REXLOG_INFO("input: pad icons of {}", playstation ? "PlayStation" : "Xbox");
+}
+bool PlayStationIcons() { return g_playstation_icons.load(); }
 
 // The cursor in the stage: the 1280x720 menus drawn to fit the window's client
 // area (letterboxed when its aspect differs).

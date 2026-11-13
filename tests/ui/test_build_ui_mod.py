@@ -57,8 +57,13 @@ def test_game_entries_untouched(built):
     # source: the recipe adds SCRGRAPHICSOPT, SCRDISPLAYOPT, SCROPTIONSMENU, SCRKEYSOPT and ICONGRAPHICSOPT,
     # and a HINTKEY<code> icon for each of key_names.py's 111 keys plus HINTKEYMOUSE
     # (len(key_names.sdk_key_names()) printed 2026-11-09: 111), and SCRMOUSEOPT (the user's mouse
-    # sensitivity slider, 2026-11-09)
-    assert len(ui.entries) == len(orig.entries) + 5 + 111 + 1 + 1
+    # sensitivity slider, 2026-11-09), and HINTKEY0, the empty key of Keys Mapping's second
+    # column (the user's request 2026-11-10), and 28 HINTPS<name> icons of the PlayStation pads
+    # (the user's request 2026-11-11): the game's 31 hints less the 4 plain arrows and the question
+    # mark, plus the LB and RB names the hints also ask for
+    assert len(ui.entries) == len(orig.entries) + 5 + 111 + 1 + 1 + 1 + 28
+    for name in ('HINTPSA', 'HINTPSSTART', 'HINTPSRSTICK_UD', 'HINTPSLB'):
+        assert ui.find(name) is not None, name
 
 
 def test_graphics_screen_rows(built):
@@ -90,6 +95,9 @@ def test_graphics_screen_methods_use_the_natives(built):
     texts = strings_pushed(m, ours['code'])
     assert texts.count("'GetGraphicsOption'") == 11  # one a row
     assert texts.count("'SetGraphicsOption'") == 11
+    # rows the GPU cannot use are greyed out (the user's request, 2026-11-10): one check a row
+    assert texts.count("'GraphicsOptionAvailable'") == 11
+    assert "'disable'" in texts and "'_alpha'" in texts
     assert "'InitGui'" in texts and "'HandleInput'" in texts and "'ExitScreen'" in texts
     # no row of Gameplay Options left behind
     assert not any(t in texts for t in ("'YInversion'", "'Vibration'", "'SetRumble'"))
@@ -246,8 +254,17 @@ def test_keys_screen(built):
         assert t in texts, t
     # source: 8 + 5 + 4 = 17 bindings listed, each read once: of key_capture.h's 24, the stick clicks
     # and d-pad down have no action in the game's control screens (the user, 2026-11-09: "sticki nadal są"),
-    # and the four camera keys went too ("camera left i reszta kierunków też do usunięcia")
-    assert texts.count("'GetKeyBind'") == 17
+    # and the four camera keys went too ("camera left i reszta kierunków też do usunięcia").
+    # Each row is set by one call of srSetRow, which reads its two keys (the two columns,
+    # the user's request 2026-11-10): GetKeyBind twice in that one method.
+    assert texts.count("'srSetRow'") == 17 + 1  # 17 calls and the method's definition
+    assert texts.count("'GetKeyBind'") == 2
+    # the two columns (the user's request 2026-11-10): the second column's icon clip, the
+    # selected column, the mouse's column and the page arrows' clicks
+    for t in ("'srKey2'", "'srCol'", "'srKeyClickCol'", "'srPageArrowClick'"):
+        assert t in texts, t
+    # source: key_icons.py adds the empty key the second column shows without a key
+    assert ui.find('HINTKEY0') is not None
 
 
 def test_texts(built):

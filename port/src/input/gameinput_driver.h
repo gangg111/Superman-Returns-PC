@@ -21,6 +21,14 @@ using rex::X_STATUS;
 int ConnectedPads();
 int64_t LastPadUseMs();
 int64_t NowMs();
+// PlayStation pads (ps_pad_driver.cpp, SDL): their count and their use, also
+// counted in ConnectedPads and LastPadUseMs.
+void SetPlayStationPads(int count);
+void NotePlayStationPadUse();
+// The pad used last is a PlayStation one. A pad seen twice (DS4Windows or
+// Steam Input: a virtual Xbox pad and the real Sony one) counts as PlayStation:
+// its Sony side moved within 500 ms of the last pad use.
+bool PlayStationPadLast();
 
 class GameInputDriver final : public rex::input::InputDriver {
  public:

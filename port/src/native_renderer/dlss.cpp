@@ -61,6 +61,10 @@ REXCVAR_DEFINE_DOUBLE(sr_dlss_jitter_scale, 1.0, "Superman Returns Native",
                       "DLSS debug: jitter multiplier as DLSS is told it (-1 flips the convention)")
     .range(-1.0, 1.0);
 
+extern bool g_dlss_hardware;  // native_renderer.cpp: an NVIDIA RTX card, NGX not refused
+// sr_dlss as it applies: 0 on a GPU without DLSS (no jitter, no upscale ratio).
+int SrDlssMode() { return g_dlss_hardware ? REXCVAR_GET(sr_dlss) : 0; }
+
 namespace superman_returns::native {
 extern float g_dlss_mip_bias;  // native_renderer.cpp
 
@@ -92,11 +96,11 @@ constexpr NVSDK_NGX_PerfQuality_Value kQuality[] = {
 }  // namespace
 
 float Renderer::DlssSceneRatio() const {
-  return kSceneRatio[std::clamp(REXCVAR_GET(sr_dlss), 0, 4)];
+  return kSceneRatio[std::clamp(SrDlssMode(), 0, 4)];
 }
 
 uint32_t Renderer::DlssSceneVariant() const {
-  const int mode = std::clamp(REXCVAR_GET(sr_dlss), 0, 4);
+  const int mode = std::clamp(SrDlssMode(), 0, 4);
   return kSceneRatio[mode] < 1.0f ? uint32_t(mode) : 0u;
 }
 
@@ -139,7 +143,7 @@ void DlssDeleter::operator()(DlssState* state) const {
 }
 
 bool Renderer::DlssMotionDraw() const {
-  return REXCVAR_GET(sr_dlss) && dlss_scene_ && !dlss_scene_done_ && bound_rts_[0] &&
+  return SrDlssMode() && dlss_scene_ && !dlss_scene_done_ && bound_rts_[0] &&
          bound_rts_[0]->resource.Get() == dlss_scene_ && !(dlss_ && dlss_->failed);
 }
 
@@ -199,7 +203,7 @@ const D3D12_CPU_DESCRIPTOR_HANDLE* Renderer::DlssMotionTarget() {
 
 void Renderer::DlssDrawKey(uint64_t vs_hash, uint64_t ps_hash, uint32_t fetch0, uint32_t prim,
                            uint32_t count) {
-  if (!REXCVAR_GET(sr_dlss)) {
+  if (!SrDlssMode()) {
     dlss_draw_key_ = 0;
     return;
   }
@@ -268,7 +272,7 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::DlssPrevVsConstants(bool& valid) {
 }
 
 void Renderer::DlssCaptureCamera() {
-  if (!REXCVAR_GET(sr_dlss) || dlss_camera_) return;
+  if (!SrDlssMode() || dlss_camera_) return;
   if (dlss_scene_ && (!bound_rts_[0] || bound_rts_[0]->resource.Get() != dlss_scene_)) return;
   const CameraReg* end = std::end(kCameraRegs);
   const CameraReg* it = std::lower_bound(std::begin(kCameraRegs), end, current_vs_hash_,
@@ -280,7 +284,7 @@ void Renderer::DlssCaptureCamera() {
 }
 
 void Renderer::DlssJitter(float half_pixel[2]) {
-  if (!REXCVAR_GET(sr_dlss) || !dlss_scene_ || dlss_scene_done_ || !bound_rts_[0] ||
+  if (!SrDlssMode() || !dlss_scene_ || dlss_scene_done_ || !bound_rts_[0] ||
       bound_rts_[0]->resource.Get() != dlss_scene_) {
     return;
   }
@@ -299,7 +303,7 @@ void Renderer::DlssOnDepthResolve(HostSurface& src) {
 void Renderer::DlssOnColorResolve(HostSurface& src) {
   const bool after_depth = dlss_depth_just_resolved_;
   dlss_depth_just_resolved_ = false;
-  const int mode = REXCVAR_GET(sr_dlss);
+  const int mode = SrDlssMode();
   if (!mode) g_dlss_mip_bias = 0.0f;
   if (!mode || dlss_scene_done_ || !after_depth || src.depth || src.samples != 1 || !src.resource ||
       !dlss_scene_depth_ || !dlss_scene_depth_->srv_index) {
@@ -350,6 +354,7 @@ void Renderer::DlssOnColorResolve(HostSurface& src) {
     if (NVSDK_NGX_FAILED(r)) {
       REXLOG_ERROR("dlss: NGX init failed ({:08X}); is nvngx_dlss.dll next to the executable?", uint32_t(r));
       s.failed = true;
+      ::g_dlss_hardware = false;  // greyed out in Graphics Options from now on
       return;
     }
     s.initialized = true;
@@ -359,6 +364,7 @@ void Renderer::DlssOnColorResolve(HostSurface& src) {
         !available) {
       REXLOG_ERROR("dlss: DLSS is not available on this GPU / driver");
       s.failed = true;
+      ::g_dlss_hardware = false;
       return;
     }
     REXLOG_INFO("dlss: NGX initialized, DLSS available");
@@ -638,8 +644,8 @@ void Renderer::DlssEndFrame() {
   const float ratio = DlssSceneRatio();
   const uint32_t phases = uint32_t(std::ceil(8.0f / (ratio * ratio)));
   const uint32_t phase = dlss_frame_ % phases + 1;
-  dlss_jitter_[0] = REXCVAR_GET(sr_dlss) ? Halton(phase, 2) - 0.5f : 0.0f;
-  dlss_jitter_[1] = REXCVAR_GET(sr_dlss) ? Halton(phase, 3) - 0.5f : 0.0f;
+  dlss_jitter_[0] = SrDlssMode() ? Halton(phase, 2) - 0.5f : 0.0f;
+  dlss_jitter_[1] = SrDlssMode() ? Halton(phase, 3) - 0.5f : 0.0f;
 }
 
 }  // namespace superman_returns::native

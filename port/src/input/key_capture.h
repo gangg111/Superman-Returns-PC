@@ -23,13 +23,19 @@ void ApplyDefaultKeyBinds();
 // Keys Mapping's Y: every binding to its default, written to the settings file.
 void ResetKeyBinds();
 
-void BeginKeyCapture(int index);
+// Each binding has two keys (Keys Mapping's two columns): the option's list,
+// "first,second". The screen names a column as index + kKeySlotStride * slot.
+constexpr int kKeySlots = 2;
+constexpr int kKeySlotStride = 32;
+
+// `id`: index + kKeySlotStride * slot; the captured key becomes that column's.
+void BeginKeyCapture(int id);
 bool KeyCaptureActive();
 void CancelKeyCapture();
 
-// The first key of binding `index`: its code | 0x100 Shift | 0x200 Ctrl | 0x400
-// Alt; 0 when the binding is empty or unknown.
-int KeyBindCode(int index);
+// Key `slot` of binding `index`: its code | 0x100 Shift | 0x200 Ctrl | 0x400
+// Alt; 0 when there is none or it is unknown.
+int KeyBindCode(int index, int slot = 0);
 // The key a hint shows for binding `index`: in the menus Enter for A, Escape
 // for B and the arrows for the d-pad and the left stick (the Raw Input driver
 // presses them so), else KeyBindCode's key (no
@@ -72,5 +78,9 @@ void SetMouseLast(bool last);
 // while a connected pad was used after the keyboard and mouse, else the keys.
 void SetPadIcons(bool pad);
 bool PadIcons();
+// The pad icons are PlayStation's (a DualShock 4 or DualSense used last,
+// ps_pad_driver.h), else Xbox's (SettingsAdapter.PadStyle).
+void SetPlayStationIcons(bool playstation);
+bool PlayStationIcons();
 
 }  // namespace superman_returns::input

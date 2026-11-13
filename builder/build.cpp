@@ -160,6 +160,22 @@ fs::path Build(const Pack& pack, const BuildOptions& options, std::atomic<bool>&
     if (fs::exists(final_dir)) {
       const fs::path settings = final_dir / L"superman_returns.toml";
       if (fs::exists(settings)) fs::copy_file(settings, work / L"superman_returns.toml", fs::copy_options::overwrite_existing);
+      // the player's own replacement textures (PNG or DDS mods in textures\):
+      // every file there this build did not write is carried over (a player's
+      // mods were removed by a rebuild, 2026-11-11)
+      const fs::path old_textures = final_dir / L"textures";
+      if (fs::is_directory(old_textures, ec)) {
+        for (auto it = fs::recursive_directory_iterator(old_textures, ec); !ec && it != fs::recursive_directory_iterator();
+             it.increment(ec)) {
+          if (!it->is_regular_file(ec)) continue;
+          const fs::path rel = fs::relative(it->path(), old_textures, ec);
+          const fs::path to = work / L"textures" / rel;
+          if (rel.empty() || fs::exists(to, ec)) continue;
+          fs::create_directories(to.parent_path(), ec);
+          fs::copy_file(it->path(), to, ec);
+        }
+        ec.clear();
+      }
       const fs::path old = options.output / (std::wstring(kGameFolder) + L".old");
       fs::remove_all(old, ec);
       fs::rename(final_dir, old);

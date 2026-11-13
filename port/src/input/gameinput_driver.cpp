@@ -91,10 +91,24 @@ X_STATUS GameInputDriver::Setup() {
 namespace {
 std::atomic<int> g_connected_pads{0};
 std::atomic<int64_t> g_last_pad_use_ms{0};
+std::atomic<int> g_playstation_pads{0};
+std::atomic<int64_t> g_last_playstation_use_ms{0};
 }  // namespace
 
-int ConnectedPads() { return g_connected_pads.load(std::memory_order_relaxed); }
+int ConnectedPads() {
+  return g_connected_pads.load(std::memory_order_relaxed) + g_playstation_pads.load(std::memory_order_relaxed);
+}
 int64_t LastPadUseMs() { return g_last_pad_use_ms.load(std::memory_order_relaxed); }
+void SetPlayStationPads(int count) { g_playstation_pads.store(count, std::memory_order_relaxed); }
+void NotePlayStationPadUse() {
+  const int64_t now = NowMs();
+  g_last_playstation_use_ms.store(now, std::memory_order_relaxed);
+  g_last_pad_use_ms.store(now, std::memory_order_relaxed);
+}
+bool PlayStationPadLast() {
+  const int64_t ps = g_last_playstation_use_ms.load(std::memory_order_relaxed);
+  return ps > 0 && ps + 500 >= g_last_pad_use_ms.load(std::memory_order_relaxed);
+}
 int64_t NowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
       .count();
