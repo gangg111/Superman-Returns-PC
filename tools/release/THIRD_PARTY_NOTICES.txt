@@ -21,9 +21,9 @@ terms (app-local deployment).
 https://github.com/dotnet - MIT and third-party licenses, licenses\DOTNET-LICENSE.txt
 and licenses\DOTNET-ThirdPartyNotices.txt.
 
-PlayStation button icons in the menus (game\DATA\ui_sr.AST, the HintPs icons) - "PlayStation 5
-Button Icons & Controls" by Zacksly, Creative Commons Attribution 4.0 (CC BY 4.0),
-https://creativecommons.org/licenses/by/4.0/ ; cropped and resized.
+PlayStation button icons in the menus (game\DATA\ui_sr.AST, the HintPs icons) - generated with
+AI after "PlayStation 5 Button Icons & Controls" by Zacksly as the reference, Creative Commons
+Attribution 4.0 (CC BY 4.0), https://creativecommons.org/licenses/by/4.0/ ; cropped and resized.
 
 Game shaders are translated on the user's machine from the user's own copy of the game;
 no translated shader and no game data is part of this package.

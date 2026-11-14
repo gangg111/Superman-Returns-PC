@@ -1,8 +1,8 @@
 """PlayStation button icons for the menus' button hints (DualShock 4, DualSense).
 
-The icons come from assets/ps_buttons_zacksly.png: "PlayStation 5 Button Icons
-& Controls" by Zacksly (CC BY 4.0), white on a transparent background, the
-sheet the user chose (2026-11-11). Each icon the game's hints use (the Xbox
+The icons come from assets/ps_buttons_zacksly.png, white on a transparent
+background: a sheet the user generated with AI after "PlayStation 5 Button
+Icons & Controls" by Zacksly (CC BY 4.0) as the reference (2026-11-11). Each icon the game's hints use (the Xbox
 ButtonHints, HINT<name>) gets its PlayStation counterpart HINTPS<name>, loaded
 instead while a PlayStation pad was used last (build_ui_mod.py srSetIcon):
   ../common/ButtonHints/<platform>/HintPsA.swf -> HINTPSA.
