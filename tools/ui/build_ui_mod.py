@@ -96,6 +96,7 @@ def key_texts():
            ("Label_ScrMouseOpt", "MOUSE OPTIONS"), ("KEYS_DEFAULTS", "DEFAULTS"), ("MouseOpt_Sens_Slider", "Mouse Sensitivity"),
            ("Label_ScrTuningOpt", "DISPLAY TUNING"), ("TuningOpt_Brightness_Slider", "Brightness"),
            ("TuningOpt_Contrast_Slider", "Contrast"),
+           ("SR_BOOT_TITLE", "MAIN MENU"), ("SR_BOOT_NEW_GAME", "New Game"), ("SR_BOOT_LOAD_GAME", "Load Game"), ("SR_BOOT_OPTIONS", "Options"),
            ("KEYS_PRESS", "PRESS A KEY..."), ("KEYNAME_NONE", "-"),
            ("KEYMOD_SHIFT", "Shift+"), ("KEYMOD_CTRL", "Ctrl+"), ("KEYMOD_ALT", "Alt+")]
     for title_key, title, page_rows in KEY_PAGES:
@@ -1302,7 +1303,7 @@ def edit_pause_menu(data, const):
         code.set_member((g,), "PauseSelectedItem", "btn6")
         code.call_method((("r", 6),), "handleInput", [("r", 3)])
         code.call_method((g,), "playSound", [lambda: code.path(g, "SOUND", "OPEN")])
-        code.call_method((g, "FlowMgr"), "SwitchScreen", [lambda: code.path(g, "SCREEN", "OPTIONS_MENU")])
+        go_screen(code, g, lambda: code.path(g, "SCREEN", "OPTIONS_MENU"))
         code.push(False)
         code.op("Return")
         code.land(not_ours)
@@ -1348,25 +1349,40 @@ def find_class_init(m, frame_items, cls_name):
     raise LookupError(cls_name)
 
 
-def back_to_options(code, g):
-    """In a screen's HandleInput: B while paused goes to OPTIONS (the game's
-    screens went back to the pause menu). Leaves the stack as it was."""
-    code.path(g, "FlowMgr", "PauseMode")
-    code.path(g, "FlowMgr", "PAUSEMODE_MENU")
-    code.op("Equals2")
+# OPTIONS opened from the boot menu (edit_gen_popup) lives on its own screen
+# level above PRESS ENTER, which stays loaded under it: reloading PRESS ENTER
+# while the boot flow waits crashed the game (sub_826ADD40, 2026-11-14).
+# MAIN 50, FOREGROUND 75 (MAIN's LEVELS).
+BOOT_OPTIONS_LEVEL = 60
+
+
+def go_screen(code, g, push_screen):
+    """Switch to a screen: on BOOT_OPTIONS_LEVEL while _global.srOptOverlay
+    (OPTIONS from the boot menu), else as the game does (FlowMgr.SwitchScreen)."""
+    code.path(g, "srOptOverlay")
     code.op("Not")
-    not_paused = code.branch_if_true()
+    normal = code.branch_if_true()
+    code.call_method((g, "gSM"), "ChangeScreenByLevel", [push_screen, BOOT_OPTIONS_LEVEL])
+    done = code.branch()
+    code.land(normal)
+    code.call_method((g, "FlowMgr"), "SwitchScreen", [push_screen])
+    code.land(done)
+
+
+def back_to_options(code, g):
+    """In a screen's HandleInput: B goes to OPTIONS, paused or from the main
+    menu (the game's screens went back to the pause menu, or outside a pause to
+    the Control Room the game never shows). Leaves the stack as it was."""
     code.push(("r", 3))
     code.path(g, "INPUTCODE", "TRIANGLE")
     code.op("Equals2")
     code.op("Not")
     not_back = code.branch_if_true()
     code.call_method((g,), "playSound", [lambda: code.path(g, "SOUND", "CLOSE")])
-    code.call_method((g, "FlowMgr"), "SwitchScreen", [lambda: code.path(g, "SCREEN", "OPTIONS_MENU")])
+    go_screen(code, g, lambda: code.path(g, "SCREEN", "OPTIONS_MENU"))
     code.push(False)
     code.op("Return")
     code.land(not_back)
-    code.land(not_paused)
 
 
 def make_options_menu(data, const):
@@ -1442,22 +1458,40 @@ def make_options_menu(data, const):
         code.op("Return")
         code.land(not_start)
         code.land(not_paused)
-        # B: back to the pause menu (or the Control Room outside a pause)
+        # B: back to the pause menu, or (from the boot menu) OPTIONS' level
+        # closed and the boot menu shown again over PRESS ENTER
         code.push(("r", 3))
         code.path(g, "INPUTCODE", "TRIANGLE")
         code.op("Equals2")
         code.op("Not")
         not_back = code.branch_if_true()
         code.call_method((g,), "playSound", [lambda: code.path(g, "SOUND", "CLOSE")])
+        code.path(g, "srOptOverlay")
+        code.op("Not")
+        not_boot = code.branch_if_true()
+        code.set_member((g,), "srOptOverlay", False)
+        code.call_method((g, "gSM"), "UnloadOverlayScreen", [BOOT_OPTIONS_LEVEL])
+        # the background's frame (title, hints) OPTIONS turned on: off, as the
+        # boot menu had it (it stayed behind the menu, 2026-11-14)
+        code.call_method((g,), "SetDisplayWell", [False])
+        # and its hints (SELECT, BACK) off; the boot menu, hidden under OPTIONS,
+        # shown again (aPopupStack's popInstance is not the clip: setting it there
+        # left the menu working but invisible, 2026-11-14)
+        code.call_method((g,), "ShowHints")
+        code.set_member((g, "srBootMenuClip"), "_visible", True)
+        code.set_member((g,), "srBootMenuClip", None)
+        code.push(False)
+        code.op("Return")
+        code.land(not_boot)
 
         def back_screen():
             paused()
             code.op("Not")
-            to_room = code.branch_if_true()
+            to_main = code.branch_if_true()
             code.path(g, "SCREEN", "PAUSEMENU")
             joined = code.branch()
-            code.land(to_room)
-            code.path(g, "SCREEN", "CONTROL_ROOM")
+            code.land(to_main)
+            code.path(g, "SCREEN", "MAINMENU")
             code.land(joined)
 
         code.call_method((g, "FlowMgr"), "SwitchScreen", [back_screen])
@@ -1482,7 +1516,7 @@ def make_options_menu(data, const):
             code.set_member((g,), "OptionsSelectedItem", button)
             code.call_method((("r", 6),), "handleInput", [("r", 3)])
             code.call_method((g,), "playSound", [lambda: code.path(g, "SOUND", "OPEN")])
-            code.call_method((g, "FlowMgr"), "SwitchScreen", [lambda sc=screen_name: code.path(g, "SCREEN", sc)])
+            go_screen(code, g, lambda sc=screen_name: code.path(g, "SCREEN", sc))
             code.push(False)
             code.op("Return")
             code.land(skip)
@@ -1715,17 +1749,7 @@ def make_options_screen(data, const, cls_name, label_key, title_key, id_base, sc
         not_back = code.branch_if_true()
         code.call_method((g,), "playSound", [lambda: code.path(g, "SOUND", "CLOSE")])
 
-        def back_screen():
-            paused()
-            code.op("Not")
-            to_room = code.branch_if_true()
-            code.path(g, "SCREEN", "OPTIONS_MENU")
-            joined = code.branch()
-            code.land(to_room)
-            code.path(g, "SCREEN", "CONTROL_ROOM")
-            code.land(joined)
-
-        code.call_method((g, "FlowMgr"), "SwitchScreen", [back_screen])
+        go_screen(code, g, lambda: code.path(g, "SCREEN", "OPTIONS_MENU"))
         code.land(not_back)
         code.call_method((g, "gFM"), "handleDefaultInputs", [("r", 3)])
         # LEFT/RIGHT: the row's new value, at once.
@@ -2020,14 +2044,182 @@ def edit_press_start(data, const):
     code.push(None)
     code.op("Equals2")
     missing = code.branch_if_true()
+    # Once: the class survives the screen (its init is guarded), so a second
+    # PRESS ENTER (back from OPTIONS) found SetStartText already ours, kept it as
+    # srOrigSST and called itself without end; the game crashed at once
+    # (read of guest 0x4 in the Apt interpreter, sub_8269F3A0, 2026-11-14).
+    code.path(*proto, "srOrigSST")
+    code.push(None)
+    code.op("Equals2")
+    code.op("Not")
+    done_once = code.branch_if_true()
     code.set_member(proto, "srOrigSST", lambda: code.path(*proto, "SetStartText"))
     code.set_member(proto, "SetStartText", lambda: code.path("_global", "srSetStartText"))
+    code.land(done_once)
     code.land(missing)
     code.end()
     code.finish()
     new = m.init_action(61, at)
     i = items.index(cls)
     m.set_frame_items(rec, items[:i + 1] + [new] + items[i + 1:])
+    return m.write()
+
+
+BOOT_POPUP_TITLE = "LoadCreate_Profile_Title"  # "LOAD A GAME?": Load Game / Start New Game
+
+
+def edit_gen_popup(data, const):
+    """The game's popup (ScrGenPop), shown by the C++ boot flow after PRESS
+    ENTER as LOAD A GAME? with Load Game and Start New Game, shown as the
+    game's menu New Game, Load Game, Options (the user's request 2026-11-14:
+    "gra ma mieć menu New game, Load game, Options"). New Game and Load Game
+    answer with the game's own index of that button; Options hides the menu
+    (the boot flow keeps waiting on it) and opens OPTIONS on its own screen
+    level over PRESS ENTER (go_screen); the hidden menu passes every input on;
+    OPTIONS' B closes that level and shows the menu again. Answering 255 (the
+    popup's B) started the game: this popup cannot be cancelled. The title
+    becomes MAIN MENU, the body text goes."""
+    m = apt_edit.MovieEdit(data, const)
+    rec, items = m.frame_items(m.root)
+    cls = find_class_init(m, items, "ScrGenPop")
+    code = m.code()
+    at = code.start()
+    proto = ("_global", "ScrGenPop", "prototype")
+    code.path(*proto, "srPopupInit0")
+    code.push(None)
+    code.op("Equals2")
+    code.op("Not")
+    done = code.branch_if_true()
+    code.set_member(proto, "srPopupInit0", lambda: code.path(*proto, "PopupInit"))
+    code.set_member(proto, "srHandleInput0", lambda: code.path(*proto, "HandleInput"))
+
+    def loc(g, key):
+        return lambda: code.call_method((g, "LocalizationAdapter"), "GetLocalizedText", [key], keep=True)
+
+    def popup_init():
+        # this r1, _global r2, params r3, the game's index of Start New Game r4
+        body = code.begin_method(["params"], registers=5)
+        this = (("r", 1),)
+        g = ("r", 2)
+        p = ("r", 3)
+        code.set_member(this, "srOptionsButton", -1)
+        # the boot popup: its title as the key or as the localized text
+        code.path(p, "title")
+        code.push(BOOT_POPUP_TITLE)
+        code.op("Equals2")
+        yes = code.branch_if_true()
+        code.path(p, "title")
+        loc(g, BOOT_POPUP_TITLE)()
+        code.op("Equals2")
+        code.op("Not")
+        no = code.branch_if_true()
+        code.land(yes)
+        # the game's two buttons, in whatever order it gives them
+        code.push(1)
+        code.set_register(4)
+        code.path(p, "buttonLabels")
+        code.push(0)
+        code.op("GetMember")
+        loc(g, "LoadCreate_Create_Btn")()
+        code.op("Equals2")
+        code.op("Not")
+        create_second = code.branch_if_true()
+        code.push(0)
+        code.set_register(4)
+        code.land(create_second)
+        # shown: New Game, Load Game, Options; srMap: shown index -> the game's
+        code.set_member(this, "srMap", lambda: code.array([
+            ("r", 4), lambda: (code.push(1), code.push(("r", 4)), code.op("Subtract")), -1]))
+        code.set_member((p,), "buttonLabels", lambda: code.array(
+            [loc(g, "SR_BOOT_NEW_GAME"), loc(g, "SR_BOOT_LOAD_GAME"), loc(g, "SR_BOOT_OPTIONS")]))
+        code.set_member((p,), "numButtons", 3)
+        # the game's main menu, not a load question: its own title, no body text
+        code.set_member((p,), "title", loc(g, "SR_BOOT_TITLE"))
+        code.set_member((p,), "body", "")
+        # the game's default button, shown where it now is
+        code.path(p, "defaultButton")
+        code.push(("r", 4))
+        code.op("Equals2")
+        default_new = code.branch_if_true()
+        code.set_member((p,), "defaultButton", 1)
+        default_done = code.branch()
+        code.land(default_new)
+        code.set_member((p,), "defaultButton", 0)
+        code.land(default_done)
+        code.set_member(this, "srOptionsButton", 2)
+        code.land(no)
+        code.call_method(this, "srPopupInit0", [p])
+        code.end_method(body)
+
+    def handle_input():
+        # this r1, _global r2, keyCode r3, controllerId r4, ascii r5, the shown button r6
+        body = code.begin_method(["keyCode", "controllerId", "ascii"], registers=7)
+        this = (("r", 1),)
+        g = ("r", 2)
+        # hidden under OPTIONS: every input on to the screens below (true = not
+        # handled, as BistroBaseScreen's own HandleInput)
+        code.path(g, "srOptOverlay")
+        code.op("Not")
+        shown = code.branch_if_true()
+        code.push(True)
+        code.op("Return")
+        code.land(shown)
+        code.push(("r", 3))
+        code.path(g, "INPUTCODE", "CROSS")
+        code.op("Equals2")
+        code.op("Not")
+        other = code.branch_if_true()
+        code.path(("r", 1), "srOptionsButton")
+        code.push(0)
+        code.op("LessThan2")
+        not_boot = code.branch_if_true()
+        code.call_method(this + ("mFM",), "getSelectedItem", keep=True)
+        code.push("m_tabIndex")
+        code.op("GetMember")
+        code.set_register(6)
+        code.call_method((g,), "playSound", [lambda: code.path(g, "SOUND", "OPEN")])
+        code.push(("r", 6))
+        code.path(("r", 1), "srOptionsButton")
+        code.op("Equals2")
+        code.op("Not")
+        not_options = code.branch_if_true()
+        # Options: the popup hidden, not closed (the boot flow keeps waiting on
+        # it; closing it and showing it again lost it the second time,
+        # 2026-11-14), OPTIONS on its own level over PRESS ENTER (go_screen);
+        # OPTIONS' B closes that level and shows the popup again
+        code.set_member((g,), "srOptOverlay", True)
+        code.set_member((g,), "OptionsSelectedItem", "btn1")
+        code.set_member(this, "_visible", False)
+        # kept while OPTIONS is up (the popup stays loaded all that time)
+        code.set_member((g,), "srBootMenuClip", ("r", 1))
+        go_screen(code, g, lambda: code.path(g, "SCREEN", "OPTIONS_MENU"))
+        code.push(False)
+        code.op("Return")
+        code.land(not_options)
+        # New Game or Load Game: the game's own index, then as its own CROSS
+        code.call_method(this + ("mParams", "selectedCallback"), "call", [
+            lambda: code.path(("r", 1), "mParams", "context"), ("r", 1),
+            lambda: (code.path(("r", 1), "srMap"), code.push(("r", 6)), code.op("GetMember"))])
+        code.path(("r", 1), "mParams", "closeOnPress")
+        code.op("Not")
+        keep_open = code.branch_if_true()
+        code.call_method((g, "gPopupMgr"), "ClosePopup", [("r", 1)])
+        code.land(keep_open)
+        code.push(False)
+        code.op("Return")
+        code.land(not_boot)
+        code.land(other)
+        code.call_method(this, "srHandleInput0", [("r", 3), ("r", 4), ("r", 5)], keep=True)
+        code.op("Return")
+        code.end_method(body)
+
+    code.set_member(proto, "PopupInit", popup_init)
+    code.set_member(proto, "HandleInput", handle_input)
+    code.land(done)
+    code.end()
+    code.finish()
+    items.insert(items.index(cls) + 1, m.init_action(m.b.u32(cls + 4), at))
+    m.set_frame_items(rec, items)
     return m.write()
 
 
@@ -2352,23 +2544,13 @@ def make_keys_screen(data, const):
         code.op("Return")
         code.land(not_start)
         code.land(not_paused)
-        # B: back to OPTIONS (or the Control Room outside a pause)
+        # B: back to OPTIONS (paused or from the main menu)
         key_is("TRIANGLE")
         code.op("Not")
         not_back = code.branch_if_true()
         code.call_method((g,), "playSound", [lambda: code.path(g, "SOUND", "CLOSE")])
 
-        def back_screen():
-            paused()
-            code.op("Not")
-            to_room = code.branch_if_true()
-            code.path(g, "SCREEN", "OPTIONS_MENU")
-            joined = code.branch()
-            code.land(to_room)
-            code.path(g, "SCREEN", "CONTROL_ROOM")
-            code.land(joined)
-
-        code.call_method((g, "FlowMgr"), "SwitchScreen", [back_screen])
+        go_screen(code, g, lambda: code.path(g, "SCREEN", "OPTIONS_MENU"))
         code.push(False)
         code.op("Return")
         code.land(not_back)
@@ -2553,6 +2735,8 @@ def build(data_dir, out_dir):
     add.append(("ICONGRAPHICSOPT", ui.data(ui.find("ICONCONTROLLEROPT")), ui.find("ICONCONTROLLEROPT")["flags"]))
     inner, d, c = movie_of(ui, "SCRPRESSSTART")
     replace["SCRPRESSSTART"] = repack(inner, d, c, *edit_press_start(d[1], c[1]))
+    inner, d, c = movie_of(ui, "SCRGENPOP")
+    replace["SCRGENPOP"] = repack(inner, d, c, *edit_gen_popup(d[1], c[1]))
     inner, d, c = movie_of(ui, "BUTTONICON")
     replace["BUTTONICON"] = repack(inner, d, c, *edit_button_icon(d[1], c[1]))
     for entry, sprite, cls_name in (("SCRMOVESLIST", 14, "ScrMovesList"), ("SCRSTATISTICS", 26, "ScrStatistics")):

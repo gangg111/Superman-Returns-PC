@@ -49,8 +49,9 @@ def test_game_entries_untouched(built):
     # since the key icons (2026-11-09, the user's "zamiast przycisków xboxa klawisze") also BUTTONICON
     # and SCRPRESSSTART ("PRESS ENTER" on keyboard and mouse, the user's request 2026-11-09)
     # and SCRMOVESLIST, SCRSTATISTICS (their scroll arrows clickable, the user's screenshots 2026-11-09)
+    # and SCRGENPOP (the boot popup as New Game, Load Game, Options, the user's request 2026-11-14)
     changed = {'MAIN', 'SCRCONTROLROOM', 'SCRPAUSEMENU', 'SCRGAMEPLAYOPT', 'SCRCONTROLLEROPT', 'SCRAUDIOOPT',
-               'BUTTONICON', 'SCRPRESSSTART', 'SCRMOVESLIST', 'SCRSTATISTICS'}
+               'BUTTONICON', 'SCRPRESSSTART', 'SCRMOVESLIST', 'SCRSTATISTICS', 'SCRGENPOP'}
     for e in orig.entries:
         if e['name'] not in changed:
             assert ui.data(ui.find(e['name'])) == orig.data(e), e['name']
@@ -487,3 +488,52 @@ def test_tuning_screen(built):
     for key, value in (("Label_ScrTuningOpt", "DISPLAY TUNING"), ("TuningOpt_Brightness_Slider", "Brightness"),
                        ("TuningOpt_Contrast_Slider", "Contrast")):
         assert '<uitext id="%s" value="%s"/>' % (key, value) in xml
+
+
+def all_strings(m):
+    return [t for f in m.frames(*m.header()['frames']) for it in f if it.get('code')
+            for t in strings_pushed(m, it['code'])]
+
+
+def test_boot_popup_menu(built):
+    # the popup after PRESS ENTER (the C++ boot flow's LOAD A GAME?, buttons Load Game and Start New
+    # Game; apt.py dump of SCRGENPOP): shown as New
+    # Game, Load Game, Options, the two game buttons mapped back to the game's own index
+    ui, text = built
+    m = movie(ui, 'SCRGENPOP')
+    items = m.frames(*m.header()['frames'])[0]
+    ours = [strings_pushed(m, it['code']) for it in items
+            if it['type'] == 8 and "'srPopupInit0'" in strings_pushed(m, it['code'])]
+    assert len(ours) == 1
+    for t in ("'LoadCreate_Profile_Title'", "'LoadCreate_Create_Btn'", "'SR_BOOT_TITLE'", "'SR_BOOT_NEW_GAME'", "'SR_BOOT_LOAD_GAME'",
+              "'SR_BOOT_OPTIONS'", "'srMap'", "'srOptOverlay'", "'_visible'", "'selectedCallback'", "'ClosePopup'",
+              "'OPTIONS_MENU'"):
+        assert t in ' | '.join(ours[0]), t
+    # OPTIONS from it on its own screen level over PRESS ENTER (reloading PRESS ENTER crashed the
+    # game, measured 2026-11-14), the menu hidden meanwhile; B there closes the level and shows it
+    opts = ' | '.join(all_strings(movie(ui, 'SCROPTIONSMENU')))
+    for t in ("'srOptOverlay'", "'UnloadOverlayScreen'", "'srBootMenuClip'", "'ShowHints'", "'_visible'",
+              "'ChangeScreenByLevel'"):
+        assert t in opts, t
+    assert "'PRESS_START'" not in opts
+    xml = text.data(text.find('INTERFACETEXT')).decode('utf-8-sig')
+    for key, value in (("SR_BOOT_TITLE", "MAIN MENU"), ("SR_BOOT_NEW_GAME", "New Game"), ("SR_BOOT_LOAD_GAME", "Load Game"),
+                       ("SR_BOOT_OPTIONS", "Options")):
+        assert '<uitext id="%s" value="%s"/>' % (key, value) in xml
+
+
+def test_options_screens_never_go_to_the_control_room(built):
+    # outside a pause (from the main menu) B goes to OPTIONS and OPTIONS to the main menu; the
+    # Control Room the game never shows is no destination any more
+    ui, _ = built
+    for entry in ('SCROPTIONSMENU', 'SCRGRAPHICSOPT', 'SCRDISPLAYOPT', 'SCRKEYSOPT'):
+        assert "'CONTROL_ROOM'" not in all_strings(movie(ui, entry)), entry
+    # the game's own screens keep their code (Controller Options names the Control Room), but
+    # our wrapper, which runs first, takes B to OPTIONS whether paused or not
+    for entry in ('SCRGAMEPLAYOPT', 'SCRCONTROLLEROPT', 'SCRAUDIOOPT', 'SCRMOUSEOPT', 'SCRTUNINGOPT'):
+        m = movie(ui, entry)
+        ours = [strings_pushed(m, it['code']) for it in m.frames(*m.header()['frames'])[0]
+                if it['type'] == 8 and "'srHandleInput0'" in strings_pushed(m, it['code'])]
+        assert len(ours) == 1, entry
+        assert "'OPTIONS_MENU'" in ours[0] and "'PAUSEMODE_MENU'" not in ours[0], entry
+    assert "'MAINMENU'" in all_strings(movie(ui, 'SCROPTIONSMENU'))
