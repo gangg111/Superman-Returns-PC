@@ -44,7 +44,11 @@ std::unique_ptr<rex::system::IInputSystem> CreateInputSystem(bool tool_mode) {
   auto kbm = std::make_unique<RawInputKbmDriver>();
   if (kbm->Setup() == X_STATUS_SUCCESS) system->AddDriver(std::move(kbm));
   system->AddDriver(std::make_unique<rex::input::nop::NopInputDriver>(nullptr, 1));
-  system->SetDeviceAssignment(std::make_unique<rex::input::SlotAssignment>());
+  // Every pad drives player one. Only player one is signed in (the SDK's
+  // XamUserGetSigninState), so a second device on player two (Steam Input or
+  // DS4Windows beside the real pad, a second controller) made START ask for a
+  // gamer profile (issue #3). The game is single-player.
+  system->SetDeviceAssignment(std::make_unique<rex::input::SharedAssignment>());
   REXLOG_INFO("input: native (GameInput, SDL PlayStation pads, Raw Input)");
   return system;
 }
