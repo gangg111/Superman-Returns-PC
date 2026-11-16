@@ -39,6 +39,7 @@ import apt  # noqa: E402
 import apt_edit  # noqa: E402
 import key_icons  # noqa: E402
 import ps_icons  # noqa: E402
+import xtex  # noqa: E402
 
 # The rows: (row name, label key, label, options key, options). A row's id is
 # its screen's id base plus its index; port/src/graphics_menu.cpp maps the ids
@@ -87,6 +88,14 @@ TEXTS = [("Label_ScrGraphicsOpt", "GRAPHICS OPTIONS"), ("Label_ScrDisplayOpt", "
     sorted({(r[1], r[2]) for r in ROWS} | {(r[3], r[4]) for r in ROWS})
 
 
+# The costumes screen's custom slots after the game's three (texture_replace.h:
+# kCustomCostumes); their pictures are COSTUMETHUMB_4.. and COSTUMEFULLSIZE_4..
+CUSTOM_COSTUMES = 3
+GAME_COSTUMES = 3
+COSTUME_NAME_CHARS = 24  # texture_replace.cpp CustomCostumeName
+COSTUME_GRID_RAISE = 70  # the costumes grid this much higher than the game's (edit_costumes)
+
+
 def key_texts():
     """OPTIONS and Keys Mapping: the titles, the rows' labels and every key name
     the bindings know (KEYNAME_<code>, from the SDK's table, key_names.py)."""
@@ -97,6 +106,9 @@ def key_texts():
            ("Label_ScrTuningOpt", "DISPLAY TUNING"), ("TuningOpt_Brightness_Slider", "Brightness"),
            ("TuningOpt_Contrast_Slider", "Contrast"),
            ("SR_BOOT_TITLE", "MAIN MENU"), ("SR_BOOT_NEW_GAME", "New Game"), ("SR_BOOT_LOAD_GAME", "Load Game"), ("SR_BOOT_OPTIONS", "Options"),
+           *[("SR_COSTUME_CUSTOM_DESC_%d" % k,
+              "Your own costume: textures\\Suits\\Slot%d" % (GAME_COSTUMES + k))
+             for k in range(1, CUSTOM_COSTUMES + 1)],
            ("KEYS_PRESS", "PRESS A KEY..."), ("KEYNAME_NONE", "-"),
            ("KEYMOD_SHIFT", "Shift+"), ("KEYMOD_CTRL", "Ctrl+"), ("KEYMOD_ALT", "Alt+")]
     for title_key, title, page_rows in KEY_PAGES:
@@ -221,6 +233,7 @@ def edit_main(data, const):
     # load until SCREEN_SETTLE polls after the new screen is loaded.
     code.set_member(("_global",), "srSettle", 0)
 
+
     def same_screen(note):
         """Branch (to land) taken when _global.<note> was kept on another screen."""
         code.path(("r", 2), note + "Gen")
@@ -229,9 +242,14 @@ def edit_main(data, const):
         code.op("Not")
         return code.branch_if_true()
 
+    # the main menu after PRESS ENTER (gen_popup_methods): installed on each popup
+    # by gPopupMgr.PopupFetchData, which the menu poll wraps once
+    gen_popup_methods(code)
+
     def menu_poll():
         body = code.begin_method(registers=4)
         g = ("r", 2)
+        code.call_method((g,), "srHookPopups")
         code.path(g, "SettingsAdapter")
         code.push(None)
         code.op("Equals2")
@@ -2068,30 +2086,26 @@ def edit_press_start(data, const):
 BOOT_POPUP_TITLE = "LoadCreate_Profile_Title"  # "LOAD A GAME?": Load Game / Start New Game
 
 
-def edit_gen_popup(data, const):
-    """The game's popup (ScrGenPop), shown by the C++ boot flow after PRESS
-    ENTER as LOAD A GAME? with Load Game and Start New Game, shown as the
-    game's menu New Game, Load Game, Options (the user's request 2026-11-14:
-    "gra ma mieć menu New game, Load game, Options"). New Game and Load Game
-    answer with the game's own index of that button; Options hides the menu
-    (the boot flow keeps waiting on it) and opens OPTIONS on its own screen
-    level over PRESS ENTER (go_screen); the hidden menu passes every input on;
-    OPTIONS' B closes that level and shows the menu again. Answering 255 (the
-    popup's B) started the game: this popup cannot be cancelled. The title
-    becomes MAIN MENU, the body text goes."""
-    m = apt_edit.MovieEdit(data, const)
-    rec, items = m.frame_items(m.root)
-    cls = find_class_init(m, items, "ScrGenPop")
-    code = m.code()
-    at = code.start()
-    proto = ("_global", "ScrGenPop", "prototype")
-    code.path(*proto, "srPopupInit0")
-    code.push(None)
-    code.op("Equals2")
-    code.op("Not")
-    done = code.branch_if_true()
-    code.set_member(proto, "srPopupInit0", lambda: code.path(*proto, "PopupInit"))
-    code.set_member(proto, "srHandleInput0", lambda: code.path(*proto, "HandleInput"))
+def gen_popup_methods(code):
+    """MAIN's code for the game's popup (ScrGenPop), shown by the C++ boot flow
+    after PRESS ENTER as LOAD A GAME? with Load Game and Start New Game, shown
+    as the game's menu New Game, Load Game, Options (the user's request
+    2026-11-14: "gra ma mieć menu New game, Load game, Options"). New Game and
+    Load Game answer with the game's own index of that button; Options hides
+    the menu (the boot flow keeps waiting on it) and opens OPTIONS on its own
+    screen level over PRESS ENTER (go_screen); the hidden menu passes every
+    input on; OPTIONS' B closes that level and shows the menu again. Answering
+    255 (the popup's B) started the game: this popup cannot be cancelled. The
+    title becomes MAIN MENU, the body text goes.
+
+    The code lives in MAIN, which never unloads, and goes onto each popup as
+    it asks for its data (gPopupMgr.PopupFetchData calls its PopupInit):
+    _global.srHookPopups (the menu poll) wraps PopupFetchData once, and the
+    wrapper puts _global.srGenPopInit / srGenPopInput on the popup instance as
+    PopupInit / HandleInput, the game's kept as srPopupInit0 / srHandleInput0.
+    ScrGenPop's own movie stays the game's: code added there broke every popup
+    after the first two (it is loaded again while the last copy is still in
+    memory, 2026-11-16)."""
 
     def loc(g, key):
         return lambda: code.call_method((g, "LocalizationAdapter"), "GetLocalizedText", [key], keep=True)
@@ -2213,7 +2227,193 @@ def edit_gen_popup(data, const):
         code.op("Return")
         code.end_method(body)
 
-    code.set_member(proto, "PopupInit", popup_init)
+    def fetch_data():
+        # gPopupMgr (r1).PopupFetchData(popup r3): our PopupInit and HandleInput on
+        # the popup instance, the game's kept on it, then the game's PopupFetchData
+        body = code.begin_method(["popup"], registers=4)
+        g = ("r", 2)
+        pop = (("r", 3),)
+        code.push(("r", 3))
+        code.push(None)
+        code.op("Equals2")
+        none = code.branch_if_true()
+        code.path(("r", 3), "srPopupInit0")
+        code.push(None)
+        code.op("Equals2")
+        code.op("Not")
+        done = code.branch_if_true()
+        code.set_member(pop, "srPopupInit0", lambda: code.path(("r", 3), "PopupInit"))
+        code.set_member(pop, "PopupInit", lambda: code.path(g, "srGenPopInit"))
+        code.set_member(pop, "srHandleInput0", lambda: code.path(("r", 3), "HandleInput"))
+        code.set_member(pop, "HandleInput", lambda: code.path(g, "srGenPopInput"))
+        code.land(done)
+        code.land(none)
+        code.call_method((("r", 1),), "srFetch0", [("r", 3)])
+        code.end_method(body)
+
+    def hook_popups():
+        # once gPopupMgr is there: its PopupFetchData through srPopupFetch
+        body = code.begin_method(registers=3)
+        g = ("r", 2)
+        pm = (g, "gPopupMgr")
+        code.path(*pm)
+        code.push(None)
+        code.op("Equals2")
+        none = code.branch_if_true()
+        code.path(*pm, "srFetch0")
+        code.push(None)
+        code.op("Equals2")
+        code.op("Not")
+        done = code.branch_if_true()
+        code.set_member(pm, "srFetch0", lambda: code.path(*pm, "PopupFetchData"))
+        code.set_member(pm, "PopupFetchData", lambda: code.path(g, "srPopupFetch"))
+        code.land(done)
+        code.land(none)
+        code.end_method(body)
+
+    code.set_member(("_global",), "srGenPopInit", popup_init)
+    code.set_member(("_global",), "srGenPopInput", handle_input)
+    code.set_member(("_global",), "srPopupFetch", fetch_data)
+    code.set_member(("_global",), "srHookPopups", hook_popups)
+
+
+def edit_costumes(data, const):
+    """The Fortress's costumes screen (ScrCostumes) with the custom slots 4 to 6
+    after the game's three (the user's request 2026-11-16): never locked, named
+    from textures/Suits/Slot<n>/costume.toml (SettingsAdapter.CostumeNameChar),
+    their pictures COSTUMETHUMB_<n> / COSTUMEFULLSIZE_<n>, the grid two rows of
+    three. The screen's ThumbViewer gets the game's records and ours (its
+    Create and SetRows replaced on the instance while InitGui runs). SQUARE on a custom slot wears the game's costume 1 with
+    the slot's textures (SettingsAdapter.SetCustomCostume(1..3)); on a game's
+    unlocked costume it takes the custom one off, then the game's handler."""
+    m = apt_edit.MovieEdit(data, const)
+    rec, items = m.frame_items(m.root)
+    cls = find_class_init(m, items, "ScrCostumes")
+    code = m.code()
+    at = code.start()
+    proto = ("_global", "ScrCostumes", "prototype")
+    code.path(*proto, "srInitGui0")
+    code.push(None)
+    code.op("Equals2")
+    code.op("Not")
+    done = code.branch_if_true()
+    code.set_member(proto, "srInitGui0", lambda: code.path(*proto, "InitGui"))
+    code.set_member(proto, "srHandleInput0", lambda: code.path(*proto, "HandleInput"))
+
+    def costume_name():
+        # this r1, _global r2, the slot (1..3) r3, the name r4, a character r5
+        body = code.begin_method(["slot"], registers=6)
+        g = ("r", 2)
+        code.push("")
+        code.set_register(4)
+        ends = []
+        for i in range(COSTUME_NAME_CHARS):
+            code.call_method((g, "SettingsAdapter"), "CostumeNameChar", [
+                lambda i=i: (code.push(("r", 3)), code.push(32), code.op("Multiply"), code.push(i), code.op("Add2"))],
+                keep=True)
+            code.set_register(5)
+            code.push(("r", 5))
+            code.push(0)
+            code.op("Equals2")
+            ends.append(code.branch_if_true())
+            code.push(("r", 4))
+            code.call_method(("String",), "fromCharCode", [("r", 5)], keep=True)
+            code.op("Add2")
+            code.set_register(4)
+        for e in ends:
+            code.land(e)
+        code.push(("r", 4))
+        code.op("Return")
+        code.end_method(body)
+
+    def costume_create():
+        # on the screen's ThumbViewer (r1): the game's records (r3) and ours, a new record r4
+        body = code.begin_method(["records"], registers=5)
+        g = ("r", 2)
+        for k in range(1, CUSTOM_COSTUMES + 1):
+            n = GAME_COSTUMES + k
+            code.push(0)
+            code.op("InitObject")
+            code.set_register(4)
+            r4 = (("r", 4),)
+            code.set_member(r4, "Locked", False)
+            code.set_member(r4, "MediaType", lambda: (code.path(("r", 3)), code.push(0), code.op("GetMember"),
+                                                       code.push("MediaType"), code.op("GetMember")))
+            code.set_member(r4, "ThumbFile", "artassets/Costumes/thumbs/CostumeThumb_%d.swf" % n)
+            code.set_member(r4, "FullSizeFile", "artassets/Costumes/fullsize/CostumeFullSize_%d.swf" % n)
+            code.set_member(r4, "Name", lambda k=k: code.call_method((g,), "srCostumeName", [k], keep=True))
+            code.set_member(r4, "Description", lambda k=k: code.call_method(
+                (g, "LocalizationAdapter"), "GetLocalizedText", ["SR_COSTUME_CUSTOM_DESC_%d" % k], keep=True))
+            code.call_method((("r", 3),), "push", [("r", 4)])
+        code.call_method((g, "ThumbViewer", "prototype", "Create"), "call", [("r", 1), ("r", 3)])
+        code.end_method(body)
+
+    def two_rows():
+        # on the screen's ThumbViewer (r1): the game's SetRows(1) as SetRows(2)
+        body = code.begin_method(["rows"], registers=4)
+        code.call_method(("_global", "ThumbViewer", "prototype", "SetRows"), "call", [("r", 1), 2])
+        code.end_method(body)
+
+    def higher_grid():
+        # on the screen's ThumbViewer (r1): the game's SetTopMargin(265) 70 higher.
+        # The name and description sit below at mTopMargin + mGridHeight + padding,
+        # over the button hints (the user's screenshot 2026-11-16, "teksty na
+        # siebie nachodzą"); moved up with the grid they clear them.
+        body = code.begin_method(["margin"], registers=4)
+        code.call_method(("_global", "ThumbViewer", "prototype", "SetTopMargin"), "call", [
+            ("r", 1), lambda: (code.push(("r", 3)), code.push(COSTUME_GRID_RAISE), code.op("Subtract"))])
+        code.end_method(body)
+
+    def init_gui():
+        # this r1, _global r2: the ThumbViewer's SetRows and Create as ours for
+        # this screen (RecordAdapter is native: assigning its GetCostumeData is
+        # ignored, measured 2026-11-16), then the game's InitGui
+        body = code.begin_method([], registers=3)
+        g = ("r", 2)
+        viewer = (("r", 1), "mThumbViewer")
+        code.set_member(viewer, "SetRows", lambda: code.path(g, "srCostumeRows"))
+        code.set_member(viewer, "Create", lambda: code.path(g, "srCostumeCreate"))
+        code.set_member(viewer, "SetTopMargin", lambda: code.path(g, "srCostumeTop"))
+        code.call_method((("r", 1),), "srInitGui0")
+        code.end_method(body)
+
+    def handle_input():
+        # this r1, _global r2, keyCode r3, controllerId r4, ascii r5, the selected slot r6
+        body = code.begin_method(["keyCode", "controllerId", "ascii"], registers=7)
+        this = (("r", 1),)
+        g = ("r", 2)
+        code.push(("r", 3))
+        code.path(g, "INPUTCODE", "SQUARE")
+        code.op("Equals2")
+        code.op("Not")
+        other = code.branch_if_true()
+        code.call_method(this + ("mThumbViewer",), "GetSelected", keep=True)
+        code.set_register(6)
+        code.push(("r", 6))
+        code.push(GAME_COSTUMES)
+        code.op("LessThan2")
+        game_costume = code.branch_if_true()
+        # a custom slot: the game's costume 1 with the slot's textures
+        code.call_method((g, "SettingsAdapter"), "SetCustomCostume", [
+            lambda: (code.push(("r", 6)), code.push(GAME_COSTUMES - 1), code.op("Subtract"))])
+        code.call_method((g, "RecordAdapter"), "SetActiveCostume", [0])
+        code.push(False)
+        code.op("Return")
+        code.land(game_costume)
+        code.call_method(this + ("mThumbViewer",), "IsLocked", [("r", 6)], keep=True)
+        locked = code.branch_if_true()
+        code.call_method((g, "SettingsAdapter"), "SetCustomCostume", [0])
+        code.land(locked)
+        code.land(other)
+        code.call_method(this, "srHandleInput0", [("r", 3), ("r", 4), ("r", 5)], keep=True)
+        code.op("Return")
+        code.end_method(body)
+
+    code.set_member(("_global",), "srCostumeName", costume_name)
+    code.set_member(("_global",), "srCostumeCreate", costume_create)
+    code.set_member(("_global",), "srCostumeRows", two_rows)
+    code.set_member(("_global",), "srCostumeTop", higher_grid)
+    code.set_member(proto, "InitGui", init_gui)
     code.set_member(proto, "HandleInput", handle_input)
     code.land(done)
     code.end()
@@ -2221,6 +2421,36 @@ def edit_gen_popup(data, const):
     items.insert(items.index(cls) + 1, m.init_action(m.b.u32(cls + 4), at))
     m.set_frame_items(rec, items)
     return m.write()
+
+
+def costume_picture_entries(ui):
+    """[(name, data, flags)]: COSTUMETHUMB_<n> and COSTUMEFULLSIZE_<n> for the
+    custom slots: our own picture, the slot's number on a dark card, no pixel of
+    the game's (these go into the published patch), each its own texture, so the
+    player's thumb.png / fullsize.png (the builder makes them from costume 1's
+    pictures on the player's disc) replaces only that slot's."""
+    from PIL import Image, ImageDraw
+    out = []
+    for kind in ("COSTUMETHUMB", "COSTUMEFULLSIZE"):
+        src_e = ui.find("%s_1" % kind)
+        src = apt_edit.Archive(ui.data(src_e))
+        tex_e = [e for e in src.entries if e["flags"] == 0][0]
+        texture = src.data(tex_e)
+        w, h = xtex.size_of(texture)[:2]
+        for k in range(1, CUSTOM_COSTUMES + 1):
+            n = GAME_COSTUMES + k
+            card = Image.new("RGBA", (w, h), (18, 30, 52, 255))
+            d = ImageDraw.Draw(card)
+            d.rectangle((w // 16, h // 16, w - 1 - w // 16, h - 1 - h // 16), outline=(90, 130, 190, 255),
+                        width=max(1, w // 64))
+            d.text((w // 2, h // 2), str(n), fill=(220, 232, 250, 255), font_size=h // 2, anchor="mm")
+            px = list(card.getdata())
+            new_tex = xtex.encode([px[y * w:(y + 1) * w] for y in range(h)], texture)
+            name = "%s_%d" % (kind, n)
+            del px
+            suffix = struct.pack("<I", apt_edit.fnv1a64(name) & 0xFFFFFFFF)
+            out.append((name, src.build(replace={tex_e["hash"]: new_tex}, suffix=suffix), src_e["flags"]))
+    return out
 
 
 def edit_scroll_screen(data, const, sprite, cls_name):
@@ -2735,8 +2965,9 @@ def build(data_dir, out_dir):
     add.append(("ICONGRAPHICSOPT", ui.data(ui.find("ICONCONTROLLEROPT")), ui.find("ICONCONTROLLEROPT")["flags"]))
     inner, d, c = movie_of(ui, "SCRPRESSSTART")
     replace["SCRPRESSSTART"] = repack(inner, d, c, *edit_press_start(d[1], c[1]))
-    inner, d, c = movie_of(ui, "SCRGENPOP")
-    replace["SCRGENPOP"] = repack(inner, d, c, *edit_gen_popup(d[1], c[1]))
+    inner, d, c = movie_of(ui, "SCRCOSTUMES")
+    replace["SCRCOSTUMES"] = repack(inner, d, c, *edit_costumes(d[1], c[1]))
+    add += costume_picture_entries(ui)
     inner, d, c = movie_of(ui, "BUTTONICON")
     replace["BUTTONICON"] = repack(inner, d, c, *edit_button_icon(d[1], c[1]))
     for entry, sprite, cls_name in (("SCRMOVESLIST", 14, "ScrMovesList"), ("SCRSTATISTICS", 26, "ScrStatistics")):

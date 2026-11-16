@@ -49,6 +49,7 @@
 #include "generated/default/superman_returns_init.h"
 #include "input/key_capture.h"
 #include "launcher_settings.h"
+#include "native_renderer/texture_replace.h"
 
 REXCVAR_DEFINE_BOOL(sr_menu_mouse_log, true, "Superman Returns",
                     "Log each menu click: the cursor and the item it hit (calibration)");
@@ -322,6 +323,35 @@ extern "C" void RestartGameNative(PPCContext& ctx, uint8_t* base) {
   sub_82686910(ctx, base);
 }
 
+// The costumes screen's custom slots (native_renderer/texture_replace.h):
+// GetCustomCostume() -> the worn slot (0 = the game's costume), SetCustomCostume(n)
+// (saved to the toml), CostumeNameChar(slot * 32 + i) -> the name's i-th
+// character code, 0 past its end (Apt has no string return here; the screen
+// joins them with String.fromCharCode).
+extern "C" void GetCustomCostumeNative(PPCContext& ctx, uint8_t* base) {
+  ctx.r3.u64 = uint32_t(superman_returns::native::CustomCostume());
+  sub_82698550(ctx, base);
+}
+extern "C" void SetCustomCostumeNative(PPCContext& ctx, uint8_t* base) {
+  namespace sn = superman_returns::native;
+  sn::SetCustomCostume(ArgInt(ctx, base, 0));
+  const std::string value = std::to_string(sn::CustomCostume());
+  if (!superman_returns::SaveConfigSetting(ConfigPath(), "sr_custom_costume", value))
+    REXLOG_WARN("graphics menu: could not write {}", ConfigPath().string());
+  sub_82686910(ctx, base);
+}
+extern "C" void CostumeNameCharNative(PPCContext& ctx, uint8_t* base) {
+  const int32_t id = ArgInt(ctx, base, 0);
+  const int slot = id / 32, i = id % 32;
+  uint32_t code = 0;
+  if (id >= 0 && slot >= 1 && slot <= superman_returns::native::kCustomCostumes) {
+    const std::string name = superman_returns::native::CustomCostumeName(slot);
+    if (size_t(i) < name.size()) code = uint8_t(name[i]);
+  }
+  ctx.r3.u64 = code;
+  sub_82698550(ctx, base);
+}
+
 uint32_t GuestCString(const char* text) {
   const uint32_t size = uint32_t(std::strlen(text) + 1);
   const uint32_t at = REX_KERNEL_MEMORY()->SystemHeapAlloc(size, 4);
@@ -377,6 +407,9 @@ REX_HOOK_RAW(sub_822AF3E8) {
       {"SetBrightness", &SetBrightnessNative},
       {"GetContrast", &GetContrastNative},
       {"SetContrast", &SetContrastNative},
+      {"GetCustomCostume", &GetCustomCostumeNative},
+      {"SetCustomCostume", &SetCustomCostumeNative},
+      {"CostumeNameChar", &CostumeNameCharNative},
   };
   for (const auto& [name, func] : natives) {
     const uint32_t code = dispatcher->AllocateThunk(func, 0);

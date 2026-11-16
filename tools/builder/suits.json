@@ -1,0 +1,59 @@
+[
+ {
+  "name": "suit_body",
+  "out": "body.png",
+  "file": "DATA/objtiv.AST",
+  "offset": 239886336,
+  "size": 262144,
+  "width": 512,
+  "height": 512,
+  "format": 20,
+  "sha256": "7d35009c26bcdabbf7f736a335f0f8fb6c7533c305f8c5a195d7ec97357b3411"
+ },
+ {
+  "name": "suit_briefs_boots",
+  "out": "briefs_boots.png",
+  "file": "DATA/objtiv.AST",
+  "offset": 238051328,
+  "size": 262144,
+  "width": 512,
+  "height": 512,
+  "format": 20,
+  "sha256": "1cd7d6e92172dedf33b5a9034b29e790d08ece258ba1e39b0047497bbe48514b"
+ },
+ {
+  "name": "suit_cape",
+  "out": "cape.png",
+  "file": "DATA/objtiv.AST",
+  "offset": 238051328,
+  "size": 262144,
+  "width": 512,
+  "height": 512,
+  "format": 20,
+  "sha256": "1cd7d6e92172dedf33b5a9034b29e790d08ece258ba1e39b0047497bbe48514b"
+ },
+ {
+  "name": "suit_thumb",
+  "out": "thumb.png",
+  "file": "DATA/ui.AST",
+  "offset": 8713640,
+  "size": 16384,
+  "width": 128,
+  "height": 128,
+  "format": 20,
+  "linear": true,
+  "sha256": "ceafe019f202d17c4121639b744286e3f21a732e398ffa48215d0bf8c1aa63d5"
+ },
+ {
+  "name": "suit_fullsize",
+  "out": "fullsize.png",
+  "file": "DATA/ui.AST",
+  "offset": 8765296,
+  "size": 262144,
+  "width": 512,
+  "height": 512,
+  "format": 20,
+  "linear": true,
+  "sha256": "dddece2f66ba3cca582158f58fb9441482ef2d19f8b2e915e95d779ad6bd4b89"
+ }
+]

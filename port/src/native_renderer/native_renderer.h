@@ -841,6 +841,8 @@ class Renderer : public NativeFrontend {
   // Content names of the game's textures by SRV index (texture_replace.h names), for logs and
   // per-texture companions (patch 0036 window maps).
   std::vector<std::string> srv_names_;
+  // CustomCostumeGeneration() last seen (texture_replace.h): a change recreates the costume's textures.
+  uint32_t costume_generation_ = 0;
   struct TextureEntry {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     uint32_t srv_index = 0;

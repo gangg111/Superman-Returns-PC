@@ -1,5 +1,6 @@
 #include "textures.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -136,6 +137,70 @@ std::vector<uint8_t> DdsHeader(uint32_t w, uint32_t h) {
   return d;
 }
 
+// A PNG of RGBA8 rows, its pixels in stored (uncompressed) deflate blocks: any image editor
+// reads it, and the builder needs no compression library.
+uint32_t Crc32(const uint8_t* p, size_t n, uint32_t crc = 0) {
+  static const auto table = [] {
+    std::vector<uint32_t> t(256);
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; ++k) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+      t[i] = c;
+    }
+    return t;
+  }();
+  crc = ~crc;
+  for (size_t i = 0; i < n; ++i) crc = table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+  return ~crc;
+}
+
+std::vector<uint8_t> Png(const std::vector<uint8_t>& rgba, uint32_t w, uint32_t h) {
+  std::vector<uint8_t> raw;  // filter byte 0, then the row
+  raw.reserve(size_t(h) * (size_t(w) * 4 + 1));
+  for (uint32_t y = 0; y < h; ++y) {
+    raw.push_back(0);
+    raw.insert(raw.end(), rgba.begin() + ptrdiff_t(size_t(y) * w * 4), rgba.begin() + ptrdiff_t(size_t(y + 1) * w * 4));
+  }
+  std::vector<uint8_t> z = {0x78, 0x01};
+  for (size_t at = 0; at < raw.size() || at == 0;) {
+    const size_t n = std::min<size_t>(65535, raw.size() - at);
+    const bool last = at + n == raw.size();
+    z.push_back(last ? 1 : 0);
+    z.push_back(uint8_t(n));
+    z.push_back(uint8_t(n >> 8));
+    z.push_back(uint8_t(~n));
+    z.push_back(uint8_t(~n >> 8));
+    z.insert(z.end(), raw.begin() + ptrdiff_t(at), raw.begin() + ptrdiff_t(at + n));
+    at += n;
+    if (last) break;
+  }
+  uint32_t a = 1, b = 0;
+  for (uint8_t v : raw) {
+    a = (a + v) % 65521;
+    b = (b + a) % 65521;
+  }
+  const uint32_t adler = b << 16 | a;
+  for (int s = 24; s >= 0; s -= 8) z.push_back(uint8_t(adler >> s));
+  std::vector<uint8_t> out = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+  auto chunk = [&](const char* type, const std::vector<uint8_t>& data) {
+    const uint32_t n = uint32_t(data.size());
+    for (int s = 24; s >= 0; s -= 8) out.push_back(uint8_t(n >> s));
+    const size_t start = out.size();
+    out.insert(out.end(), type, type + 4);
+    out.insert(out.end(), data.begin(), data.end());
+    const uint32_t crc = Crc32(out.data() + start, out.size() - start);
+    for (int s = 24; s >= 0; s -= 8) out.push_back(uint8_t(crc >> s));
+  };
+  std::vector<uint8_t> ihdr;
+  for (uint32_t v : {w, h})
+    for (int s = 24; s >= 0; s -= 8) ihdr.push_back(uint8_t(v >> s));
+  ihdr.insert(ihdr.end(), {8, 6, 0, 0, 0});  // 8 bits, RGBA, deflate, no filter set, no interlace
+  chunk("IHDR", ihdr);
+  chunk("IDAT", z);
+  chunk("IEND", {});
+  return out;
+}
+
 std::vector<uint8_t> ReadRange(const fs::path& path, uint64_t offset, size_t size) {
   std::ifstream in(path, std::ios::binary);
   if (!in) throw Failure("missing:" + Narrow(path.filename().wstring()));
@@ -149,7 +214,7 @@ std::vector<uint8_t> ReadRange(const fs::path& path, uint64_t offset, size_t siz
 }  // namespace
 
 std::vector<uint8_t> DecodeGameTexture(const std::vector<uint8_t>& tiled, uint32_t width, uint32_t height,
-                                       uint32_t guest_format) {
+                                       uint32_t guest_format, bool linear) {
   if (guest_format != 18 && guest_format != 20) throw std::runtime_error("texture format " + std::to_string(guest_format));
   const bool bc3 = guest_format == 20;  // k_DXT4_5; 18 is k_DXT1
   const uint32_t bpb = bc3 ? 16 : 8, log2 = bc3 ? 4 : 3;
@@ -157,7 +222,8 @@ std::vector<uint8_t> DecodeGameTexture(const std::vector<uint8_t>& tiled, uint32
   std::vector<uint8_t> rgba(size_t(width) * height * 4);
   for (uint32_t by = 0; by < bh; ++by)
     for (uint32_t bx = 0; bx < bw; ++bx) {
-      const size_t at = size_t(TiledAddress2D(int32_t(bx), int32_t(by), pitch, log2));
+      const size_t at = linear ? (size_t(by) * bw + bx) * bpb
+                               : size_t(TiledAddress2D(int32_t(bx), int32_t(by), pitch, log2));
       if (at + bpb > tiled.size()) throw std::runtime_error("texture data too short");
       uint8_t block[16];
       for (uint32_t i = 0; i < bpb; ++i) block[i] = tiled[at + (i ^ 1)];  // 8-in-16
@@ -267,7 +333,12 @@ int MakeTextures(const Pack& pack, const fs::path& game_dir, const fs::path& out
     uint64_t offset = 0;
     size_t size = 0;
     uint32_t w = 0, h = 0, format = 0;
+    bool linear = false;
   };
+  // the custom costume slots (port: native_renderer/texture_replace.h)
+  const fs::path suits = out_dir / L"Suits";
+  constexpr int kFirstSlot = 4, kLastSlot = 6;
+  auto slot_dir = [&](int n) { return suits / Widen("Slot" + std::to_string(n)); };
   std::map<std::string, Source> sources;
   int written = 0;
   for (size_t i = 0; i < lines.size(); ++i) {
@@ -281,17 +352,43 @@ int MakeTextures(const Pack& pack, const fs::path& game_dir, const fs::path& out
       const fs::path dir = kind == "own" ? out_dir : out_dir.parent_path();
       WriteAll(dir / fs::path(Widen(name.substr(name.find('/') + 1))), data.data(), data.size());
       ++written;
-    } else if (kind == "src") {
+    } else if (kind == "src" || kind == "srclinear") {
       Source s;
       words >> s.path >> s.offset >> s.size >> s.w >> s.h >> s.format >> s.sha;
+      s.linear = kind == "srclinear";
       sources[name] = s;
-    } else if (kind == "window" || kind == "diff") {
+    } else if (kind == "suitnames") {
+      for (int n = kFirstSlot; n <= kLastSlot; ++n) {
+        const fs::path toml = slot_dir(n) / L"costume.toml";
+        std::error_code ec;
+        if (fs::exists(toml, ec)) continue;
+        const std::string text = "# The name this costume slot shows in the Fortress's costumes screen.\r\n"
+                                  "name = \"Slot " + std::to_string(n) + "\"\r\n";
+        WriteAll(toml, text.data(), text.size());
+        ++written;
+      }
+    } else if (kind == "window" || kind == "diff" || kind == "suit") {
       const Source& s = sources.at(name);
       const std::vector<uint8_t> tiled = ReadRange(game_dir / fs::path(Widen(s.path)), s.offset, s.size);
       Sha256 h;
       h.Update(tiled.data(), tiled.size());
       if (tiled.size() != s.size || h.Hex() != s.sha) throw Failure("wrong_game:" + s.path);
-      const std::vector<uint8_t> rgba = DecodeGameTexture(tiled, s.w, s.h, s.format);
+      const std::vector<uint8_t> rgba = DecodeGameTexture(tiled, s.w, s.h, s.format, s.linear);
+      if (kind == "suit") {
+        // the player's own edits stay: only slots without this file get it
+        std::string file;
+        words >> file;
+        std::vector<uint8_t> png;
+        for (int n = kFirstSlot; n <= kLastSlot; ++n) {
+          const fs::path dest = slot_dir(n) / Widen(file);
+          std::error_code ec;
+          if (fs::exists(dest, ec)) continue;
+          if (png.empty()) png = Png(rgba, s.w, s.h);
+          WriteAll(dest, png.data(), png.size());
+          ++written;
+        }
+        continue;
+      }
       if (kind == "window") {
         double kenv[3];
         words >> kenv[0] >> kenv[1] >> kenv[2];

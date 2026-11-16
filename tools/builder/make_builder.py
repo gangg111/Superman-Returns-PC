@@ -35,6 +35,7 @@ SOURCES = ["main.cpp", "build.cpp", "audio.cpp", "textures.cpp"]
 # The remastered textures (builder/textures.h): where the made ones' game textures are on the
 # disc (found once by their bytes in the renderer's dumps) and how each is made.
 TEXTURES_JSON = os.path.join(os.path.dirname(__file__), "textures.json")
+SUITS_JSON = os.path.join(os.path.dirname(__file__), "suits.json")
 # builder/ffmpeg_min.sh's install folder (MSYS2 home): the DLLs the audio conversion loads
 FFMPEG = os.environ.get("SR_FFMPEG_MIN", f"C:/msys64/home/{os.path.basename(os.path.expanduser('~'))}/srff/out")
 
@@ -150,7 +151,9 @@ def textures_payload(port, game, files):
     spec = json.load(open(TEXTURES_JSON, encoding="utf-8"))
     made = {e["name"] + ("_win.dds" if "window_kenv" in e else ".dds") for e in spec}
     lines = []
-    for dirpath, _, names in os.walk(tex):
+    for dirpath, dirs, names in os.walk(tex):
+        # textures/Suits: the costume slots, made from the player's disc (suits.json), never shipped
+        dirs[:] = [d for d in dirs if not (dirpath == tex and d.lower() == "suits")]
         for n in sorted(names):
             rel = os.path.relpath(os.path.join(dirpath, n), tex).replace("\\", "/")
             if n in made:
@@ -177,6 +180,20 @@ def textures_payload(port, game, files):
             name = f"textures_made/{e['name']}.diff"
             files.append((name, ref[:128] + diff.tobytes()))
             lines.append(f"diff {e['name']} {name}")
+    # the custom costume slots' starting files (textures/Suits/Slot4..6, the user's request
+    # 2026-11-16): costume 1's textures and pictures from the player's own disc as PNGs to
+    # edit, and costume.toml with the slot's name; the builder never overwrites them
+    for e in json.load(open(SUITS_JSON, encoding="utf-8")):
+        with open(os.path.join(game, e["file"]), "rb") as f:
+            f.seek(e["offset"])
+            data = f.read(e["size"])
+        if hashlib.sha256(data).hexdigest() != e["sha256"]:
+            raise SystemExit(f"{e['name']}: not at {e['file']}+{e['offset']}")
+        kind = "srclinear" if e.get("linear") else "src"
+        lines.append(f"{kind} {e['name']} {e['file']} {e['offset']} {e['size']} {e['width']} {e['height']} "
+                     f"{e['format']} {e['sha256']}")
+        lines.append(f"suit {e['name']} {e['out']}")
+    lines.append("suitnames")
     # the night's street lamps (the user's lamp_cache.bin, 2026-11-09: positions only, 3 floats a
     # lamp): the renderer knows only the lamps of sectors already loaded, so a new folder lit them
     # near Superman alone until the city had been flown over

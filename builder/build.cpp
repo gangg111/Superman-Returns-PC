@@ -170,9 +170,12 @@ fs::path Build(const Pack& pack, const BuildOptions& options, std::atomic<bool>&
           if (!it->is_regular_file(ec)) continue;
           const fs::path rel = fs::relative(it->path(), old_textures, ec);
           const fs::path to = work / L"textures" / rel;
-          if (rel.empty() || fs::exists(to, ec)) continue;
+          // the costume slots (textures\Suits): the player's files win over this
+          // build's starting ones (costume.toml's name, the edited PNGs)
+          const bool suit = !rel.empty() && _wcsicmp(rel.begin()->c_str(), L"Suits") == 0;
+          if (rel.empty() || (!suit && fs::exists(to, ec))) continue;
           fs::create_directories(to.parent_path(), ec);
-          fs::copy_file(it->path(), to, ec);
+          fs::copy_file(it->path(), to, suit ? fs::copy_options::overwrite_existing : fs::copy_options::none, ec);
         }
         ec.clear();
       }

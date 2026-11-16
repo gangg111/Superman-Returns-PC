@@ -3,7 +3,9 @@ Input: the game's ui.AST and text.AST (skipped without them). The built
 archives are read back with apt.py and an XML parser, and checked against
 what the recipe promises: the game's entries untouched, the new screen's
 rows, the new paths in MAIN, the texts."""
+import hashlib
 import os
+import struct
 import sys
 import xml.etree.ElementTree as ET
 
@@ -49,9 +51,10 @@ def test_game_entries_untouched(built):
     # since the key icons (2026-11-09, the user's "zamiast przycisków xboxa klawisze") also BUTTONICON
     # and SCRPRESSSTART ("PRESS ENTER" on keyboard and mouse, the user's request 2026-11-09)
     # and SCRMOVESLIST, SCRSTATISTICS (their scroll arrows clickable, the user's screenshots 2026-11-09)
-    # and SCRGENPOP (the boot popup as New Game, Load Game, Options, the user's request 2026-11-14)
+    # (SCRGENPOP stays the game's: the boot popup's code is MAIN's, 2026-11-16)
+    # and SCRCOSTUMES (the custom costume slots 4 to 6, the user's request 2026-11-16)
     changed = {'MAIN', 'SCRCONTROLROOM', 'SCRPAUSEMENU', 'SCRGAMEPLAYOPT', 'SCRCONTROLLEROPT', 'SCRAUDIOOPT',
-               'BUTTONICON', 'SCRPRESSSTART', 'SCRMOVESLIST', 'SCRSTATISTICS', 'SCRGENPOP'}
+               'BUTTONICON', 'SCRPRESSSTART', 'SCRMOVESLIST', 'SCRSTATISTICS', 'SCRCOSTUMES'}
     for e in orig.entries:
         if e['name'] not in changed:
             assert ui.data(ui.find(e['name'])) == orig.data(e), e['name']
@@ -62,8 +65,9 @@ def test_game_entries_untouched(built):
     # column (the user's request 2026-11-10), and 28 HINTPS<name> icons of the PlayStation pads
     # (the user's request 2026-11-11): the game's 31 hints less the 4 plain arrows and the question
     # mark, plus the LB and RB names the hints also ask for, and SCRTUNINGOPT (Brightness and
-    # Contrast sliders, the user's request 2026-11-13)
-    assert len(ui.entries) == len(orig.entries) + 5 + 111 + 1 + 1 + 1 + 28 + 1
+    # Contrast sliders, the user's request 2026-11-13), and COSTUMETHUMB_4..6 and
+    # COSTUMEFULLSIZE_4..6 (the custom costume slots' pictures, 2026-11-16)
+    assert len(ui.entries) == len(orig.entries) + 5 + 111 + 1 + 1 + 1 + 28 + 1 + 6
     for name in ('HINTPSA', 'HINTPSSTART', 'HINTPSRSTICK_UD', 'HINTPSLB'):
         assert ui.find(name) is not None, name
 
@@ -499,16 +503,18 @@ def test_boot_popup_menu(built):
     # the popup after PRESS ENTER (the C++ boot flow's LOAD A GAME?, buttons Load Game and Start New
     # Game; apt.py dump of SCRGENPOP): shown as New
     # Game, Load Game, Options, the two game buttons mapped back to the game's own index
+    # The code is MAIN's (it never unloads) and goes onto each popup through
+    # gPopupMgr.PopupFetchData; ScrGenPop's movie stays the game's: code added there broke
+    # every popup after the first two (2026-11-16)
     ui, text = built
-    m = movie(ui, 'SCRGENPOP')
-    items = m.frames(*m.header()['frames'])[0]
-    ours = [strings_pushed(m, it['code']) for it in items
-            if it['type'] == 8 and "'srPopupInit0'" in strings_pushed(m, it['code'])]
-    assert len(ours) == 1
+    orig = apt_edit.Archive(open(os.path.join(DATA, 'ui.AST'), 'rb').read())
+    assert ui.data(ui.find('SCRGENPOP')) == orig.data(orig.find('SCRGENPOP'))
+    main = ' | '.join(all_strings(movie(ui, 'MAIN')))
     for t in ("'LoadCreate_Profile_Title'", "'LoadCreate_Create_Btn'", "'SR_BOOT_TITLE'", "'SR_BOOT_NEW_GAME'", "'SR_BOOT_LOAD_GAME'",
               "'SR_BOOT_OPTIONS'", "'srMap'", "'srOptOverlay'", "'_visible'", "'selectedCallback'", "'ClosePopup'",
-              "'OPTIONS_MENU'"):
-        assert t in ' | '.join(ours[0]), t
+              "'OPTIONS_MENU'", "'PopupFetchData'", "'srFetch0'", "'srGenPopInit'", "'srGenPopInput'",
+              "'srPopupInit0'", "'srHandleInput0'", "'srHookPopups'"):
+        assert t in main, t
     # OPTIONS from it on its own screen level over PRESS ENTER (reloading PRESS ENTER crashed the
     # game, measured 2026-11-14), the menu hidden meanwhile; B there closes the level and shows it
     opts = ' | '.join(all_strings(movie(ui, 'SCROPTIONSMENU')))
@@ -537,3 +543,48 @@ def test_options_screens_never_go_to_the_control_room(built):
         assert len(ours) == 1, entry
         assert "'OPTIONS_MENU'" in ours[0] and "'PAUSEMODE_MENU'" not in ours[0], entry
     assert "'MAINMENU'" in all_strings(movie(ui, 'SCROPTIONSMENU'))
+
+
+def test_costume_slots(built):
+    """Slots 4 to 6 on the costumes screen: their pictures exist, decode to the
+    game's slot-1 picture size, differ from it (their own textures, so a
+    player's picture replaces one slot only) and from each other; the screen's
+    code asks the port for the names and wears a custom slot."""
+    ui, text = built
+    orig = apt_edit.Archive(open(os.path.join(DATA, 'ui.AST'), 'rb').read())
+    tex = lambda a, name: [apt_edit.Archive(a.data(a.find(name))).data(e)
+                           for e in apt_edit.Archive(a.data(a.find(name))).entries if e['flags'] == 0][0]
+    for kind in ('COSTUMETHUMB', 'COSTUMEFULLSIZE'):
+        game = tex(orig, kind + '_1')
+        ours = [tex(ui, '%s_%d' % (kind, n)) for n in (4, 5, 6)]
+        assert all(len(t) == len(game) for t in ours)
+        assert len({bytes(t) for t in ours} | {bytes(game)}) == 4
+        # the renderer names these textures by content (texture_replace.cpp CostumeFiles,
+        # measured 2026-11-16 with these bytes): a change here needs the names measured again
+        assert [hashlib.sha256(t).hexdigest()[:16] for t in ours] == {
+            'COSTUMETHUMB': ['1061eca871e3434c', '54a956a5e4cb620b', 'b5e30c2914847312'],
+            'COSTUMEFULLSIZE': ['3983a4ad3dad13e8', 'c81d203d0a81f715', '1b8f3969988b8b2a']}[kind]
+    found = set(all_strings(movie(ui, 'SCRCOSTUMES')))
+    for s in ("'CostumeNameChar'", "'SetCustomCostume'", "'srCostumeCreate'", "'fromCharCode'",
+              "'artassets/Costumes/thumbs/CostumeThumb_6.swf'", "'SR_COSTUME_CUSTOM_DESC_3'"):
+        assert s in found, s
+
+
+def test_every_movie_follows_the_loader_order(built):
+    """Every movie in the built archive (the game's, ours, the changed ones): its
+    ConstantPool and PushData entries are 0, 1, 2, ... in the order the game's
+    loader visits them (apt.Movie.loader_lists). The loader writes a counter back
+    into the lists when a movie unloads, so anything else breaks the movie's next
+    load: the popups after the main menu, 2026-11-16."""
+    ui, _ = built
+    checked = 0
+    for e in ui.entries:
+        try:
+            d, c = apt.read_bgfa_movie(ui.data(e))
+        except (ValueError, KeyError, IndexError, struct.error):
+            continue
+        mv = apt.Movie(d, c)
+        got = [mv.u32(lst + 4 * i) for lst, n in mv.loader_lists() for i in range(n)]
+        assert got == list(range(len(got))), e['name']
+        checked += 1
+    assert checked > 100

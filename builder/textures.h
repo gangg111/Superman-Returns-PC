@@ -17,8 +17,9 @@ class Pack;
 
 // RGBA8 rows of a game texture's first level, decoded as Pillow does (the tools read the
 // renderer's dumps with Pillow): Xenos 2D tiling, 8-in-16 byte order, BC1 or BC3.
+// `linear`: blocks row by row, not tiled (the menus' pictures in ui.AST, tools/ui/xtex.py).
 std::vector<uint8_t> DecodeGameTexture(const std::vector<uint8_t>& tiled, uint32_t width, uint32_t height,
-                                       uint32_t guest_format);
+                                       uint32_t guest_format, bool linear = false);
 
 // The window map DDS (make_window_map.py, byte for byte) from RGBA8 rows and the glass weights.
 std::vector<uint8_t> WindowMap(const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height,
@@ -32,6 +33,12 @@ std::vector<uint8_t> WindowMap(const std::vector<uint8_t>& rgba, uint32_t width,
 //   window <name> <kr> <kg> <kb>               textures\windows\<name>_win.dds
 //   diff <name> <payload path>                 textures\<name>.dds: the header, then
 //                                              (game RGBA + difference) mod 256
+//   srclinear <as src>                         a source whose blocks are not tiled
+//   suit <name> <file>                         textures\Suits\Slot4..6\<file>: the source as
+//                                              a PNG (over an older build, the player's own
+//                                              files there win: build.cpp)
+//   suitnames                                  textures\Suits\Slot<n>\costume.toml with
+//                                              name = "Slot <n>", where missing
 // Returns the number of files written.
 int MakeTextures(const Pack& pack, const fs::path& game_dir, const fs::path& out_dir, std::atomic<bool>& cancel,
                  const std::function<void(double, const std::string&)>& progress);

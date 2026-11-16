@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -42,6 +44,13 @@ REXCVAR_DEFINE_STRING(sr_input_script, "", "Input",
                       "Automation: keys pressed inside the game without focus or system input, "
                       "\"seconds:Key[:ms];...\" from the driver start (Key as in keybind_*, "
                       "e.g. \"25:Return;29:Shift+Down;97:Up:1500\"; default hold 120 ms)");
+REXCVAR_DEFINE_STRING(sr_input_control, "", "Input",
+                      "Automation: a file the game reads commands from while it runs, "
+                      "\"press <Key>[ ms]\" and \"dump\" (a frame into sr_native_dump_dir), one a line");
+
+namespace superman_returns::native {
+void RequestFrameDump(const std::string& prefix);  // native_renderer.cpp
+}
 
 namespace superman_returns::input {
 
@@ -122,6 +131,85 @@ bool SharedKeyDown(const bool (&down)[256], const char* a, const char* b) {
   return false;
 }
 
+// "Shift+Down" -> its virtual keys (modifiers included).
+std::vector<uint8_t> ComboKeys(std::string_view combo) {
+  std::vector<uint8_t> keys;
+  while (!combo.empty()) {
+    const size_t plus = combo.find('+');
+    const std::string_view name = combo.substr(0, plus);
+    combo = plus == std::string_view::npos ? std::string_view() : combo.substr(plus + 1);
+    const uint16_t vk = name == "Shift" ? VK_SHIFT : name == "Ctrl" ? VK_CONTROL : name == "Alt" ? VK_MENU
+                                              : uint16_t(rex::ui::ParseVirtualKey(name));
+    if (vk && vk < 256) keys.push_back(uint8_t(vk));
+  }
+  return keys;
+}
+
+// sr_input_control: commands appended to a file while the game runs, read every
+// 100 ms from where the last read stopped (automation that waits on what the
+// screen shows, unlike the fixed times of sr_input_script):
+//   press <Key>[+<Key>...] [ms]   held from now, 150 ms by default
+//   dump                          the next presented frame into sr_native_dump_dir
+//                                 as c<n>_* (raw2png.py), n counting from 1
+// Each command is logged ("control: ..."), the dump with its file prefix.
+bool ControlKeys(bool (&down)[256]) {
+  using Clock = std::chrono::steady_clock;
+  struct Hold {
+    Clock::time_point until;
+    std::vector<uint8_t> keys;
+  };
+  static std::vector<Hold> holds;
+  static Clock::time_point next_read{};
+  static uint64_t offset = 0;
+  static int dumps = 0;
+  const std::string path = rex::cvar::Query<std::string>("sr_input_control");
+  if (path.empty()) return false;
+  const auto now = Clock::now();
+  if (now >= next_read) {
+    next_read = now + std::chrono::milliseconds(100);
+    std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
+    if (in) {
+      in.seekg(0, std::ios::end);
+      const uint64_t size = uint64_t(in.tellg());
+      if (size < offset) offset = 0;  // the file was started again
+      in.seekg(std::streamoff(offset));
+      std::string text(size_t(size - offset), '\0');
+      in.read(text.data(), std::streamsize(text.size()));
+      const size_t last = text.rfind('\n');
+      if (last != std::string::npos) {
+        offset += last + 1;
+        std::string_view rest(text.data(), last + 1);
+        while (!rest.empty()) {
+          const size_t nl = rest.find('\n');
+          std::string_view line = rest.substr(0, nl);
+          rest = rest.substr(nl + 1);
+          while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.remove_suffix(1);
+          if (line.rfind("press ", 0) == 0) {
+            std::string_view arg = line.substr(6);
+            const size_t sp = arg.find(' ');
+            const double ms = sp == std::string_view::npos ? 150.0 : std::atof(std::string(arg.substr(sp + 1)).c_str());
+            holds.push_back({now + std::chrono::milliseconds(int64_t(ms)), ComboKeys(arg.substr(0, sp))});
+            REXLOG_INFO("control: press {} for {} ms", arg.substr(0, sp), ms);
+          } else if (line == "dump") {
+            const std::string prefix = "c" + std::to_string(++dumps) + "_";
+            superman_returns::native::RequestFrameDump(prefix);
+            REXLOG_INFO("control: dump {}", prefix);
+          } else if (!line.empty()) {
+            REXLOG_WARN("control: unknown command '{}'", line);
+          }
+        }
+      }
+    }
+  }
+  bool any = false;
+  holds.erase(std::remove_if(holds.begin(), holds.end(), [&](const Hold& h) { return now >= h.until; }), holds.end());
+  for (const Hold& h : holds) {
+    for (uint8_t vk : h.keys) down[vk] = true;
+    any = true;
+  }
+  return any;
+}
+
 // sr_input_script: the keys (modifiers included) held at `elapsed_ms`.
 // Returns whether any scripted key is held.
 bool ScriptKeys(double elapsed_ms, bool (&down)[256]) {
@@ -146,15 +234,7 @@ bool ScriptKeys(double elapsed_ms, bool (&down)[256]) {
       s.start_ms = std::atof(std::string(item.substr(0, c1)).c_str()) * 1000.0;
       const double hold = c2 == std::string_view::npos ? 120.0 : std::atof(std::string(item.substr(c2 + 1)).c_str());
       s.end_ms = s.start_ms + hold;
-      std::string_view combo = item.substr(c1 + 1, c2 == std::string_view::npos ? std::string_view::npos : c2 - c1 - 1);
-      while (!combo.empty()) {
-        const size_t plus = combo.find('+');
-        const std::string_view name = combo.substr(0, plus);
-        combo = plus == std::string_view::npos ? std::string_view() : combo.substr(plus + 1);
-        const uint16_t vk = name == "Shift" ? VK_SHIFT : name == "Ctrl" ? VK_CONTROL : name == "Alt" ? VK_MENU
-                                                  : uint16_t(rex::ui::ParseVirtualKey(name));
-        if (vk && vk < 256) s.keys.push_back(uint8_t(vk));
-      }
+      s.keys = ComboKeys(item.substr(c1 + 1, c2 == std::string_view::npos ? std::string_view::npos : c2 - c1 - 1));
       if (!s.keys.empty()) out.push_back(std::move(s));
     }
     if (!out.empty()) REXLOG_INFO("Raw Input: input script with {} steps", out.size());
@@ -405,8 +485,9 @@ X_RESULT RawInputKbmDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state
   if (!Enabled() || id != kDevice) return X_ERROR_DEVICE_NOT_CONNECTED;
   static const auto script_start = std::chrono::steady_clock::now();
   bool scripted[256] = {};
-  const bool script_held = ScriptKeys(
+  bool script_held = ScriptKeys(
       std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - script_start).count(), scripted);
+  script_held = ControlKeys(scripted) || script_held;
   const bool foreground = GameInForeground();
   const bool live = (foreground || script_held) && is_active();
   // Mouse look only in the game itself (no menu open), and with sr_kbm_auto
@@ -448,7 +529,14 @@ X_RESULT RawInputKbmDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state
   if (!out_state) return X_ERROR_SUCCESS;
   std::memset(out_state, 0, sizeof(*out_state));
   out_state->packet_number = packet_;
+  // Enter and Escape held across a menu switch (below). Tracked while no key
+  // can reach the game too: else the first scripted key after a stretch in the
+  // background met a stale was_menu and was taken for a key held across a
+  // switch, and dropped (sr_input_control's first Enter, 2026-11-16).
+  static bool enter_held = false, escape_held = false, was_menu = false;
   if (!live) {
+    was_menu = MenuActive();
+    enter_held = escape_held = false;
     RecordInputState(id, *out_state);
     return X_ERROR_SUCCESS;
   }
@@ -465,7 +553,6 @@ X_RESULT RawInputKbmDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state
   bool menu_enter = false, menu_escape = false, game_escape = false;
   uint16_t menu_arrows = 0;
   {
-    static bool enter_held = false, escape_held = false, was_menu = false;
     const bool menu = MenuActive();
     if (menu != was_menu) {
       enter_held = k[VK_RETURN];

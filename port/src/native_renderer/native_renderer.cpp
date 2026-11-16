@@ -436,6 +436,17 @@ namespace superman_returns::native {
 bool InlineRayTracingSupported() { return g_inline_rt; }
 bool DlssSupported() { return g_dlss_hardware; }
 }  // namespace superman_returns::native
+
+// sr_input_control's "dump" (input/rawinput_kbm_driver.cpp): the next presented
+// frame into sr_native_dump_dir under `prefix`.
+std::mutex g_frame_dump_mutex;
+std::string g_frame_dump_prefix;
+namespace superman_returns::native {
+void RequestFrameDump(const std::string& prefix) {
+  std::lock_guard lock(g_frame_dump_mutex);
+  g_frame_dump_prefix = prefix;
+}
+}  // namespace superman_returns::native
 REXCVAR_DEFINE_INT32(sr_native_shadow_quality, 4, "Superman Returns Native",
                      "Shadow map resolution multiplier (1 = original 1024, 2 = 2048, 4 = 4096)")
     .range(1, 4);
@@ -8956,6 +8967,13 @@ void Renderer::EndFrameAndPresent(uint32_t front_buffer_address) {
     if (std::find(ab_swaps.begin(), ab_swaps.end(), swap_number_) != ab_swaps.end()) {
       DumpFrameResources(fmt::format("s{:06}_", swap_number_), false, true);
     }
+    // sr_input_control's "dump" (RequestFrameDump): the same, under its prefix.
+    std::string requested;
+    {
+      std::lock_guard lock(g_frame_dump_mutex);
+      requested.swap(g_frame_dump_prefix);
+    }
+    if (!requested.empty()) DumpFrameResources(requested, false, true);
   }
   // Filtering A/B: the configured anisotropy from this swap on.
   if (REXCVAR_GET(sr_native_aniso_from_swap) > 0 &&
@@ -8966,6 +8984,24 @@ void Renderer::EndFrameAndPresent(uint32_t front_buffer_address) {
   }
   // Texture replacement A/B: from this swap on, recreate every texture with
   // the replacements (the frames before it use the game's textures).
+  // Another custom costume worn (texture_replace.h): only the costume's
+  // textures are created again, with the new slot's files.
+  if (const uint32_t costume = CustomCostumeGeneration(); costume != costume_generation_) {
+    costume_generation_ = costume;
+    size_t dropped = 0;
+    for (auto it = textures_.begin(); it != textures_.end();) {
+      const uint32_t srv = it->second.srv_index;
+      if (srv < srv_names_.size() && !srv_names_[srv].empty() && IsCostumeTexture(srv_names_[srv])) {
+        Retire(it->second.resource);
+        RetireSrvIndex(srv);
+        it = textures_.erase(it);
+        ++dropped;
+      } else {
+        ++it;
+      }
+    }
+    REXLOG_INFO("costumes: slot {}, {} costume texture(s) recreated", CustomCostume(), dropped);
+  }
   if (ReplaceFromSwap() && swap_number_ == ReplaceFromSwap()) {
     for (auto& [key, entry] : textures_) {
       Retire(entry.resource);

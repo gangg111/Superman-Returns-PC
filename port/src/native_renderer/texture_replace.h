@@ -37,4 +37,21 @@ bool IsBlockCompressed(DXGI_FORMAT format);
 uint64_t ReplaceFromSwap();
 void SetReplacementsEnabled(bool enabled);
 
+// Custom costume slots (the Fortress's costumes screen, CUSTOM 1..3 after the
+// game's three): <exe>/textures/Suits/Slot<n + 3>/ holds the player's PNGs under
+// readable names (body.png, briefs_boots.png, cape.png), each standing for the
+// game textures of costume 1 listed in texture_replace.cpp, and costume.toml
+// with name = "...". While slot n is worn (sr_custom_costume = n) its files come
+// before the textures folder; thumb.png and fullsize.png replace the slot's own
+// pictures on the screen whichever slot is worn.
+constexpr int kCustomCostumes = 3;
+int CustomCostume();  // 0: the game's costume
+// Wears slot `slot` (0..kCustomCostumes); the renderer recreates the costume's
+// textures on its next frame. The caller saves the cvar.
+void SetCustomCostume(int slot);
+uint32_t CustomCostumeGeneration();
+bool IsCostumeTexture(const std::string& name);
+// The slot's name from its costume.toml, else "SLOT <slot + 3>" (printable ASCII, at most 24).
+std::string CustomCostumeName(int slot);
+
 }  // namespace superman_returns::native

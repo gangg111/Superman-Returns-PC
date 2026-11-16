@@ -32,6 +32,8 @@ REXCVAR_DEFINE_STRING(sr_texture_replace_dir, "", "Superman Returns Native",
 REXCVAR_DEFINE_INT32(sr_texture_replace_from_swap, 0, "Superman Returns Native",
                      "A/B: start texture replacement at this guest swap (0 = from the start)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_INT32(sr_custom_costume, 0, "Superman Returns Native",
+                     "Custom costume worn: 1..3 = the costumes screen's slots 4..6 (<exe>/textures/Suits/Slot4..6); 0 = the game's costume");
 
 namespace superman_returns::native {
 
@@ -101,7 +103,14 @@ const ReplaceIndex& Index() {
     }
     // A .dds or a .png (the players' request 2026-11-11: an edited PNG under the
     // dumped name); with both, the DDS.
-    for (const auto& e : fs::recursive_directory_iterator(r.dir, ec)) {
+    for (auto it = fs::recursive_directory_iterator(r.dir, ec); it != fs::recursive_directory_iterator();
+         it.increment(ec)) {
+      const auto& e = *it;
+      // the custom costumes' files (textures/Suits/Slot<n>) count only while worn
+      if (it.depth() == 0 && e.is_directory() && _wcsicmp(e.path().filename().c_str(), L"Suits") == 0) {
+        it.disable_recursion_pending();
+        continue;
+      }
       if (!e.is_regular_file()) continue;
       std::string ext = e.path().extension().string();
       std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
@@ -208,6 +217,102 @@ uint64_t ReplaceFromSwap() {
 void SetReplacementsEnabled(bool enabled) {
   std::call_once(g_replace_init, [] {});  // the initial state must not override this
   g_replace_enabled = enabled;
+}
+
+namespace {
+
+// The player's files in a custom costume folder and the game textures each one
+// stands for, by the first 16 digits of the name (the content hash). Measured
+// by painting them (memory: kostium-i-peleryna-tekstury): the suit's body; the
+// briefs and boots; the cape's outside, three byte-identical copies of the
+// briefs' texture under other hashes (the scene decides which one is drawn).
+struct CostumeFile {
+  const char* file;
+  std::vector<std::string> hashes;
+  // The slots' own pictures on the costumes screen: hashes[n - 1] is slot n's,
+  // replaced by that slot's file whichever slot is worn. Measured by the
+  // renderer's dump on the screen (2026-11-16); they are the textures
+  // tools/ui/build_ui_mod.py costume_picture_entries makes, and change with them
+  // (tests/ui test_costume_slots holds their bytes' SHA-256).
+  bool picture;
+};
+const std::vector<CostumeFile>& CostumeFiles() {
+  static const std::vector<CostumeFile> files = {
+      {"body.png", {"4817CA35041A47A3"}, false},
+      {"briefs_boots.png", {"BABD6E1873DAE219"}, false},
+      {"cape.png", {"1DDFD929C1386395", "37723AEE4F1D9AE1", "156E060938442B71"}, false},
+      {"thumb.png", {"D597E26BDE5373A9", "A3EC202389B3DF1A", "ACF323EDE2C52B6B"}, true},
+      {"fullsize.png", {"ECDE511A52384ADF", "0FAEA40EE38407CC", "F1B7D42AE0D96D82"}, true},
+  };
+  return files;
+}
+
+// <exe>/textures/Suits/Slot<4..6>: the screen's slots 4 to 6 (the user's names,
+// 2026-11-16). Suits is left out of the textures folder's own index.
+fs::path CostumeDir(int slot) {
+  wchar_t exe[MAX_PATH] = {};
+  GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  return fs::path(exe).parent_path() / "textures" / "Suits" / ("Slot" + std::to_string(slot + 3));
+}
+
+std::atomic<uint32_t> g_costume_generation{0};
+
+// The player's file standing for texture `name`, if the worn slot has one.
+bool CostumePath(const std::string& name, fs::path& out) {
+  const std::string hash = name.substr(0, 16);
+  for (const auto& f : CostumeFiles()) {
+    const auto at = std::find(f.hashes.begin(), f.hashes.end(), hash);
+    if (at == f.hashes.end()) continue;
+    const int slot = f.picture ? int(at - f.hashes.begin()) + 1 : CustomCostume();
+    if (slot <= 0) return false;
+    std::error_code ec;
+    const fs::path p = CostumeDir(slot) / f.file;
+    if (!fs::is_regular_file(p, ec)) return false;
+    out = p;
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+int CustomCostume() {
+  return std::clamp(REXCVAR_GET(sr_custom_costume), 0, kCustomCostumes);
+}
+
+void SetCustomCostume(int slot) {
+  slot = std::clamp(slot, 0, kCustomCostumes);
+  if (slot == CustomCostume()) return;
+  REXCVAR_SET(sr_custom_costume, slot);
+  g_costume_generation.fetch_add(1);
+  REXLOG_INFO("costumes: custom slot {} worn ({})", slot,
+              slot ? CostumeDir(slot).string() : std::string("the game's costume"));
+}
+
+uint32_t CustomCostumeGeneration() { return g_costume_generation.load(); }
+
+bool IsCostumeTexture(const std::string& name) {
+  const std::string hash = name.substr(0, 16);
+  for (const auto& f : CostumeFiles())
+    if (!f.picture && std::find(f.hashes.begin(), f.hashes.end(), hash) != f.hashes.end()) return true;
+  return false;
+}
+
+std::string CustomCostumeName(int slot) {
+  std::string name;
+  std::ifstream in(CostumeDir(slot) / "costume.toml");
+  for (std::string line; std::getline(in, line);) {
+    const size_t key = line.find_first_not_of(" \t");
+    if (key == std::string::npos || line.compare(key, 4, "name") != 0) continue;
+    const size_t eq = line.find('=', key + 4);
+    if (eq == std::string::npos || line.find_first_not_of(" \t", key + 4) != eq) continue;
+    const size_t open = line.find('"', eq), close = open == std::string::npos ? open : line.rfind('"');
+    if (open == std::string::npos || close <= open) continue;
+    for (char c : line.substr(open + 1, close - open - 1))
+      if (c >= 32 && c < 127 && name.size() < 24) name += c;
+    break;
+  }
+  return name.find_first_not_of(' ') == std::string::npos ? "SLOT " + std::to_string(slot + 3) : name;
 }
 
 bool IsBlockCompressed(DXGI_FORMAT f) {
@@ -337,10 +442,14 @@ bool DecodePng(const std::vector<uint8_t>& b, DecodedTexture& t, const char*& wh
 bool LoadReplacement(const std::string& name, DecodedTexture& out) {
   std::call_once(g_replace_init, [] { g_replace_enabled = ReplaceFromSwap() == 0; });
   if (!g_replace_enabled) return false;
+  // The worn custom costume's file first; it is read now (the prefetched copies
+  // are the textures folder's, under the same names).
+  fs::path costume;
+  const bool from_costume = CostumePath(name, costume);
   const ReplaceIndex& index = Index();
-  const auto found = index.files.find(name);
-  if (found == index.files.end()) return false;
-  const fs::path& path = found->second;
+  const auto found = from_costume ? index.files.end() : index.files.find(name);
+  if (!from_costume && found == index.files.end()) return false;
+  const fs::path& path = from_costume ? costume : found->second;
   auto fail = [&](const char* why) {
     REXLOG_WARN("textures: {} not used: {}", path.string(), why);
     return false;
@@ -350,10 +459,19 @@ bool LoadReplacement(const std::string& name, DecodedTexture& out) {
     static std::mutex m;
     static std::set<std::string> logged;
     std::lock_guard<std::mutex> lock(m);
-    if (logged.insert(name).second)
-      REXLOG_INFO("textures: {} replaced by {} ({}x{}, {} mips, PNG {})", name, path.filename().string(), t.width,
+    if (logged.insert(path.string() + "|" + name).second)
+      REXLOG_INFO("textures: {} replaced by {} ({}x{}, {} mips, PNG {})", name, path.string(), t.width,
                   t.height, t.mip_levels, how);
   };
+  if (from_costume) {
+    const auto bytes = ReadWhole(path);
+    DecodedTexture t;
+    const char* why = nullptr;
+    if (!IsPng(*bytes) || !DecodePng(*bytes, t, why)) return fail(why ? why : "not a PNG file");
+    png_log(t, "of the custom costume");
+    out = std::move(t);
+    return true;
+  }
   if (auto png = CachedPng(name)) {
     png_log(*png, "decoded in advance");
     out = *png;
