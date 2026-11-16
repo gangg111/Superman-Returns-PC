@@ -380,7 +380,32 @@ class MovieEdit:
 
     def write(self):
         self.b.align(16)
+        self.renumber_constants()
         return bytes(self.b.b), self.c.write()
+
+    def renumber_constants(self):
+        """Every ConstantPool and PushData list entry its own constant, numbered
+        0, 1, 2, ... in the order the game's loader visits them (apt.Movie.loader_lists),
+        as EA's tools laid them out: the loader turns entries into values on load
+        and, on unload, writes back a running counter instead of the entry, so a
+        shared or out-of-order index points at another constant once the movie is
+        loaded a second time (the popups after the main menu, 2026-11-16: a crash
+        in sub_8269F3A0, or a popup that never showed). Code no frame reaches is
+        never loaded: its lists are left as they are and no longer name the right
+        constants. A game movie comes out unchanged."""
+        movie = apt.Movie(bytes(self.b.b), self.c.write())
+        entries, seen = [], set()
+        for lst, count in movie.loader_lists():
+            if lst in seen:
+                raise ValueError(f"constant list at {lst:X} used twice: the loader would convert it twice")
+            seen.add(lst)
+            for i in range(count):
+                old = self.b.u32(lst + 4 * i)
+                if old >= len(self.c.entries):
+                    raise ValueError(f"list at {lst:X} names constant {old} of {len(self.c.entries)}")
+                entries.append(list(self.c.entries[old]))
+                self.b.set32(lst + 4 * i, len(entries) - 1)
+        self.c.entries = entries
 
 
 # --- BGFA ------------------------------------------------------------------

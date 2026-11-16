@@ -220,90 +220,127 @@ class Movie:
         pool = []
         pc = furthest = start
         while pc < len(self.data):
-            at = pc
-            op = self.u8(pc)
-            pc += 1
-            name = OPS.get(op)
-            if name is None:
-                out.append(Instruction(at, op, f"op{op:02X}?", text="(unknown opcode, stopped)"))
+            ins, pc, pool, target = self._instruction(pc, pool)
+            out.append(ins)
+            if ins.name.endswith("?"):
                 break
-            if op in ALIGNED:
-                pc = (pc + 3) & ~3
-            args, text = [], ""
-            if op == 0x88:
-                count, lst = self.u32(pc), self.u32(pc + 4)
-                pc += 8
-                pool = [self.u32(lst + i * 4) for i in range(count)]
-                args = list(pool)
-                text = f"{count} constant(s)"
-            elif op == 0x96:
-                count, lst = self.u32(pc), self.u32(pc + 4)
-                pc += 8
-                args = [self.u32(lst + i * 4) for i in range(count)]
-                text = ", ".join(self.constant_text(a, pool) for a in args)
-            elif op in POOL_BYTE or op == 0xA3:
-                if op == 0xA3:
-                    index = self.u16(pc)
-                    pc += 2
-                else:
-                    index = self.u8(pc)
-                    pc += 1
-                args = [index]
-                text = self.constant_text(pool[index]) if index < len(pool) else f"pool#{index}?"
-            elif op in (0xA1, 0xA4, 0xA5, 0xA6, 0xA7, 0x8C):
-                args = [self.str(self.u32(pc))]
-                text = repr(args[0])
-                pc += 4
-            elif op == 0x83:
-                args = [self.str(self.u32(pc)), self.str(self.u32(pc + 4))]
-                text = f"{args[0]!r}, {args[1]!r}"
-                pc += 8
-            elif op in (0x81, 0x87, 0x9F, 0x8B, 0x94):
-                args = [self.i32(pc)]
-                text = str(args[0])
-                pc += 4
-            elif op in (0x99, 0x9D, 0xB8):
-                offset = self.i32(pc)
-                pc += 4
-                target = pc + offset
+            if target is not None:
                 furthest = max(furthest, target)
-                args = [target]
-                text = f"-> {target:06X}"
-            elif op == 0xB4:
-                args = [self.f32(pc)]
-                text = repr(args[0])
-                pc += 4
-            elif op in (0xB5, 0xB9):
-                args = [self.u8(pc)]
-                text = str(args[0])
-                pc += 1
-            elif op == 0xB6:
-                args = [self.u16(pc)]
-                text = str(args[0])
-                pc += 2
-            elif op == 0xB7:
-                args = [self.i32(pc)]
-                text = str(args[0])
-                pc += 4
-            elif op in (0x9B, 0x8E):
-                fname = self.str(self.u32(pc))
-                if op == 0x9B:
-                    count, lst = self.u32(pc + 4), self.u32(pc + 8)
-                    params = [self.str(self.u32(lst + i * 4)) for i in range(count)]
-                    body = self.u32(pc + 12)
-                    pc += 16 + 8
-                else:
-                    count, lst = self.u32(pc + 4), self.u32(pc + 12)
-                    params = [f"r{self.u32(lst + i * 8)}={self.str(self.u32(lst + i * 8 + 4))}"
-                              for i in range(count)]
-                    body = self.u32(pc + 16)
-                    pc += 20 + 8
-                args = [fname, params, body]
-                text = f"{fname!r} ({', '.join(params)}) body {body} byte(s)"
-            out.append(Instruction(at, op, name, args, text))
-            if op == 0x00 and pc > furthest:
+            if ins.op == 0x00 and pc > furthest:
                 break
         return out
+
+    def loader_lists(self):
+        """The ConstantPool (0x88) and PushData (0x96) lists as the game's loader
+        visits them, [(list offset, entry count)]: characters by index, a sprite's
+        or the movie's frames, each frame's items (an action's code, an init
+        action's code, a placement's clip events' code), each code block from its
+        start to its first End byte, function bodies inline. The loader turns each
+        entry into a value when the movie loads and, when it unloads, writes back a
+        running counter, not the entry: the entries must be 0, 1, 2, ... in this
+        order (measured in sub_8269F3A0, 2026-11-16; the game's own movies are)."""
+        out = []
+        for ch in self.characters():
+            if not ch or self.u32(ch) not in (5, 9):
+                continue
+            for items in self.frames(self.u32(ch + 16), self.u32(ch + 20)):
+                for it in items:
+                    codes = [it["code"]] if it["type"] in (1, 8) else \
+                        [code for _, code in it.get("events", [])] if it["type"] == 3 else []
+                    for pc in codes:
+                        pool = []
+                        while self.u8(pc) != 0x00:
+                            ins, nxt, pool, _ = self._instruction(pc, pool)
+                            if ins.name.endswith("?"):
+                                raise ValueError(f"unknown opcode {ins.op:02X} at {pc:X}")
+                            if ins.op in (0x88, 0x96):
+                                at = (pc + 4) & ~3
+                                out.append((self.u32(at + 4), self.u32(at)))
+                            pc = nxt
+        return out
+
+    def _instruction(self, pc, pool):
+        """(Instruction at pc, the next pc, the constant pool in force, a branch
+        target or None)."""
+        at = pc
+        op = self.u8(pc)
+        pc += 1
+        name = OPS.get(op)
+        if name is None:
+            return Instruction(at, op, f"op{op:02X}?", text="(unknown opcode, stopped)"), pc, pool, None
+        if op in ALIGNED:
+            pc = (pc + 3) & ~3
+        args, text, target = [], "", None
+        if op == 0x88:
+            count, lst = self.u32(pc), self.u32(pc + 4)
+            pc += 8
+            pool = [self.u32(lst + i * 4) for i in range(count)]
+            args = list(pool)
+            text = f"{count} constant(s)"
+        elif op == 0x96:
+            count, lst = self.u32(pc), self.u32(pc + 4)
+            pc += 8
+            args = [self.u32(lst + i * 4) for i in range(count)]
+            text = ", ".join(self.constant_text(a, pool) for a in args)
+        elif op in POOL_BYTE or op == 0xA3:
+            if op == 0xA3:
+                index = self.u16(pc)
+                pc += 2
+            else:
+                index = self.u8(pc)
+                pc += 1
+            args = [index]
+            text = self.constant_text(pool[index]) if index < len(pool) else f"pool#{index}?"
+        elif op in (0xA1, 0xA4, 0xA5, 0xA6, 0xA7, 0x8C):
+            args = [self.str(self.u32(pc))]
+            text = repr(args[0])
+            pc += 4
+        elif op == 0x83:
+            args = [self.str(self.u32(pc)), self.str(self.u32(pc + 4))]
+            text = f"{args[0]!r}, {args[1]!r}"
+            pc += 8
+        elif op in (0x81, 0x87, 0x9F, 0x8B, 0x94):
+            args = [self.i32(pc)]
+            text = str(args[0])
+            pc += 4
+        elif op in (0x99, 0x9D, 0xB8):
+            offset = self.i32(pc)
+            pc += 4
+            target = pc + offset
+            args = [target]
+            text = f"-> {target:06X}"
+        elif op == 0xB4:
+            args = [self.f32(pc)]
+            text = repr(args[0])
+            pc += 4
+        elif op in (0xB5, 0xB9):
+            args = [self.u8(pc)]
+            text = str(args[0])
+            pc += 1
+        elif op == 0xB6:
+            args = [self.u16(pc)]
+            text = str(args[0])
+            pc += 2
+        elif op == 0xB7:
+            args = [self.i32(pc)]
+            text = str(args[0])
+            pc += 4
+        elif op in (0x9B, 0x8E):
+            fname = self.str(self.u32(pc))
+            if op == 0x9B:
+                count, lst = self.u32(pc + 4), self.u32(pc + 8)
+                params = [self.str(self.u32(lst + i * 4)) for i in range(count)]
+                body = self.u32(pc + 12)
+                pc += 16 + 8
+            else:
+                count, lst = self.u32(pc + 4), self.u32(pc + 12)
+                params = [f"r{self.u32(lst + i * 8)}={self.str(self.u32(lst + i * 8 + 4))}"
+                          for i in range(count)]
+                body = self.u32(pc + 16)
+                pc += 20 + 8
+            args = [fname, params, body]
+            text = f"{fname!r} ({', '.join(params)}) body {body} byte(s)"
+        return Instruction(at, op, name, args, text), pc, pool, target
 
 
 def read_bgfa_movie(entry_bytes):

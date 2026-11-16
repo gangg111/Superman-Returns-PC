@@ -74,6 +74,9 @@ def test_method_and_branch_disassemble():
     code.end_method(body)
     code.end()
     code.finish()
+    # run as the root's frame action: the loader reaches it (renumber_constants)
+    rec, items = m.frame_items(m.root)
+    m.set_frame_items(rec, items + [m.action(at)])
     d, c = m.write()
     ins = apt.Movie(d, c).disassemble(at)
     assert [i.name for i in ins] == ['DefineFunction2', 'PushData', 'BranchIfTrue', 'PushData', 'Pop', 'End']
@@ -82,6 +85,67 @@ def test_method_and_branch_disassemble():
     assert ins[1].text == 'r3'
     assert ins[2].args[0] == ins[5].at        # lands on the End after the body
     assert size == ins[5].at - ins[1].at      # the body: from the first push to the End
+
+
+def loader_entries(d, c):
+    """The constant indices of every list in the loader's order (apt.Movie.loader_lists)."""
+    mv = apt.Movie(d, c)
+    return [mv.u32(lst + 4 * i) for lst, n in mv.loader_lists() for i in range(n)]
+
+
+def test_renumber_gives_every_list_entry_its_own_constant_in_loader_order():
+    # two pushes of the same string share constant 0 as assembled; the loader
+    # needs 0, 1, 2, ... in its walk (sub_8269F3A0 writes a counter back on unload)
+    data, raw = hand_movie()
+    m = apt_edit.MovieEdit(data, raw)
+    code = m.code()
+    at = code.start()
+    code.push('x', 'x', 5)
+    code.op('Pop')
+    code.push('x')
+    code.op('Pop')
+    code.end()
+    code.finish()
+    rec, items = m.frame_items(m.root)
+    m.set_frame_items(rec, items + [m.action(at)])
+    d, c = m.write()
+    got = loader_entries(d, c)
+    assert got == list(range(len(got)))
+    mv = apt.Movie(d, c)
+    assert len(mv.constants) == len(got)
+    # the values stay the same, each now its own entry
+    assert [mv.constant_text(i) for i in got[-4:]] == ["'x'", "'x'", '5', "'x'"]
+
+
+def test_renumber_refuses_a_list_two_codes_share():
+    data, raw = hand_movie()
+    m = apt_edit.MovieEdit(data, raw)
+    code = m.code()
+    at = code.start()
+    code.push('x')
+    code.op('Pop')
+    code.end()
+    code.finish()
+    rec, items = m.frame_items(m.root)
+    m.set_frame_items(rec, items + [m.action(at), m.action(at)])
+    with pytest.raises(ValueError, match='used twice'):
+        m.write()
+
+
+@have_game
+def test_game_movies_follow_the_loader_order_and_come_out_unchanged():
+    # Measured on the game's own movies: every list entry its own constant, in the
+    # loader's order; renumbering them changes nothing.
+    sys.path.insert(0, os.path.join(ROOT, 'tools', 'audio'))
+    import ea_ast  # noqa: PLC0415
+    a = ea_ast.Bgfa(UI_AST)
+    for name in ('MAIN', 'SCRGENPOP', 'SCRCOSTUMES', 'SCRPAUSEMENU', 'SCRPRESSSTART', 'THUMBVIEWER'):
+        d, c = apt.read_bgfa_movie(a.read(a.by_name()[name]))
+        got = loader_entries(d, c)
+        assert got == list(range(len(apt.Movie(d, c).constants))), name
+        d2, c2 = apt_edit.MovieEdit(d, c).write()
+        assert c2 == apt_edit.Constants(c).write(), name
+        assert d2.rstrip(b'\0') == d.rstrip(b'\0'), name
 
 
 @have_game
