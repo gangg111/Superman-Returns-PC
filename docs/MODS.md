@@ -69,7 +69,7 @@ Next to `superman_returns.exe`, in `textures\Suits`, there is one folder per slo
 | `cape.png` | the outside of the cape |
 | `thumb.png` | the small picture of the slot on the Costumes screen |
 | `fullsize.png` | the large picture shown with View Costume |
-| `costume.toml` | the slot's name |
+| `costume.toml` | the slot's name, and whether it has the cape |
 
 #### Make a costume
 
@@ -77,6 +77,10 @@ Next to `superman_returns.exe`, in `textures\Suits`, there is one folder per slo
 2. To name the costume, open `costume.toml` with Notepad and change the text between the quotes, for example `name = "Black Suit"`. The name shows on the Costumes screen.
 3. To show your costume on the Costumes screen, replace `thumb.png` (and `fullsize.png`) with your own picture, for example a screenshot of Superman in it. The game cannot draw these from the textures: they are pictures.
 4. In the game, open the Fortress of Solitude, then Costumes, select the slot and press Wear Costume.
+
+#### With or without the cape
+
+On slots 4 to 6 the Costumes screen shows **CAPE: SHOWN**. Press Y (triangle on a PlayStation pad, X on the keyboard) to switch it to **CAPE: HIDDEN**: that costume is worn without the cape. The choice is saved in the slot's `costume.toml` as `cape = true` or `cape = false`, which you can also edit by hand.
 
 A file you delete is taken from the game, so a slot with only `cape.png` changes only the cape. Running a new builder keeps your files and names.
 
