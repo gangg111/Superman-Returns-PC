@@ -256,6 +256,30 @@ fs::path CostumeDir(int slot) {
 }
 
 std::atomic<uint32_t> g_costume_generation{0};
+std::atomic<int> g_cape_hidden_slot{-1};  // the worn slot when its costume.toml says cape = false
+
+// The value of `key = ...` in the slot's costume.toml (after '=', trimmed), empty when missing.
+std::string CostumeSetting(int slot, const char* key) {
+  const size_t n = std::strlen(key);
+  std::ifstream in(CostumeDir(slot) / "costume.toml");
+  for (std::string line; std::getline(in, line);) {
+    const size_t at = line.find_first_not_of(" \t");
+    if (at == std::string::npos || line.compare(at, n, key) != 0) continue;
+    const size_t eq = line.find('=', at + n);
+    if (eq == std::string::npos || line.find_first_not_of(" \t", at + n) != eq) continue;
+    const std::string v = line.substr(eq + 1);
+    const size_t a = v.find_first_not_of(" \t\r"), b = v.find_last_not_of(" \t\r");
+    return a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+  }
+  return {};
+}
+
+// cape = false in the slot's costume.toml: the slot's costume without the cape.
+void NoteCapeSetting(int slot) {
+  const bool hidden = slot > 0 && CostumeSetting(slot, "cape") == "false";
+  g_cape_hidden_slot.store(hidden ? slot : -1);
+  if (hidden) REXLOG_INFO("costumes: slot {} has no cape (cape = false)", slot + 3);
+}
 
 // The player's file standing for texture `name`, if the worn slot has one.
 bool CostumePath(const std::string& name, fs::path& out) {
@@ -277,13 +301,18 @@ bool CostumePath(const std::string& name, fs::path& out) {
 }  // namespace
 
 int CustomCostume() {
-  return std::clamp(REXCVAR_GET(sr_custom_costume), 0, kCustomCostumes);
+  const int slot = std::clamp(REXCVAR_GET(sr_custom_costume), 0, kCustomCostumes);
+  // the slot worn from the toml at start: its cape setting read once
+  static std::once_flag read;
+  std::call_once(read, [slot] { NoteCapeSetting(slot); });
+  return slot;
 }
 
 void SetCustomCostume(int slot) {
   slot = std::clamp(slot, 0, kCustomCostumes);
   if (slot == CustomCostume()) return;
   REXCVAR_SET(sr_custom_costume, slot);
+  NoteCapeSetting(slot);
   g_costume_generation.fetch_add(1);
   REXLOG_INFO("costumes: custom slot {} worn ({})", slot,
               slot ? CostumeDir(slot).string() : std::string("the game's costume"));
@@ -298,20 +327,56 @@ bool IsCostumeTexture(const std::string& name) {
   return false;
 }
 
+bool CostumeCapeShown(int slot) {
+  return slot < 1 || slot > kCustomCostumes || CostumeSetting(slot, "cape") != "false";
+}
+
+void SetCostumeCapeShown(int slot, bool shown) {
+  if (slot < 1 || slot > kCustomCostumes) return;
+  const fs::path path = CostumeDir(slot) / "costume.toml";
+  std::vector<std::string> lines;
+  {
+    std::ifstream in(path);
+    for (std::string line; std::getline(in, line);) {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      lines.push_back(line);
+    }
+  }
+  const std::string value = std::string("cape = ") + (shown ? "true" : "false");
+  bool found = false;
+  for (auto& line : lines) {
+    const size_t at = line.find_first_not_of(" \t");
+    if (at == std::string::npos || line.compare(at, 4, "cape") != 0) continue;
+    const size_t eq = line.find_first_not_of(" \t", at + 4);
+    if (eq == std::string::npos || line[eq] != '=') continue;
+    line = value;
+    found = true;
+  }
+  if (!found) {
+    lines.push_back("# false: this costume without the cape.");
+    lines.push_back(value);
+  }
+  std::error_code ec;
+  fs::create_directories(path.parent_path(), ec);
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  for (const auto& line : lines) out << line << "\r\n";
+  if (!out) REXLOG_WARN("costumes: cannot write {}", path.string());
+  REXLOG_INFO("costumes: slot {} cape {}", slot + 3, shown ? "shown" : "hidden");
+  if (slot == CustomCostume()) NoteCapeSetting(slot);
+}
+
+bool CostumeCapeHidden() {
+  const int slot = CustomCostume();
+  return slot > 0 && g_cape_hidden_slot.load() == slot;
+}
+
 std::string CustomCostumeName(int slot) {
   std::string name;
-  std::ifstream in(CostumeDir(slot) / "costume.toml");
-  for (std::string line; std::getline(in, line);) {
-    const size_t key = line.find_first_not_of(" \t");
-    if (key == std::string::npos || line.compare(key, 4, "name") != 0) continue;
-    const size_t eq = line.find('=', key + 4);
-    if (eq == std::string::npos || line.find_first_not_of(" \t", key + 4) != eq) continue;
-    const size_t open = line.find('"', eq), close = open == std::string::npos ? open : line.rfind('"');
-    if (open == std::string::npos || close <= open) continue;
-    for (char c : line.substr(open + 1, close - open - 1))
+  const std::string v = CostumeSetting(slot, "name");
+  const size_t open = v.find('"'), close = v.rfind('"');
+  if (open != std::string::npos && close > open)
+    for (char c : v.substr(open + 1, close - open - 1))
       if (c >= 32 && c < 127 && name.size() < 24) name += c;
-    break;
-  }
   return name.find_first_not_of(' ') == std::string::npos ? "SLOT " + std::to_string(slot + 3) : name;
 }
 

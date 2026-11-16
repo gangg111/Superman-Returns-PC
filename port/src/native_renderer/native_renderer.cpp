@@ -7164,6 +7164,18 @@ bool Renderer::PrepareDraw(uint8_t* base, uint32_t dev, uint32_t prim,
       (info->is_vertex ? vs_hash : ps_hash) = info->container_hash;
     }
   }
+  // The cape (its own vertex shader, the cloth's: one draw for both sides, measured
+  // 2026-11-16) left out while the worn costume slot says cape = false
+  // (texture_replace.h): its colour draw and any other pass drawing it.
+  constexpr uint64_t kCapeVs = 0xA5232A3184AA617Cull;
+  if (vs_hash == kCapeVs) {
+    static std::mutex m;
+    static std::set<uint64_t> seen;
+    std::lock_guard lock(m);
+    if (seen.size() < 16 && seen.insert(ps_hash).second)
+      REXLOG_INFO("costumes: the cape's vertex shader with ps {:016X} (pass {})", ps_hash, g_current_pass);
+  }
+  if (vs_hash == kCapeVs && CostumeCapeHidden()) return false;
   uint32_t decl = Load32(base, dev + kDevVertexDecl);
   // "<hash>" or "<hash>:<index count>" (one mesh of that shader).
   static const std::pair<uint64_t, uint32_t> skip_ps = [] {

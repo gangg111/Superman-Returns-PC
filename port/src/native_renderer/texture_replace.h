@@ -51,6 +51,14 @@ int CustomCostume();  // 0: the game's costume
 void SetCustomCostume(int slot);
 uint32_t CustomCostumeGeneration();
 bool IsCostumeTexture(const std::string& name);
+// The worn slot's costume.toml has cape = false: the renderer leaves the cape out
+// (native_renderer.cpp, the cape's vertex shader). Read when the slot is worn.
+bool CostumeCapeHidden();
+// Slot `slot` (1..kCustomCostumes): its costume.toml's cape setting (true unless
+// cape = false), and setting it (the line replaced or added; applied at once
+// when the slot is worn). The costumes screen's Y button.
+bool CostumeCapeShown(int slot);
+void SetCostumeCapeShown(int slot, bool shown);
 // The slot's name from its costume.toml, else "SLOT <slot + 3>" (printable ASCII, at most 24).
 std::string CustomCostumeName(int slot);
 

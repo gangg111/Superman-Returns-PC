@@ -363,7 +363,9 @@ int MakeTextures(const Pack& pack, const fs::path& game_dir, const fs::path& out
         std::error_code ec;
         if (fs::exists(toml, ec)) continue;
         const std::string text = "# The name this costume slot shows in the Fortress's costumes screen.\r\n"
-                                  "name = \"Slot " + std::to_string(n) + "\"\r\n";
+                                  "name = \"Slot " + std::to_string(n) + "\"\r\n"
+                                  "# false: this costume without the cape.\r\n"
+                                  "cape = true\r\n";
         WriteAll(toml, text.data(), text.size());
         ++written;
       }

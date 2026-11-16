@@ -566,8 +566,13 @@ def test_costume_slots(built):
             'COSTUMEFULLSIZE': ['3983a4ad3dad13e8', 'c81d203d0a81f715', '1b8f3969988b8b2a']}[kind]
     found = set(all_strings(movie(ui, 'SCRCOSTUMES')))
     for s in ("'CostumeNameChar'", "'SetCustomCostume'", "'srCostumeCreate'", "'fromCharCode'",
-              "'artassets/Costumes/thumbs/CostumeThumb_6.swf'", "'SR_COSTUME_CUSTOM_DESC_3'"):
+              "'artassets/Costumes/thumbs/CostumeThumb_6.swf'", "'SR_COSTUME_CUSTOM_DESC_3'",
+              # the cape's hint and button on the custom slots (the user's request 2026-11-16)
+              "'GetCostumeCape'", "'SetCostumeCape'", "'SR_CAPE_SHOWN'", "'SR_CAPE_HIDDEN'", "'CIRCLE'", "'Y'"):
         assert s in found, s
+    xml = text.data(text.find('INTERFACETEXT')).decode('utf-8-sig')
+    for key, value in (("SR_CAPE_SHOWN", "CAPE: SHOWN"), ("SR_CAPE_HIDDEN", "CAPE: HIDDEN")):
+        assert '<uitext id="%s" value="%s"/>' % (key, value) in xml
 
 
 def test_every_movie_follows_the_loader_order(built):

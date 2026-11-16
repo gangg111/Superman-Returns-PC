@@ -340,6 +340,16 @@ extern "C" void SetCustomCostumeNative(PPCContext& ctx, uint8_t* base) {
     REXLOG_WARN("graphics menu: could not write {}", ConfigPath().string());
   sub_82686910(ctx, base);
 }
+// GetCostumeCape(slot 1..3) -> 1 shown, 0 hidden; SetCostumeCape(slot, shown):
+// the slot's costume.toml cape line (the costumes screen's Y button).
+extern "C" void GetCostumeCapeNative(PPCContext& ctx, uint8_t* base) {
+  ctx.r3.u64 = superman_returns::native::CostumeCapeShown(ArgInt(ctx, base, 0)) ? 1 : 0;
+  sub_82698550(ctx, base);
+}
+extern "C" void SetCostumeCapeNative(PPCContext& ctx, uint8_t* base) {
+  superman_returns::native::SetCostumeCapeShown(ArgInt(ctx, base, 0), ArgInt(ctx, base, 1) != 0);
+  sub_82686910(ctx, base);
+}
 extern "C" void CostumeNameCharNative(PPCContext& ctx, uint8_t* base) {
   const int32_t id = ArgInt(ctx, base, 0);
   const int slot = id / 32, i = id % 32;
@@ -410,6 +420,8 @@ REX_HOOK_RAW(sub_822AF3E8) {
       {"GetCustomCostume", &GetCustomCostumeNative},
       {"SetCustomCostume", &SetCustomCostumeNative},
       {"CostumeNameChar", &CostumeNameCharNative},
+      {"GetCostumeCape", &GetCostumeCapeNative},
+      {"SetCostumeCape", &SetCostumeCapeNative},
   };
   for (const auto& [name, func] : natives) {
     const uint32_t code = dispatcher->AllocateThunk(func, 0);

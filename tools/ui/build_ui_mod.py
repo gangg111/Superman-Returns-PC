@@ -106,6 +106,7 @@ def key_texts():
            ("Label_ScrTuningOpt", "DISPLAY TUNING"), ("TuningOpt_Brightness_Slider", "Brightness"),
            ("TuningOpt_Contrast_Slider", "Contrast"),
            ("SR_BOOT_TITLE", "MAIN MENU"), ("SR_BOOT_NEW_GAME", "New Game"), ("SR_BOOT_LOAD_GAME", "Load Game"), ("SR_BOOT_OPTIONS", "Options"),
+           ("SR_CAPE_SHOWN", "CAPE: SHOWN"), ("SR_CAPE_HIDDEN", "CAPE: HIDDEN"),
            *[("SR_COSTUME_CUSTOM_DESC_%d" % k,
               "Your own costume: textures\\Suits\\Slot%d" % (GAME_COSTUMES + k))
              for k in range(1, CUSTOM_COSTUMES + 1)],
@@ -2375,6 +2376,47 @@ def edit_costumes(data, const):
         code.set_member(viewer, "Create", lambda: code.path(g, "srCostumeCreate"))
         code.set_member(viewer, "SetTopMargin", lambda: code.path(g, "srCostumeTop"))
         code.call_method((("r", 1),), "srInitGui0")
+        code.call_method((g,), "srCostumeHints", [("r", 1)])
+        code.end_method(body)
+
+    def hints():
+        # srCostumeHints(screen r3): the game's three hints (Wear, View, Back), and on a
+        # custom slot the cape's between View and Back (Y; CAPE: SHOWN / HIDDEN). Not
+        # while a picture is shown full size (its own hints).
+        body = code.begin_method(["screen"], registers=6)
+        g = ("r", 2)
+        viewer = (("r", 3), "mThumbViewer")
+        code.call_method(viewer, "IsFullScreen", keep=True)
+        full = code.branch_if_true()
+        code.call_method(viewer, "GetSelected", keep=True)
+        code.set_register(4)
+        loc = lambda key: lambda: code.call_method((g, "LocalizationAdapter"), "GetLocalizedText", [key], keep=True)
+        code.call_method((("r", 3),), "ClearHints")
+        code.push(("r", 4))
+        code.push(GAME_COSTUMES)
+        code.op("LessThan2")
+        game_slot = code.branch_if_true()
+        code.call_method((g, "SettingsAdapter"), "GetCostumeCape", [
+            lambda: (code.push(("r", 4)), code.push(GAME_COSTUMES - 1), code.op("Subtract"))], keep=True)
+        shown = code.branch_if_true()
+        code.push("SR_CAPE_HIDDEN")
+        code.set_register(5)
+        picked = code.branch()
+        code.land(shown)
+        code.push("SR_CAPE_SHOWN")
+        code.set_register(5)
+        code.land(picked)
+        # ShowHints(text, key, ...): the last pair shows first
+        code.call_method((("r", 3),), "ShowHints", [
+            loc("Generic_BACK"), "B",
+            lambda: code.call_method((g, "LocalizationAdapter"), "GetLocalizedText", [("r", 5)], keep=True), "Y",
+            loc("Costume_View_Hint"), "A", loc("Costume_Wear_Hint"), "X"])
+        done_ = code.branch()
+        code.land(game_slot)
+        code.call_method((("r", 3),), "ShowHints", [
+            loc("Generic_BACK"), "B", loc("Costume_View_Hint"), "A", loc("Costume_Wear_Hint"), "X"])
+        code.land(done_)
+        code.land(full)
         code.end_method(body)
 
     def handle_input():
@@ -2382,6 +2424,33 @@ def edit_costumes(data, const):
         body = code.begin_method(["keyCode", "controllerId", "ascii"], registers=7)
         this = (("r", 1),)
         g = ("r", 2)
+        # Y (the game's CIRCLE; X is SQUARE, B TRIANGLE) on a custom slot: its cape on or off
+        code.push(("r", 3))
+        code.path(g, "INPUTCODE", "CIRCLE")
+        code.op("Equals2")
+        code.op("Not")
+        not_cape = code.branch_if_true()
+        code.call_method(this + ("mThumbViewer",), "IsFullScreen", keep=True)
+        full = code.branch_if_true()
+        code.call_method(this + ("mThumbViewer",), "GetSelected", keep=True)
+        code.push(GAME_COSTUMES - 1)
+        code.op("Subtract")
+        code.set_register(6)
+        code.push(("r", 6))
+        code.push(1)
+        code.op("LessThan2")
+        no_slot = code.branch_if_true()
+        code.call_method((g, "SettingsAdapter"), "SetCostumeCape", [
+            ("r", 6),
+            lambda: (code.call_method((g, "SettingsAdapter"), "GetCostumeCape", [("r", 6)], keep=True),
+                     code.op("Not"))])
+        code.call_method((g,), "playSound", [lambda: code.path(g, "SOUND", "OPEN")])
+        code.call_method((g,), "srCostumeHints", [("r", 1)])
+        code.land(no_slot)
+        code.land(full)
+        code.push(False)
+        code.op("Return")
+        code.land(not_cape)
         code.push(("r", 3))
         code.path(g, "INPUTCODE", "SQUARE")
         code.op("Equals2")
@@ -2406,9 +2475,14 @@ def edit_costumes(data, const):
         code.land(locked)
         code.land(other)
         code.call_method(this, "srHandleInput0", [("r", 3), ("r", 4), ("r", 5)], keep=True)
+        code.set_register(6)
+        # the selection may have moved onto or off a custom slot
+        code.call_method((g,), "srCostumeHints", [("r", 1)])
+        code.push(("r", 6))
         code.op("Return")
         code.end_method(body)
 
+    code.set_member(("_global",), "srCostumeHints", hints)
     code.set_member(("_global",), "srCostumeName", costume_name)
     code.set_member(("_global",), "srCostumeCreate", costume_create)
     code.set_member(("_global",), "srCostumeRows", two_rows)
