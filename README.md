@@ -21,3 +21,5 @@ The finished game holds data from your own disc: it is for your private use only
 ### Texture mods
 
 You can replace any texture, for example Superman's suit, with your own PNG. How to find a texture's name and where to put your file: [docs/MODS.md](docs/MODS.md).
+
+The Fortress of Solitude's Costumes screen also has three slots of your own (4, 5 and 6): paint the suit's PNGs in `textures\Suits\Slot4` and name the costume in its `costume.toml`. How: [docs/MODS.md](docs/MODS.md#your-own-costumes-slots-4-to-6).

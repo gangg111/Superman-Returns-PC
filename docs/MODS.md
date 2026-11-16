@@ -53,3 +53,35 @@ Open the newest file in the `logs` folder next to `superman_returns.exe` and sea
 - If your name appears in none of these lines, it does not match the texture: compare it with the name in `C:\sr_dump` letter by letter.
 
 If it still does not work, open an [issue](https://github.com/gangg111/Superman-Returns-PC/issues) and attach that log file.
+
+### Your own costumes (slots 4 to 6)
+
+The Fortress of Solitude's Costumes screen has three more slots after the game's three: 4, 5 and 6. They are never locked. Each one is a costume you paint yourself, with no texture names to look up.
+
+#### Where the files are
+
+Next to `superman_returns.exe`, in `textures\Suits`, there is one folder per slot: `Slot4`, `Slot5` and `Slot6`. The builder fills each one from your own disc with Superman's movie costume, ready to edit:
+
+| File | What it is |
+|---|---|
+| `body.png` | the suit: chest, arms, legs and the S shield |
+| `briefs_boots.png` | the briefs, the belt and the boots |
+| `cape.png` | the outside of the cape |
+| `thumb.png` | the small picture of the slot on the Costumes screen |
+| `fullsize.png` | the large picture shown with View Costume |
+| `costume.toml` | the slot's name |
+
+#### Make a costume
+
+1. Open the slot's PNGs in an image editor, paint them and save them as PNG under the same names.
+2. To name the costume, open `costume.toml` with Notepad and change the text between the quotes, for example `name = "Black Suit"`. The name shows on the Costumes screen.
+3. To show your costume on the Costumes screen, replace `thumb.png` (and `fullsize.png`) with your own picture, for example a screenshot of Superman in it. The game cannot draw these from the textures: they are pictures.
+4. In the game, open the Fortress of Solitude, then Costumes, select the slot and press Wear Costume.
+
+A file you delete is taken from the game, so a slot with only `cape.png` changes only the cape. Running a new builder keeps your files and names.
+
+#### Good to know
+
+- The inside of the cape does not come from a texture and stays red.
+- Keep the transparency of `body.png` and `briefs_boots.png` where it is; the game uses it.
+- The files in `textures\Suits` are used only while their slot is worn.
