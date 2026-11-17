@@ -94,6 +94,12 @@ CUSTOM_COSTUMES = 3
 GAME_COSTUMES = 3
 COSTUME_NAME_CHARS = 24  # texture_replace.cpp CustomCostumeName
 COSTUME_GRID_RAISE = 70  # the costumes grid this much higher than the game's (edit_costumes)
+# The screen manager's levels counted apart (counting), in buckets: every 5 up to
+# 100 (the game uses 20, 50, 75, logged 2026-11-16), then one up to POPUP_LEVEL
+# (BistroPopupManager.POPUP_DEPTHBEGIN, 900: popups from there up, not counted).
+POPUP_LEVEL = 900
+LEVEL_STEPS = list(range(0, 101, 5)) + [POPUP_LEVEL]
+LEVELS = len(LEVEL_STEPS) - 1
 
 
 def key_texts():
@@ -132,7 +138,9 @@ SCREEN_BLOCKED, SCREEN_SETTLE = 100000, 20
 # An IconMenu's row (SCRFORTRESS: mIconMenu at y 547.8, its icons and arrows
 # drawn about 40..120 below; the selected icon ~90 wide, at the row's x):
 # a click this far below its origin, within ICON_ROW_HALF of x is the icon.
-ICON_ROW_TOP, ICON_ROW_BOTTOM, ICON_ROW_HALF = 20, 140, 50
+ICON_ROW_TOP, ICON_ROW_BOTTOM = 20, 140
+# The most icons a row has (Fortress 4), and the polls icon_steer waits after each step.
+ICON_ROW_MAX, ICON_STEER_WAIT = 8, 8
 # A Slider (components/Slider, Audio and Mouse Options) in its own units: mSection1..10
 # 17 apart from 489.8, the mirrored left arrow just before them, the right one after
 # (on screen 2026-11-09: left arrow 474..485, squares 490..660, right arrow 668..680).
@@ -228,6 +236,13 @@ def edit_main(data, const):
     # srPressStart) is noted with _global.srScreenGen, which the screen
     # manager's loads and unloads raise, and used only while it is the same.
     code.set_member(("_global",), "srScreenGen", 0)
+    # The same per screen level (counting): srLvGen<l>, raised only when level l
+    # or one below it goes, so a clip of a lower screen outlives the overlays
+    # above it (srCostumeScreen "New costume selected", srIconMenu Costumes; the
+    # user 2026-11-16: after either the mouse stopped working there).
+    for l in range(LEVELS):
+        code.set_member(("_global",), "srLvGen%d" % l, 0)
+    code.set_member(("_global",), "srTopLevel", 0)
     # The mouse poll walks gFM's items, which still name the old screen's
     # clips while a screen changes (freed: the crash entering OPTIONS with the
     # mouse in use). It waits _global.srSettle polls: from a screen change or
@@ -235,10 +250,27 @@ def edit_main(data, const):
     code.set_member(("_global",), "srSettle", 0)
 
 
-    def same_screen(note):
-        """Branch (to land) taken when _global.<note> was kept on another screen."""
-        code.path(("r", 2), note + "Gen")
-        code.path(("r", 2), "srScreenGen")
+    def note_level(note):
+        """_global.<note>Lvl, <note>Gen: the top screen's level and its generation
+        (for same_screen(note, level=True)); r2 is _global."""
+        code.set_member((("r", 2),), note + "Lvl", lambda: code.path(("r", 2), "srTopLevel"))
+        code.set_member((("r", 2),), note + "LGen", lambda: (
+            code.path(("r", 2)), code.push("srLvGen"), code.path(("r", 2), "srTopLevel"),
+            code.op("Add2"), code.op("GetMember")))
+
+    def same_screen(note, level=False):
+        """Branch (to land) taken when _global.<note> was kept on another screen
+        (level: noted with its level's generation, note_level; overlays opened and
+        closed above it do not count)."""
+        code.path(("r", 2), note + ("LGen" if level else "Gen"))
+        if level:
+            code.path(("r", 2))
+            code.push("srLvGen")
+            code.path(("r", 2), note + "Lvl")
+            code.op("Add2")
+            code.op("GetMember")
+        else:
+            code.path(("r", 2), "srScreenGen")
         code.op("Equals2")
         code.op("Not")
         return code.branch_if_true()
@@ -280,7 +312,7 @@ def edit_main(data, const):
                 ("ChangeScreenByLevel", "srCSBL", SCREEN_BLOCKED, True), ("LoadOverlayScreen", "srLOS", SCREEN_BLOCKED, True),
                 ("UnloadOverlayScreen", "srUOS", SCREEN_SETTLE, True), ("ScreenLoaded", "srSL", SCREEN_SETTLE, False)):
             code.set_member((("r", 3),), saved, lambda m=method: code.path(("r", 3), m))
-            code.set_member((("r", 3),), method, lambda s_=saved, v=settle, r=raise_only: counting(s_, v, r))
+            code.set_member((("r", 3),), method, lambda s_=saved, v=settle, r=raise_only, m=method: counting(s_, v, r, m))
         code.set_member((("r", 3),), "srWrapped", True)
         code.land(sm_wrapped)
         code.land(no_sm)
@@ -337,11 +369,7 @@ def edit_main(data, const):
         code.push(None)
         code.op("Equals2")
         no_icons = code.branch_if_true()
-        code.path(g, "srIconMenuGen")
-        code.path(g, "srScreenGen")
-        code.op("Equals2")
-        code.op("Not")
-        icons_gone = code.branch_if_true()
+        icons_gone = same_screen("srIconMenu", level=True)
         code.path(g, "FlowMgr", "srCIS")
         code.push(None)
         code.op("Equals2")
@@ -472,7 +500,7 @@ def edit_main(data, const):
         menu_wrapped = code.branch_if_true()
         for method, saved in (("SetIcons", "srSetIcons"), ("Next", "srNext"), ("Previous", "srPrev")):
             code.set_member((("r", 3),), saved, lambda m=method: code.path(("r", 3), m))
-            code.set_member((("r", 3),), method, lambda s_=saved: noting(s_, "srIconMenu"))
+            code.set_member((("r", 3),), method, lambda s_=saved: noting(s_, "srIconMenu", level=True))
         # the game's CheckArrows dims the left arrow on the first icon and the right
         # one on the last but never lights them again, so with two icons (METROPOLIS,
         # FORTRESS) both stay dim after one turn each way (the user 2026-11-09)
@@ -551,25 +579,64 @@ def edit_main(data, const):
         code.call_method((("r", 2), "SettingsAdapter"), "srSetAC", [("r", 3)])
         code.end_method(body)
 
-    def noting(saved, note="srActiveFM"):
+    def noting(saved, note="srActiveFM", level=False):
         # function (a, b) { _global.<note> = this; return this.<saved>(a, b); }
         body = code.begin_method(params=("a", "b"), registers=5)
         code.set_member((("r", 2),), note, ("r", 1))
         code.set_member((("r", 2),), note + "Gen", lambda: code.path(("r", 2), "srScreenGen"))
+        if level:
+            note_level(note)
         code.call_method((("r", 1),), saved, [("r", 3), ("r", 4)], keep=True)
         code.op("Return")
         code.end_method(body)
 
-    def counting(saved, settle, raise_only):
+    def counting(saved, settle, raise_only, method=None):
         # function (a, b, c) { _global.srScreenGen++; srSettle = settle (or the
         # larger of the two); return this.<saved>(a, b, c); }
-        body = code.begin_method(params=("a", "b", "c"), registers=6)
+        # r6 the top level (srTopLevel below): 7 registers (writing r6 with 6
+        # crashed the game leaving the Fortress, 0x20, 2026-11-16)
+        body = code.begin_method(params=("a", "b", "c"), registers=7)
         # only a load, an unload or a change frees clips: ScreenLoaded comes
         # after the new screen's InitGui kept its own (the icon row did not
         # answer the mouse, 2026-11-09), so it leaves the generation as it is
         if raise_only:
             code.set_member((("r", 2),), "srScreenGen", lambda: (
                 code.path(("r", 2), "srScreenGen"), code.push(1), code.op("Add2")))
+            # per screen level (LEVELS): srLvGen<l> raised for every l at or above the
+            # level freed (ChangeScreenByLevel(id, level), LoadOverlayScreen(path,
+            # level): the screen at that level and above; UnloadOverlayScreen(level));
+            # srTopLevel the level shown on top. A clip noted with its level's
+            # generation (noting with level=True) stays usable while overlays above
+            # it come and go (popups, Costumes over the Fortress; the user 2026-11-16).
+            level = ("r", 3) if method == "UnloadOverlayScreen" else ("r", 4)
+            # bucket i holds the levels LEVEL_STEPS[i] <= level < LEVEL_STEPS[i + 1]
+            # (the game's 20, 50, 75: the front end, the Fortress, Costumes over it)
+            for i in range(LEVELS):
+                code.push(level, LEVEL_STEPS[i + 1])
+                code.op("LessThan2")  # level below the bucket's end: it or one under it freed
+                code.op("Not")
+                above = code.branch_if_true()
+                code.set_member((("r", 2),), "srLvGen%d" % i, lambda i=i: (
+                    code.path(("r", 2), "srLvGen%d" % i), code.push(1), code.op("Add2")))
+                code.land(above)
+            # the top screen's bucket, not a popup's (an unload: the level one below)
+            code.push(level, POPUP_LEVEL)
+            code.op("LessThan2")
+            code.op("Not")
+            popup = code.branch_if_true()
+            code.push(level)
+            if method == "UnloadOverlayScreen":
+                code.push(1)
+                code.op("Subtract")
+            code.set_register(6)
+            code.set_member((("r", 2),), "srTopLevel", 0)
+            for i in range(1, LEVELS):
+                code.push(("r", 6), LEVEL_STEPS[i])
+                code.op("LessThan2")
+                below = code.branch_if_true()
+                code.set_member((("r", 2),), "srTopLevel", i)
+                code.land(below)
+            code.land(popup)
         keep = None
         if raise_only:
             code.push(settle)
@@ -596,13 +663,15 @@ def edit_main(data, const):
     # for A, or RIGHT on an option row (one with GetIndex): the press reaches the
     # screen as a pad's would (SettingsAdapter.PressPad, rawinput_kbm_driver).
     def icon_row():
-        """A click beside every item, on the icon row (_global.srIconMenu, still
-        on the stage and shown): on the selected icon A, left of it LEFT, right
-        of it RIGHT. The row's origin is the selected icon's centre in x; the
-        icons and arrows lie ICON_ROW_TOP..ICON_ROW_BOTTOM below it. Uses
-        r5..r7, r9..r11."""
+        """The cursor moved or clicked beside every item, on the icon row
+        (_global.srIconMenu, still on the stage and shown; its icons and arrows
+        ICON_ROW_TOP..ICON_ROW_BOTTOM below its origin): the icon under it the
+        target icon_steer selects (and, clicked, enters); a click left or right
+        of the icons LEFT or RIGHT. The selected icon is not at the row's origin
+        (the Fortress's Costumes at x 767, the origin 646: the user's click went
+        RIGHT, 2026-11-16). Uses r5..r7, r9..r11, r13..r16."""
         g_main = ("r", 2)
-        ends = [same_screen("srIconMenu")]
+        ends = [same_screen("srIconMenu", level=True)]
         code.path(g_main, "srIconMenu")
         code.set_register(5)
         code.push(("r", 5), None)
@@ -639,7 +708,11 @@ def edit_main(data, const):
             code.set_register(9)
         for t in tops:
             code.land(t)
+        code.push(("r", 12))
+        code.op("Not")
+        no_log = code.branch_if_true()
         code.call_method((g_main, "SettingsAdapter"), "MenuMouseLog", [("r", 3), ("r", 4), ("r", 6), ("r", 7), -3, 0])
+        code.land(no_log)
         # r10 = x - row x, r11 = y - row y
         code.push(("r", 3), ("r", 6))
         code.op("Subtract")
@@ -656,26 +729,71 @@ def edit_main(data, const):
                 code.push(limit, ("r", reg))
             code.op("LessThan2")
             ends.append(code.branch_if_true())
-        for limit, pad in ((-ICON_ROW_HALF, 3), (ICON_ROW_HALF, None)):
-            if pad == 3:
-                code.push(("r", 10))  # dx < 0 - half: LEFT
-                code.push(0, ICON_ROW_HALF)
-                code.op("Subtract")
-                code.op("LessThan2")
-                code.op("Not")
-                other = code.branch_if_true()
-                code.call_method((g_main, "SettingsAdapter"), "PressPad", [3])
-                ends.append(code.branch())
-                code.land(other)
-            else:
-                code.push(limit, ("r", 10))  # half < dx: RIGHT, else A
-                code.op("LessThan2")
-                code.op("Not")
-                other = code.branch_if_true()
-                code.call_method((g_main, "SettingsAdapter"), "PressPad", [2])
-                ends.append(code.branch())
-                code.land(other)
-                code.call_method((g_main, "SettingsAdapter"), "PressPad", [1])
+        # the icons: icon i's centre at holder._x + i * step + size / 2 (IconMenu
+        # LoadIcons and GetGlowDest; step mIconSize + mPadding), the first
+        # mVisibleIcons of them. The one under the cursor becomes the target that
+        # icon_steer walks the selection to (r13 step, r14 matched, r15 holder x)
+        row = ("r", 5)
+        code.path(row, "mIconSize")
+        code.path(row, "mPadding")
+        code.op("Add2")
+        code.set_register(13)
+        code.path(row, "mIconHolder", "_x")
+        code.set_register(15)
+        code.push(False)
+        code.set_register(14)
+        for i in range(ICON_ROW_MAX):
+            skips = []
+            code.push(i)
+            code.path(row, "mVisibleIcons")
+            code.op("LessThan2")
+            code.op("Not")
+            skips.append(code.branch_if_true())
+            # d = dx - (holder + i * step + size / 2); outside: d < -step/2 or step/2 < d
+            code.push(("r", 10), ("r", 15))
+            code.op("Subtract")
+            code.push(i, ("r", 13))
+            code.op("Multiply")
+            code.op("Subtract")
+            code.path(row, "mIconSize")
+            code.push(2)
+            code.op("Divide")
+            code.op("Subtract")
+            code.set_register(16)
+            # d < -step/2
+            code.push(("r", 16), 0, ("r", 13))
+            code.op("Subtract")
+            code.push(2)
+            code.op("Divide")
+            code.op("LessThan2")
+            skips.append(code.branch_if_true())
+            # step/2 < d
+            code.push(("r", 13), 2)
+            code.op("Divide")
+            code.push(("r", 16))
+            code.op("LessThan2")
+            skips.append(code.branch_if_true())
+            code.set_member((g_main,), "srIconTarget", i)
+            code.push(True)
+            code.set_register(14)
+            # clicked: entered when reached (a later move over another icon only selects)
+            code.set_member((g_main,), "srIconEnter", lambda: (code.push(("r", 12)), code.op("Not"), code.op("Not")))
+            for s_ in skips:
+                code.land(s_)
+        # a click beside the icons: the arrows (left of the first LEFT, right of the last RIGHT)
+        code.push(("r", 14))
+        ends.append(code.branch_if_true())
+        code.push(("r", 12))
+        code.op("Not")
+        ends.append(code.branch_if_true())
+        code.push(("r", 10), ("r", 15))
+        code.op("LessThan2")
+        code.op("Not")
+        not_left = code.branch_if_true()
+        code.call_method((g_main, "SettingsAdapter"), "PressPad", [3])
+        ends.append(code.branch())
+        code.land(not_left)
+        code.call_method((g_main, "SettingsAdapter"), "PressPad", [2])
         for e in ends:
             code.land(e)
 
@@ -837,6 +955,201 @@ def edit_main(data, const):
         code.land(none)
         code.land(other)
 
+    def icon_steer():
+        """Every poll: the icon row's selection walked to _global.srIconTarget (set
+        by icon_row), one LEFT or RIGHT per ICON_STEER_WAIT polls as from a pad (the
+        screen turns its row and its title), then A when the icon was clicked
+        (srIconEnter). The target is dropped on another screen. Uses r5, r6."""
+        g_main = ("r", 2)
+        sa_ = (g_main, "SettingsAdapter")
+        ends = []
+        code.path(g_main, "srIconTarget")
+        code.push(None)
+        code.op("Equals2")
+        ends.append(code.branch_if_true())
+        drop = []
+        drop.append(same_screen("srIconMenu", level=True))
+        code.path(g_main, "srIconMenu")
+        code.set_register(5)
+        code.push(("r", 5), None)
+        code.op("Equals2")
+        drop.append(code.branch_if_true())
+        code.path(("r", 5), "_parent")
+        code.push(None)
+        code.op("Equals2")
+        drop.append(code.branch_if_true())
+        # waiting after a step
+        code.push(0)
+        code.path(g_main, "srIconWait")
+        code.op("LessThan2")
+        code.op("Not")
+        ready = code.branch_if_true()
+        code.set_member((g_main,), "srIconWait", lambda: (
+            code.path(g_main, "srIconWait"), code.push(1), code.op("Subtract")))
+        ends.append(code.branch())
+        code.land(ready)
+        code.set_member((g_main,), "srIconWait", ICON_STEER_WAIT)
+        code.path(("r", 5), "mSelectedIndex")
+        code.set_register(6)
+        for press, toward in ((2, True), (3, False)):
+            if toward:  # selected < target: RIGHT
+                code.push(("r", 6))
+                code.path(g_main, "srIconTarget")
+            else:  # target < selected: LEFT
+                code.path(g_main, "srIconTarget")
+                code.push(("r", 6))
+            code.op("LessThan2")
+            code.op("Not")
+            other = code.branch_if_true()
+            code.call_method(sa_, "PressPad", [press])
+            ends.append(code.branch())
+            code.land(other)
+        # there: A if clicked, and the target done
+        code.path(g_main, "srIconEnter")
+        code.op("Not")
+        no_enter = code.branch_if_true()
+        code.call_method(sa_, "PressPad", [1])
+        code.land(no_enter)
+        for d in drop:
+            code.land(d)
+        code.set_member((g_main,), "srIconTarget", lambda: code.push(None))
+        code.set_member((g_main,), "srIconEnter", False)
+        for e in ends:
+            code.land(e)
+
+    def costume_hover():
+        """The cursor moved or clicked on the Costumes screen (srCostumeScreen): the
+        slot under it becomes the selected one, as the arrows make it
+        (ThumbViewer.HighlightThumb(ID), mThumbClips[ID] its picture; the user
+        2026-11-16: the focus follows the mouse). Not over a popup or a picture
+        shown full size. Uses r5, r6, r7, r9..r11, r13..r16."""
+        g_main = ("r", 2)
+        ends = [same_screen("srCostumeScreen", level=True)]
+        code.path(g_main, "srCostumeScreen")
+        code.set_register(5)
+        code.push(("r", 5), None)
+        code.op("Equals2")
+        ends.append(code.branch_if_true())
+        code.path(("r", 5), "_parent")
+        code.push(None)
+        code.op("Equals2")
+        ends.append(code.branch_if_true())
+        code.push(0)
+        code.path(g_main, "gPopupMgr", "aPopupStack", "length")
+        code.op("LessThan2")
+        ends.append(code.branch_if_true())
+        # still and no click: nothing (the arrows keep their selection)
+        code.push(("r", 3))
+        code.path(g_main, "srMouseX")
+        code.op("Equals2")
+        code.push(("r", 4))
+        code.path(g_main, "srMouseY")
+        code.op("Equals2")
+        code.op("And")
+        code.push(("r", 12))
+        code.op("Not")
+        code.op("And")
+        ends.append(code.branch_if_true())
+        code.path(("r", 5), "mThumbViewer")
+        code.set_register(13)
+        code.push(("r", 13), None)
+        code.op("Equals2")
+        ends.append(code.branch_if_true())
+        code.call_method((("r", 13),), "IsFullScreen", keep=True)
+        ends.append(code.branch_if_true())
+        for i in range(GAME_COSTUMES + CUSTOM_COSTUMES):
+            skips = []
+            code.path(("r", 13), "mThumbClips")
+            code.push(i)
+            code.op("GetMember")
+            code.set_register(16)
+            code.push(("r", 16), None)
+            code.op("Equals2")
+            skips.append(code.branch_if_true())
+            # its rectangle on the stage: r14/r15 the origin, r10/r11 the scale
+            code.path(("r", 16), "_x")
+            code.set_register(14)
+            code.path(("r", 16), "_y")
+            code.set_register(15)
+            code.push(1)
+            code.set_register(10)
+            code.push(1)
+            code.set_register(11)
+            code.path(("r", 16), "_parent")
+            code.set_register(9)
+            tops = []
+            for _ in range(MOUSE_DEPTH + 2):
+                code.push(("r", 9), None)
+                code.op("Equals2")
+                tops.append(code.branch_if_true())
+                for pos, scale, at, s in (("_x", "_xscale", 14, 10), ("_y", "_yscale", 15, 11)):
+                    code.push(("r", at))
+                    code.path(("r", 9), scale)
+                    code.op("Multiply")
+                    code.push(100)
+                    code.op("Divide")
+                    code.path(("r", 9), pos)
+                    code.op("Add2")
+                    code.set_register(at)
+                    code.push(("r", s))
+                    code.path(("r", 9), scale)
+                    code.op("Multiply")
+                    code.push(100)
+                    code.op("Divide")
+                    code.set_register(s)
+                code.path(("r", 9), "_parent")
+                code.set_register(9)
+            for t in tops:
+                code.land(t)
+            # outside: x < left, left + width * sx < x, y < top, top + height * sy < y
+            for mouse, origin, size, s in ((3, 14, "_width", 10), (4, 15, "_height", 11)):
+                code.push(("r", mouse), ("r", origin))
+                code.op("LessThan2")
+                skips.append(code.branch_if_true())
+                code.push(("r", origin))
+                code.path(("r", 16), size)
+                code.push(("r", s))
+                code.op("Multiply")
+                code.op("Add2")
+                code.push(("r", mouse))
+                code.op("LessThan2")
+                skips.append(code.branch_if_true())
+            code.call_method((("r", 13),), "GetSelected", keep=True)
+            code.push(i)
+            code.op("Equals2")
+            skips.append(code.branch_if_true())
+            code.call_method((("r", 13),), "HighlightThumb", [i])
+            code.call_method((("r", 5),), "srCostumeHints", [("r", 5)])
+            for s_ in skips:
+                code.land(s_)
+        for e in ends:
+            code.land(e)
+
+    def costume_click():
+        """A click on nothing on the Costumes screen (srCostumeScreen, its slots are
+        not focus manager items): Wear Costume, the hint the mouse stands for (the
+        game's SQUARE is the left button; the user 2026-11-16, "na myszkę nie
+        reaguje"). Not while a popup is open: a pad's press would not reach the
+        screen either. Uses r5."""
+        g_main = ("r", 2)
+        ends = [same_screen("srCostumeScreen", level=True)]
+        code.path(g_main, "srCostumeScreen")
+        code.set_register(5)
+        code.push(("r", 5), None)
+        code.op("Equals2")
+        ends.append(code.branch_if_true())
+        code.path(("r", 5), "_parent")
+        code.push(None)
+        code.op("Equals2")
+        ends.append(code.branch_if_true())
+        code.push(0)
+        code.path(g_main, "gPopupMgr", "aPopupStack", "length")
+        code.op("LessThan2")
+        ends.append(code.branch_if_true())
+        code.call_method((("r", 5),), "HandleInput", [lambda: code.path(g_main, "INPUTCODE", "SQUARE"), 0, 0])
+        for e in ends:
+            code.land(e)
+
     def option_click():
         """A click on an option row (a Toggle, it has GetIndex; r8, its rectangle
         r13..r16): between its label and the middle of its value (halfway between
@@ -911,6 +1224,7 @@ def edit_main(data, const):
         code.set_member((g,), "srSettle", lambda: (code.path(g, "srSettle"), code.push(1), code.op("Subtract")))
         waiting = code.branch()
         code.land(settled)
+        icon_steer()
         code.call_method(sa, "GetMouseX", keep=True)
         code.set_register(3)
         code.push(("r", 3), 0)
@@ -1135,13 +1449,29 @@ def edit_main(data, const):
         code.land(no_click)
         missed = code.branch()
         code.land(no_hit)
+        # the Costumes screen's slots (not focus manager items): the one under the cursor selected
+        costume_hover()
+        # the icon row: on a move or a click (still: the arrows keep their selection)
+        code.push(("r", 3))
+        code.path(g, "srMouseX")
+        code.op("Equals2")
+        code.push(("r", 4))
+        code.path(g, "srMouseY")
+        code.op("Equals2")
+        code.op("And")
+        code.push(("r", 12))
+        code.op("Not")
+        code.op("And")
+        still_row = code.branch_if_true()
+        icon_row()
+        code.land(still_row)
         # a click on nothing: logged with the first item's rectangle, for calibration
         code.push(("r", 12))
         code.op("Not")
         quiet = code.branch_if_true()
         code.call_method(sa, "MenuMouseLog", [("r", 3), ("r", 4), -1, -1, 0, 0])
-        icon_row()
         arrow_clicks()
+        costume_click()
         code.land(quiet)
         code.land(missed)
         code.land(outside)
@@ -2342,7 +2672,7 @@ def edit_costumes(data, const):
                                                        code.push("MediaType"), code.op("GetMember")))
             code.set_member(r4, "ThumbFile", "artassets/Costumes/thumbs/CostumeThumb_%d.swf" % n)
             code.set_member(r4, "FullSizeFile", "artassets/Costumes/fullsize/CostumeFullSize_%d.swf" % n)
-            code.set_member(r4, "Name", lambda k=k: code.call_method((g,), "srCostumeName", [k], keep=True))
+            code.set_member(r4, "Name", lambda k=k: code.call_method(("_global", "ScrCostumes", "prototype"), "srCostumeName", [k], keep=True))
             code.set_member(r4, "Description", lambda k=k: code.call_method(
                 (g, "LocalizationAdapter"), "GetLocalizedText", ["SR_COSTUME_CUSTOM_DESC_%d" % k], keep=True))
             code.call_method((("r", 3),), "push", [("r", 4)])
@@ -2372,11 +2702,16 @@ def edit_costumes(data, const):
         body = code.begin_method([], registers=3)
         g = ("r", 2)
         viewer = (("r", 1), "mThumbViewer")
-        code.set_member(viewer, "SetRows", lambda: code.path(g, "srCostumeRows"))
-        code.set_member(viewer, "Create", lambda: code.path(g, "srCostumeCreate"))
-        code.set_member(viewer, "SetTopMargin", lambda: code.path(g, "srCostumeTop"))
+        code.set_member(viewer, "SetRows", lambda: code.path(("r", 1), "srCostumeRows"))
+        code.set_member(viewer, "Create", lambda: code.path(("r", 1), "srCostumeCreate"))
+        code.set_member(viewer, "SetTopMargin", lambda: code.path(("r", 1), "srCostumeTop"))
         code.call_method((("r", 1),), "srInitGui0")
-        code.call_method((g,), "srCostumeHints", [("r", 1)])
+        code.call_method((("r", 1),), "srCostumeHints", [("r", 1)])
+        # for the mouse poll's click (costume_click)
+        code.set_member((g,), "srCostumeScreen", ("r", 1))
+        code.set_member((g,), "srCostumeScreenLvl", lambda: code.path(g, "srTopLevel"))
+        code.set_member((g,), "srCostumeScreenLGen", lambda: (
+            code.path(g), code.push("srLvGen"), code.path(g, "srTopLevel"), code.op("Add2"), code.op("GetMember")))
         code.end_method(body)
 
     def hints():
@@ -2445,7 +2780,7 @@ def edit_costumes(data, const):
             lambda: (code.call_method((g, "SettingsAdapter"), "GetCostumeCape", [("r", 6)], keep=True),
                      code.op("Not"))])
         code.call_method((g,), "playSound", [lambda: code.path(g, "SOUND", "OPEN")])
-        code.call_method((g,), "srCostumeHints", [("r", 1)])
+        code.call_method((("r", 1),), "srCostumeHints", [("r", 1)])
         code.land(no_slot)
         code.land(full)
         code.push(False)
@@ -2477,16 +2812,19 @@ def edit_costumes(data, const):
         code.call_method(this, "srHandleInput0", [("r", 3), ("r", 4), ("r", 5)], keep=True)
         code.set_register(6)
         # the selection may have moved onto or off a custom slot
-        code.call_method((g,), "srCostumeHints", [("r", 1)])
+        code.call_method((("r", 1),), "srCostumeHints", [("r", 1)])
         code.push(("r", 6))
         code.op("Return")
         code.end_method(body)
 
-    code.set_member(("_global",), "srCostumeHints", hints)
-    code.set_member(("_global",), "srCostumeName", costume_name)
-    code.set_member(("_global",), "srCostumeCreate", costume_create)
-    code.set_member(("_global",), "srCostumeRows", two_rows)
-    code.set_member(("_global",), "srCostumeTop", higher_grid)
+    # on the class, not _global: _global outlives this movie, while the functions
+    # are this movie's code, freed with it (leaving Costumes, the next screen change
+    # crashed the game about every other time, 0x20; the user 2026-11-16)
+    code.set_member(proto, "srCostumeHints", hints)
+    code.set_member(proto, "srCostumeName", costume_name)
+    code.set_member(proto, "srCostumeCreate", costume_create)
+    code.set_member(proto, "srCostumeRows", two_rows)
+    code.set_member(proto, "srCostumeTop", higher_grid)
     code.set_member(proto, "InitGui", init_gui)
     code.set_member(proto, "HandleInput", handle_input)
     code.land(done)

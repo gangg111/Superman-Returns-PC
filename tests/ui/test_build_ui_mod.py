@@ -568,11 +568,63 @@ def test_costume_slots(built):
     for s in ("'CostumeNameChar'", "'SetCustomCostume'", "'srCostumeCreate'", "'fromCharCode'",
               "'artassets/Costumes/thumbs/CostumeThumb_6.swf'", "'SR_COSTUME_CUSTOM_DESC_3'",
               # the cape's hint and button on the custom slots (the user's request 2026-11-16)
-              "'GetCostumeCape'", "'SetCostumeCape'", "'SR_CAPE_SHOWN'", "'SR_CAPE_HIDDEN'", "'CIRCLE'", "'Y'"):
+              "'GetCostumeCape'", "'SetCostumeCape'", "'SR_CAPE_SHOWN'", "'SR_CAPE_HIDDEN'", "'CIRCLE'", "'Y'",
+              # noted for the mouse poll's click (Wear Costume with the left button)
+              "'srCostumeScreen'", "'srCostumeScreenLGen'"):
         assert s in found, s
+    main = set(all_strings(movie(ui, 'MAIN')))
+    for s in ("'srCostumeScreen'", "'srCostumeScreenLGen'", "'SQUARE'", "'aPopupStack'",
+              # the slot under the cursor selected (ThumbViewer's own highlight)
+              "'mThumbClips'", "'HighlightThumb'", "'srCostumeHints'",
+              # kept per screen level: overlays above (the popup, Costumes over the
+              # Fortress's icon row) leave it usable
+              "'srLvGen0'", "'srLvGen%d'" % (build_ui_mod.LEVELS - 1), "'srTopLevel'", "'srLvGen'",
+              "'srCostumeScreenLvl'", "'srIconMenuLvl'", "'srIconMenuLGen'", "'srIconMenuGen'",
+              # the icon row: the icon under the cursor from the row's own layout, walked to
+              "'mIconHolder'", "'mIconSize'", "'mPadding'", "'mVisibleIcons'", "'mSelectedIndex'",
+              "'srIconTarget'", "'srIconEnter'", "'srIconWait'"):
+        assert s in main, s
     xml = text.data(text.find('INTERFACETEXT')).decode('utf-8-sig')
     for key, value in (("SR_CAPE_SHOWN", "CAPE: SHOWN"), ("SR_CAPE_HIDDEN", "CAPE: HIDDEN")):
         assert '<uitext id="%s" value="%s"/>' % (key, value) in xml
+
+
+def test_every_function_keeps_to_its_registers(built):
+    """Every DefineFunction2 in every built movie uses only the registers it
+    declares (SetRegister and pushed rN below its register count, the innermost
+    function's). A write past them corrupted the game: counting's r6 with 6
+    registers crashed it leaving the Fortress (0x20, 2026-11-16)."""
+    ui, _ = built
+    functions = 0
+    for e in ui.entries:
+        try:
+            d, c = apt.read_bgfa_movie(ui.data(e))
+        except (ValueError, KeyError, IndexError, struct.error):
+            continue
+        mv = apt.Movie(d, c)
+        blocks = {it['code'] for f in mv.frames(*mv.header()['frames']) for it in f if it.get('code')}
+        for start in blocks:
+            code = mv.disassemble(start)
+            spans = []  # (body start, body end, register count)
+            for k, ins in enumerate(code):
+                if ins.name == 'DefineFunction2' and k + 1 < len(code):
+                    head = (ins.at + 1 + 3) & ~3
+                    begin = code[k + 1].at
+                    spans.append((begin, begin + ins.args[2], mv.u32(head + 8) >> 16))
+            functions += len(spans)
+            for ins in code:
+                if ins.name == 'SetRegister':
+                    used = [ins.args[0]]
+                elif ins.name == 'PushData':
+                    used = [int(t[1:]) for t in ins.text.split(', ') if t[:1] == 'r' and t[1:].isdigit()]
+                else:
+                    continue
+                inside = [s for s in spans if s[0] <= ins.at < s[1]]
+                if not inside or not used:
+                    continue
+                count = min(inside, key=lambda s: s[1] - s[0])[2]
+                assert max(used) < count, (e['name'], hex(ins.at), ins.name, used, count)
+    assert functions > 1000
 
 
 def test_every_movie_follows_the_loader_order(built):
