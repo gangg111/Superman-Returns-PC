@@ -33,7 +33,9 @@ REXCVAR_DEFINE_BOOL(sr_lock_action_is_power, true, "Superman Returns",
 REXCVAR_DEFINE_DOUBLE(sr_mouse_sensitivity, 6.0, "Superman Returns",
                       "Mouse camera sensitivity, left and right: right stick units per mouse count / 200")
     .range(0.01, 1000.0);
-REXCVAR_DEFINE_DOUBLE(sr_mouse_sensitivity_y, 6.0, "Superman Returns",
+// 15 as the builder's settings give sr_mouse_sensitivity: before the Up / Down slider (1.0.12)
+// the mouse turned up and down as fast as left and right
+REXCVAR_DEFINE_DOUBLE(sr_mouse_sensitivity_y, 15.0, "Superman Returns",
                       "Mouse camera sensitivity, up and down (the same units as sr_mouse_sensitivity)")
     .range(0.01, 1000.0);
 REXCVAR_DEFINE_BOOL(sr_mouse_invert_y, false, "Superman Returns", "Mouse camera: moving the mouse up looks down");

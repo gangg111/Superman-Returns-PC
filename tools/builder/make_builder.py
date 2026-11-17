@@ -59,6 +59,7 @@ DEFAULT_TOML = """\
 mnk_mode = true
 mnk_mouse = true
 sr_mouse_sensitivity = 15
+sr_mouse_sensitivity_y = 15
 """
 
 README = """\
