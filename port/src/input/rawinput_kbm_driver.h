@@ -17,6 +17,13 @@ namespace superman_returns::input {
 using rex::X_RESULT;
 using rex::X_STATUS;
 
+// The mouse camera (sr_mouse_direct): whether the game's camera input took the mouse
+// in the last 200 ms (then the mouse is not the right stick), the counts gathered since
+// the last take, and the degrees one count turns the camera.
+bool DirectMouseAlive();
+void DirectMouseTake(double& dx, double& dy);
+double DirectMouseDegreesPerCount();
+
 class RawInputKbmDriver final : public rex::input::InputDriver {
  public:
   RawInputKbmDriver();

@@ -33,6 +33,9 @@ REXCVAR_DEFINE_BOOL(sr_lock_action_is_power, true, "Superman Returns",
 REXCVAR_DEFINE_DOUBLE(sr_mouse_sensitivity, 6.0, "Superman Returns",
                       "Mouse camera sensitivity: right stick units per mouse count / 200")
     .range(0.01, 1000.0);
+REXCVAR_DEFINE_BOOL(sr_mouse_direct, true, "Superman Returns",
+                    "Mouse look: the mouse turns the camera by an angle per count, past the stick's dead zone, "
+                    "curve and smoothing (camera_mouse in native_input.cpp); off: the mouse is the right stick");
 REXCVAR_DEFINE_BOOL(sr_kbm_auto, true, "Input",
                     "Keyboard and mouse always on beside the pads: the input last used decides the cursor and "
                     "mouse look (off: mnk_mode and mnk_mouse decide)");
@@ -149,9 +152,12 @@ std::vector<uint8_t> ComboKeys(std::string_view combo) {
 // 100 ms from where the last read stopped (automation that waits on what the
 // screen shows, unlike the fixed times of sr_input_script):
 //   press <Key>[+<Key>...] [ms]   held from now, 150 ms by default
+//   mouse <dx> <dy>               counts as if the mouse moved (the mouse camera's tests)
 //   dump                          the next presented frame into sr_native_dump_dir
 //                                 as c<n>_* (raw2png.py), n counting from 1
 // Each command is logged ("control: ..."), the dump with its file prefix.
+std::atomic<double> g_control_mouse_dx{0.0}, g_control_mouse_dy{0.0};  // sr_input_control "mouse"
+
 bool ControlKeys(bool (&down)[256]) {
   using Clock = std::chrono::steady_clock;
   struct Hold {
@@ -190,6 +196,13 @@ bool ControlKeys(bool (&down)[256]) {
             const double ms = sp == std::string_view::npos ? 150.0 : std::atof(std::string(arg.substr(sp + 1)).c_str());
             holds.push_back({now + std::chrono::milliseconds(int64_t(ms)), ComboKeys(arg.substr(0, sp))});
             REXLOG_INFO("control: press {} for {} ms", arg.substr(0, sp), ms);
+          } else if (line.rfind("mouse ", 0) == 0) {
+            // mouse <dx> <dy>: counts as if the mouse moved (tests of the mouse camera)
+            double mx = 0, my = 0;
+            std::sscanf(std::string(line.substr(6)).c_str(), "%lf %lf", &mx, &my);
+            g_control_mouse_dx.store(g_control_mouse_dx.load() + mx);
+            g_control_mouse_dy.store(g_control_mouse_dy.load() + my);
+            REXLOG_INFO("control: mouse {} {}", mx, my);
           } else if (line == "dump") {
             const std::string prefix = "c" + std::to_string(++dumps) + "_";
             superman_returns::native::RequestFrameDump(prefix);
@@ -272,6 +285,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 }  // namespace
+
+// The mouse camera (sr_mouse_direct): counts gathered here while mouse look is on,
+// taken by the game's camera input hook each update. While that hook took them in
+// the last 200 ms the mouse is not the right stick.
+namespace {
+constexpr int32_t kMouseWakeStick = 9200;
+std::atomic<double> g_direct_dx{0.0}, g_direct_dy{0.0};
+std::atomic<int64_t> g_direct_taken_ms{0};
+}  // namespace
+
+bool DirectMouseAlive() {
+  const int64_t taken = g_direct_taken_ms.load(std::memory_order_relaxed);
+  return REXCVAR_GET(sr_mouse_direct) && taken && NowMs() - taken < 200;
+}
+
+void DirectMouseTake(double& dx, double& dy) {
+  g_direct_taken_ms.store(NowMs(), std::memory_order_relaxed);
+  dx = g_direct_dx.exchange(0.0);
+  dy = g_direct_dy.exchange(0.0);
+}
+
+double DirectMouseDegreesPerCount() {
+  // the same slider as the stick mode: its default 6 is 0.08 degrees a count (NX2navi's at 1)
+  return REXCVAR_GET(sr_mouse_sensitivity) * (0.08 / 6.0);
+}
 
 RawInputKbmDriver::RawInputKbmDriver() : InputDriver(nullptr, 0) {}
 
@@ -523,7 +561,9 @@ X_RESULT RawInputKbmDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state
     std::memset(key_down_, 0, sizeof(key_down_));
   }
   was_foreground_ = foreground;
-  const double dx = mouse_dx_, dy = mouse_dy_;
+  const double ctl_dx = g_control_mouse_dx.exchange(0.0), ctl_dy = g_control_mouse_dy.exchange(0.0);
+  if (ctl_dx || ctl_dy) last_kbm_use_ms_.store(NowMs(), std::memory_order_relaxed);
+  const double dx = mouse_dx_ + ctl_dx, dy = mouse_dy_ + ctl_dy;
   mouse_dx_ = mouse_dy_ = 0.0;
   ++packet_;
   if (!out_state) return X_ERROR_SUCCESS;
@@ -632,8 +672,26 @@ X_RESULT RawInputKbmDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state
       carry = std::clamp(want - out, -4 * 32767.0, 4 * 32767.0);
       stick = int32_t(out);
     };
-    take(dx * s, carry_x, rx);
-    take(-dy * s, carry_y, ry);
+    if (DirectMouseAlive()) {
+      // the mouse camera takes the horizontal counts as an angle (camera_mouse)
+      g_direct_dx.store(g_direct_dx.load() + dx);
+      g_direct_dy.store(g_direct_dy.load() + dy);
+      carry_x = 0;
+      // The game's camera follows Superman until the right stick moves: while the mouse
+      // moves, the stick just past the game's dead zone (8689) in the mouse's direction
+      // takes the camera, as a stick would. After the game's curve it turns ~0.5 deg/s.
+      static int64_t moved_ms = 0;
+      static int moved_sign = 1;
+      if (dx || dy) moved_ms = NowMs();
+      if (dx) moved_sign = dx > 0 ? 1 : -1;
+      if (!rx && moved_ms && NowMs() - moved_ms < 300) rx = moved_sign * kMouseWakeStick;
+    } else {
+      take(dx * s, carry_x, rx);
+      take(-dy * s, carry_y, ry);
+    }
+  } else {
+    g_direct_dx.store(0.0);
+    g_direct_dy.store(0.0);
   }
   if (mouse_look && (dx || dy) && ++mouse_logs_ <= 8)
     REXLOG_INFO("Raw Input: mouse {} {} -> right stick {} {}", dx, dy, rx, ry);
