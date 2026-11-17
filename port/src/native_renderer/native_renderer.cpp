@@ -6386,6 +6386,11 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
     const std::string* name = FetchSlotName(base, dev, 1);
     glow_flat_ps = name && REXCVAR_GET(sr_glow_flat_textures).find(*name) != std::string::npos;
   }
+  // The inside of the cape: its PS's c45 (L0_cape_col; c45 = green turned the inside
+  // green, the user 2026-11-17), from the worn costume slot's cape_inside.
+  float cape_inside[3];
+  const bool cape_ps = current_ps_hash_ == 0x71CB82D791DE8E77ull && current_vs_hash_ == 0xA5232A3184AA617Cull &&
+                       CostumeCapeInside(cape_inside);
   // Debug (sr_draw_idview = a texture content name, e.g. the big globe's atlas): the draws
   // around the one using it (its index in the previous frame, same order every frame) are
   // painted one hue each by their offset from it, and logged once with that offset.
@@ -6421,7 +6426,7 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
   }
   const bool idview_ps = idview_id >= 0;
   const uint32_t ps_regs = ConstRegs(current_ps_hash_, true);
-  if (!use_mirror || override_ps || dn_ps || sky_ps || lod_ps || ocean_ps || glow_ps || glow_flat_ps || idview_ps || cb_ps_version_ != mirror_.ps_version ||
+  if (!use_mirror || override_ps || dn_ps || sky_ps || lod_ps || ocean_ps || glow_ps || glow_flat_ps || idview_ps || cape_ps || cb_ps_version_ != mirror_.ps_version ||
       ps_regs > cb_ps_regs_ ||
       !cb_ps_gpu_) {
     UploadAlloc ps;
@@ -6432,6 +6437,17 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
     uint32_t* ps_dst = ps_local;
     fill(Pm4Mirror::kAluConstantBase + 1024, kDevPsConstants, ps_dst);
     if (override_ps) std::memcpy(ps_dst + ps_override.reg * 4, ps_override.v, 16);
+    if (cape_ps) {
+      float* c45 = reinterpret_cast<float*>(ps_dst + 45 * 4);
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        REXLOG_INFO("costumes: the game's cape inside c45 ({:.4f}, {:.4f}, {:.4f}, {:.4f}) = #{:02X}{:02X}{:02X}", c45[0],
+                    c45[1], c45[2], c45[3], int(std::clamp(c45[0], 0.0f, 1.0f) * 255.0f + 0.5f),
+                    int(std::clamp(c45[1], 0.0f, 1.0f) * 255.0f + 0.5f), int(std::clamp(c45[2], 0.0f, 1.0f) * 255.0f + 0.5f));
+      }
+      for (int i = 0; i < 3; ++i) c45[i] = cape_inside[i];
+    }
     if (dn_ps) {
       // RB_BLENDCONTROL0 colour destination factor (bits 8-12) 1 = ONE: additive.
       const uint32_t blend = LoadReg(base, dev, rex::graphics::XE_GPU_REG_RB_BLENDCONTROL0);
@@ -6499,7 +6515,7 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
     cb_ps_regs_ = ps_regs;
     cb_ps_gpu_ = ps.gpu;
     cb_ps_version_ =
-        (use_mirror && !override_ps && !dn_ps && !sky_ps && !lod_ps && !ocean_ps && !glow_ps && !glow_flat_ps && !idview_ps) ? mirror_.ps_version : 0;
+        (use_mirror && !override_ps && !dn_ps && !sky_ps && !lod_ps && !ocean_ps && !glow_ps && !glow_flat_ps && !idview_ps && !cape_ps) ? mirror_.ps_version : 0;
   }
   float_timer.Stop();
   // Assemble all derived state in ordinary CPU memory. Upload only after the

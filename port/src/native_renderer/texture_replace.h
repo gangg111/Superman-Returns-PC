@@ -54,6 +54,10 @@ bool IsCostumeTexture(const std::string& name);
 // The worn slot's costume.toml has cape = false: the renderer leaves the cape out
 // (native_renderer.cpp, the cape's vertex shader). Read when the slot is worn.
 bool CostumeCapeHidden();
+// The worn slot's costume.toml has cape_inside = "#RRGGBB": that colour (0..1, the
+// game's own scale) for the inside of the cape (native_renderer.cpp, the cape's PS
+// constant c45). Read when the slot is worn.
+bool CostumeCapeInside(float rgb[3]);
 // Slot `slot` (1..kCustomCostumes): its costume.toml's cape setting (true unless
 // cape = false), and setting it (the line replaced or added; applied at once
 // when the slot is worn). The costumes screen's Y button.

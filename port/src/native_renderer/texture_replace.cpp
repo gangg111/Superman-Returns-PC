@@ -274,11 +274,28 @@ std::string CostumeSetting(int slot, const char* key) {
   return {};
 }
 
-// cape = false in the slot's costume.toml: the slot's costume without the cape.
+// The inside of the worn slot's cape, 0xRRGGBB, or -1: the game's own.
+std::atomic<int64_t> g_cape_inside{-1};
+
+// "#RRGGBB" (quotes and # optional) as 0xRRGGBB, or -1.
+int64_t ParseRgb(std::string v) {
+  std::erase(v, '"');
+  if (!v.empty() && v[0] == '#') v.erase(0, 1);
+  if (v.size() != 6 || v.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) return -1;
+  return std::stoll(v, nullptr, 16);
+}
+
+// cape = false in the slot's costume.toml: the slot's costume without the cape;
+// cape_inside = "#RRGGBB": the colour of the cape's inside.
 void NoteCapeSetting(int slot) {
   const bool hidden = slot > 0 && CostumeSetting(slot, "cape") == "false";
   g_cape_hidden_slot.store(hidden ? slot : -1);
   if (hidden) REXLOG_INFO("costumes: slot {} has no cape (cape = false)", slot + 3);
+  const std::string inside = slot > 0 ? CostumeSetting(slot, "cape_inside") : std::string();
+  const int64_t rgb = inside.empty() ? -1 : ParseRgb(inside);
+  g_cape_inside.store(rgb);
+  if (rgb >= 0) REXLOG_INFO("costumes: slot {} cape inside #{:06X}", slot + 3, uint32_t(rgb));
+  else if (!inside.empty()) REXLOG_WARN("costumes: slot {} cape_inside = {} is not \"#RRGGBB\"", slot + 3, inside);
 }
 
 // The player's file standing for texture `name`, if the worn slot has one.
@@ -368,6 +385,14 @@ void SetCostumeCapeShown(int slot, bool shown) {
 bool CostumeCapeHidden() {
   const int slot = CustomCostume();
   return slot > 0 && g_cape_hidden_slot.load() == slot;
+}
+
+bool CostumeCapeInside(float rgb[3]) {
+  if (CustomCostume() <= 0) return false;
+  const int64_t v = g_cape_inside.load();
+  if (v < 0) return false;
+  for (int i = 0; i < 3; ++i) rgb[i] = float((v >> (16 - 8 * i)) & 0xFF) / 255.0f;
+  return true;
 }
 
 std::string CustomCostumeName(int slot) {

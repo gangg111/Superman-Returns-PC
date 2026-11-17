@@ -365,7 +365,9 @@ int MakeTextures(const Pack& pack, const fs::path& game_dir, const fs::path& out
         const std::string text = "# The name this costume slot shows in the Fortress's costumes screen.\r\n"
                                   "name = \"Slot " + std::to_string(n) + "\"\r\n"
                                   "# false: this costume without the cape.\r\n"
-                                  "cape = true\r\n";
+                                  "cape = true\r\n"
+                                  "# The colour of the cape's inside, \"#RRGGBB\" (the game's is \"#BF0000\").\r\n"
+                                  "cape_inside = \"#BF0000\"\r\n";
         WriteAll(toml, text.data(), text.size());
         ++written;
       }
