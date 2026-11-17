@@ -412,23 +412,36 @@ def test_kept_clips_only_on_their_screen(built):
 
 def test_mouse_options_screen(built):
     # MOUSE OPTIONS: Audio Options' movie (apt.py dump of SCRAUDIOOPT: sliders Music and SoundFX,
-    # GetMusicVol/SetMusicVol), its Music slider through GetMouseSens/SetMouseSens, no SoundFX slider,
-    # opened by OPTIONS' seventh button
+    # GetMusicVol/SetMusicVol), Music through GetMouseSens/SetMouseSens (left and right), SoundFX
+    # through GetMouseSensY/SetMouseSensY (up and down), and a Toggle (SCRGAMEPLAYOPT's import
+    # 'components\\Toggle') through GetMouseInvertY/SetMouseInvertY; opened by OPTIONS' seventh button
     ui, text = built
     m = movie(ui, 'SCRMOUSEOPT')
-    exports = [name for name, _ in m.header()['exports']]
+    h = m.header()
+    exports = [name for name, _ in h['exports']]
     assert 'ScrMouseOpt' in exports and 'ScrAudioOpt' not in exports
+    imports = {name: (src, ch) for src, name, ch in h['imports']}
+    assert imports['Slider'] == ('components/Slider', 1)
+    assert imports['Toggle'] == ('components\\Toggle', 5)  # a new slot after the 5 characters
+    assert h['characters'][0] == 6 and m.characters()[5] == 0  # imported: an empty slot, as Slider's
     screen = m.characters()[2]
-    names = [it['name'] for it in m.frames(m.u32(screen + 16), m.u32(screen + 20))[0] if it['type'] == 3]
-    assert names == ['Music']  # source: SoundFX taken off
-    texts = ' | '.join(t for f in m.frames(*m.header()['frames']) for it in f if it.get('code')
+    placed = {it['name']: it for it in m.frames(m.u32(screen + 16), m.u32(screen + 20))[0] if it['type'] == 3}
+    assert list(placed) == ['Music', 'SoundFX', 'InvertY']
+    assert placed['InvertY']['character'] == 5 and placed['Music']['character'] == 1
+    # one slider step below Sound FX (413.25 -> 451.65 -> 490.05)
+    assert abs(placed['InvertY']['pos'][1] - (451.65 + (451.65 - 413.25))) < 0.01
+    texts = ' | '.join(t for f in m.frames(*h['frames']) for it in f if it.get('code')
                        for t in strings_pushed(m, it['code']))
-    for t in ("'GetMouseSens'", "'SetMouseSens'", "'MouseOpt_Sens_Slider'", "'Label_ScrMouseOpt'"):
+    for t in ("'GetMouseSens'", "'SetMouseSens'", "'GetMouseSensY'", "'SetMouseSensY'", "'GetMouseInvertY'",
+              "'SetMouseInvertY'", "'MouseOpt_Sens_Slider'", "'MouseOpt_SensY_Slider'", "'MouseOpt_InvertY'",
+              "'Label_ScrMouseOpt'"):
         assert t in texts, t
-    for t in ("'GetSFXVol'", "'SetSFXVol'", "'SetMusicVol'"):
+    for t in ("'GetSFXVol'", "'SetSFXVol'", "'SetMusicVol'", "'GetMusicVol'"):
         assert t not in texts, t
     xml = text.data(text.find('INTERFACETEXT')).decode('utf-8-sig')
-    assert '<uitext id="MouseOpt_Sens_Slider" value="Mouse Sensitivity"/>' in xml
+    for k, v in (("MouseOpt_Sens_Slider", "Left / Right"), ("MouseOpt_SensY_Slider", "Up / Down"),
+                 ("MouseOpt_InvertY", "Y-Axis Inversion")):
+        assert f'<uitext id="{k}" value="{v}"/>' in xml
 
 
 def test_smart_camera_follows_the_input(built):

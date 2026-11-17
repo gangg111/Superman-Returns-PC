@@ -120,22 +120,55 @@ int64_t SteadyMs() {
 constexpr double kFlightYawRate = 2.05;   // radians a second at 1
 constexpr double kFlightPitchRate = 1.2;  // radians a second at 1
 
+double yaw_left = 0, pitch_left = 0;  // FlightMouse's turn not yet given to the camera
+int64_t g_flight_mouse_ms = 0;        // FlightMouse last turned the camera
+
 void FlightMouse(uint8_t* base, uint32_t self, double dt) {
   if (!REXCVAR_GET(sr_mouse_direct) || !(dt > 0.0)) return;
-  if (SteadyMs() - g_on_foot_ms.load(std::memory_order_relaxed) < 150) return;
+  if (SteadyMs() - g_on_foot_ms.load(std::memory_order_relaxed) < 150) {
+    yaw_left = pitch_left = 0;  // nothing carried from one flight to the next
+    return;
+  }
   double dx = 0, dy = 0;
   superman_returns::input::DirectMouseTake(dx, dy);
-  if (!dx && !dy) return;  // a pad's stick keeps the ramp's outputs
-  const double per = superman_returns::input::DirectMouseDegreesPerCount() * 0.017453292519943295;
+  double px, py;
+  superman_returns::input::DirectMouseDegreesPerCount(px, py);
+  px *= 0.017453292519943295, py *= 0.017453292519943295;
+  // The outputs stay within the stick's +-1: past it the camera turned faster than the game
+  // turns Superman and circled him (the user, 2026-11-17: "efekt drona"). The rest of the
+  // turn (radians) carries to the next updates.
   // the right stick's directions: right is a negative yaw output, up (dy < 0) a negative
   // pitch output (as the mouse through the stick before: up looks up)
-  StoreGuestF32(base, self + 172, float(-dx * per / (kFlightYawRate * dt)));
-  StoreGuestF32(base, self + 168, float(dy * per / (kFlightPitchRate * dt)));
+  yaw_left += -dx * px;
+  pitch_left += dy * py;
+  if (!yaw_left && !pitch_left) {
+    // Just after the mouse stopped the stick still reports its last turn (rawinput_kbm_driver
+    // DirectMouseFlightStick): the camera gets none of it. Otherwise a pad's stick keeps the
+    // ramp's outputs.
+    if (SteadyMs() - g_flight_mouse_ms < 200) {
+      StoreGuestF32(base, self + 172, 0.0f);
+      StoreGuestF32(base, self + 168, 0.0f);
+      superman_returns::input::DirectMouseFlightStick(0.0f, 0.0f);
+    }
+    return;
+  }
+  g_flight_mouse_ms = SteadyMs();
+  const double yaw_out = std::clamp(yaw_left / (kFlightYawRate * dt), -1.0, 1.0);
+  const double pitch_out = std::clamp(pitch_left / (kFlightPitchRate * dt), -1.0, 1.0);
+  yaw_left -= yaw_out * kFlightYawRate * dt;
+  pitch_left -= pitch_out * kFlightPitchRate * dt;
+  if (std::abs(yaw_left) < 1e-6) yaw_left = 0;
+  if (std::abs(pitch_left) < 1e-6) pitch_left = 0;
+  // the game holds the pitch within +-40 degrees: a turn past it is not kept for later
+  pitch_left = std::clamp(pitch_left, -0.7, 0.7);
+  StoreGuestF32(base, self + 172, float(yaw_out));
+  StoreGuestF32(base, self + 168, float(pitch_out));
+  superman_returns::input::DirectMouseFlightStick(float(yaw_out), float(pitch_out));
   static bool logged = false;
   if (!logged) {
     logged = true;
-    REXLOG_INFO("mouse camera (flight): {} {} counts turned the camera {:.3f} / {:.3f} degrees", dx, dy,
-                dx * per * 57.29578, -dy * per * 57.29578);
+    REXLOG_INFO("mouse camera (flight): {} {} counts, a turn of {:.3f} / {:.3f} degrees", dx, dy,
+                dx * px * 57.29578, -dy * py * 57.29578);
   }
 }
 
@@ -157,9 +190,12 @@ REX_HOOK_RAW(sub_821FD808) {
   double dx = 0, dy = 0;
   superman_returns::input::DirectMouseTake(dx, dy);
   if (!dx && !dy) return;
-  const double per = superman_returns::input::DirectMouseDegreesPerCount() * 0.017453292519943295;
-  const float yaw = float(dx * per);
-  float pitch = float(-dy * per);  // mouse up (dy < 0) looks up
+  double px, py;
+  superman_returns::input::DirectMouseDegreesPerCount(px, py);
+  // right (dx > 0) turns as the stick right: the heading 2 atan2(y, w) down (measured: the
+  // stick right took it from -17 to -112 degrees in 0.5 s), a negative yaw in the left product
+  const float yaw = float(-dx * px * 0.017453292519943295);
+  float pitch = float(-dy * py * 0.017453292519943295);  // mouse up (dy < 0) looks up
   const uint32_t q = self + 208;
   float x = LoadGuestF32(base, q), y = LoadGuestF32(base, q + 4), z = LoadGuestF32(base, q + 8),
         w = LoadGuestF32(base, q + 12);

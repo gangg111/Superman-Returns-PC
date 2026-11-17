@@ -22,7 +22,8 @@ using rex::X_STATUS;
 // the last take, and the degrees one count turns the camera.
 bool DirectMouseAlive();
 void DirectMouseTake(double& dx, double& dy);
-double DirectMouseDegreesPerCount();
+void DirectMouseDegreesPerCount(double& x, double& y);
+void DirectMouseFlightStick(float yaw_out, float pitch_out);
 
 class RawInputKbmDriver final : public rex::input::InputDriver {
  public:

@@ -31,8 +31,12 @@
 REXCVAR_DEFINE_BOOL(sr_lock_action_is_power, true, "Superman Returns",
                     "While Target Lock (left trigger) is held, Action (X) presses Superpower (right trigger)");
 REXCVAR_DEFINE_DOUBLE(sr_mouse_sensitivity, 6.0, "Superman Returns",
-                      "Mouse camera sensitivity: right stick units per mouse count / 200")
+                      "Mouse camera sensitivity, left and right: right stick units per mouse count / 200")
     .range(0.01, 1000.0);
+REXCVAR_DEFINE_DOUBLE(sr_mouse_sensitivity_y, 6.0, "Superman Returns",
+                      "Mouse camera sensitivity, up and down (the same units as sr_mouse_sensitivity)")
+    .range(0.01, 1000.0);
+REXCVAR_DEFINE_BOOL(sr_mouse_invert_y, false, "Superman Returns", "Mouse camera: moving the mouse up looks down");
 REXCVAR_DEFINE_BOOL(sr_mouse_direct, true, "Superman Returns",
                     "Mouse look: the mouse turns the camera by an angle per count, past the stick's dead zone, "
                     "curve and smoothing (camera_mouse in native_input.cpp); off: the mouse is the right stick");
@@ -306,9 +310,25 @@ void DirectMouseTake(double& dx, double& dy) {
   dy = g_direct_dy.exchange(0.0);
 }
 
-double DirectMouseDegreesPerCount() {
-  // the same slider as the stick mode: its default 6 is 0.08 degrees a count (NX2navi's at 1)
-  return REXCVAR_GET(sr_mouse_sensitivity) * (0.08 / 6.0);
+// In flight (native_input.cpp FlightMouse): the turn the mouse gave the camera this update as
+// the flight ramp's outputs (-1..1). The right stick reports the same deflection while it is
+// recent, so Superman, who turns by the stick, turns with the camera.
+namespace {
+std::atomic<float> g_flight_yaw{0.0f}, g_flight_pitch{0.0f};
+std::atomic<int64_t> g_flight_ms{0};
+}  // namespace
+
+void DirectMouseFlightStick(float yaw_out, float pitch_out) {
+  g_flight_yaw.store(yaw_out, std::memory_order_relaxed);
+  g_flight_pitch.store(pitch_out, std::memory_order_relaxed);
+  g_flight_ms.store(NowMs(), std::memory_order_relaxed);
+}
+
+void DirectMouseDegreesPerCount(double& x, double& y) {
+  // the same sliders as the stick mode: their default 6 is 0.08 degrees a count (NX2navi's at 1);
+  // y is negative with sr_mouse_invert_y
+  x = REXCVAR_GET(sr_mouse_sensitivity) * (0.08 / 6.0);
+  y = REXCVAR_GET(sr_mouse_sensitivity_y) * (0.08 / 6.0) * (REXCVAR_GET(sr_mouse_invert_y) ? -1.0 : 1.0);
 }
 
 RawInputKbmDriver::RawInputKbmDriver() : InputDriver(nullptr, 0) {}
@@ -666,6 +686,7 @@ X_RESULT RawInputKbmDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state
     // fast move gives beyond a full stick is carried to the next polls (up to
     // four full sticks), so a quick turn is not cut short by the stick's limit.
     const double s = REXCVAR_GET(sr_mouse_sensitivity) * 200.0;
+    const double sy = REXCVAR_GET(sr_mouse_sensitivity_y) * 200.0 * (REXCVAR_GET(sr_mouse_invert_y) ? -1.0 : 1.0);
     auto take = [](double want, double& carry, int32_t& stick) {
       want += carry + stick;
       const double out = std::clamp(want, -32767.0, 32767.0);
@@ -685,9 +706,19 @@ X_RESULT RawInputKbmDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state
       if (dx || dy) moved_ms = NowMs();
       if (dx) moved_sign = dx > 0 ? 1 : -1;
       if (!rx && moved_ms && NowMs() - moved_ms < 300) rx = moved_sign * kMouseWakeStick;
+      // In flight: the stick as deflected as the camera's turn (the game's flight dead zone
+      // 8689, then linear to 1 at 32767: measured 20000 -> 0.469, 32767 -> 1.0). The ramp's
+      // output to the camera is the mouse's own (FlightMouse); right is a negative yaw output.
+      if (NowMs() - g_flight_ms.load(std::memory_order_relaxed) < 100) {
+        auto deflect = [](float out) {
+          const float a = std::min(std::fabs(out), 1.0f);
+          return a < 1e-3f ? 0 : int32_t(std::copysign(8689.0f + a * (32767.0f - 8689.0f), out));
+        };
+        if (!axis("keybind_rstick_left", "keybind_rstick_right")) rx = deflect(-g_flight_yaw.load());
+        if (!axis("keybind_rstick_down", "keybind_rstick_up")) ry = deflect(-g_flight_pitch.load());      }
     } else {
       take(dx * s, carry_x, rx);
-      take(-dy * s, carry_y, ry);
+      take(-dy * sy, carry_y, ry);
     }
   } else {
     g_direct_dx.store(0.0);

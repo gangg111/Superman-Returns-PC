@@ -108,7 +108,8 @@ def key_texts():
     import key_names
     mouse = {"LMB": "Left Mouse", "RMB": "Right Mouse", "MMB": "Middle Mouse"}
     out = [("Label_ScrOptionsMenu", "OPTIONS"), ("Label_ScrKeysOpt", "KEYS MAPPING"),
-           ("Label_ScrMouseOpt", "MOUSE OPTIONS"), ("KEYS_DEFAULTS", "DEFAULTS"), ("MouseOpt_Sens_Slider", "Mouse Sensitivity"),
+           ("Label_ScrMouseOpt", "MOUSE OPTIONS"), ("KEYS_DEFAULTS", "DEFAULTS"), ("MouseOpt_Sens_Slider", "Left / Right"),
+           ("MouseOpt_SensY_Slider", "Up / Down"), ("MouseOpt_InvertY", "Y-Axis Inversion"),
            ("Label_ScrTuningOpt", "DISPLAY TUNING"), ("TuningOpt_Brightness_Slider", "Brightness"),
            ("TuningOpt_Contrast_Slider", "Contrast"),
            ("SR_BOOT_TITLE", "MAIN MENU"), ("SR_BOOT_NEW_GAME", "New Game"), ("SR_BOOT_LOAD_GAME", "Load Game"), ("SR_BOOT_OPTIONS", "Options"),
@@ -1909,23 +1910,128 @@ def make_options_menu(data, const):
     return m.write()
 
 
+# MOUSE OPTIONS' Y-Axis Inversion toggle: a Toggle (Gameplay Options' component)
+# one slider step (38.4) below the Sound FX slider; at x -95.6 its label stood 28 px
+# right of the sliders' (frame dump 2026-11-17), so 28 further left.
+MOUSE_TOGGLE_X, MOUSE_TOGGLE_Y = -123.6, 490.05
+
+
+def add_import(m, source, name):
+    """A character imported from another movie (as the movie's own imports: an
+    empty slot in the character list, an import record of 16 bytes); returns
+    its character id."""
+    r = m.root
+    count, lst = m.b.u32(r + 28), m.b.u32(r + 32)
+    chars = [m.b.u32(lst + 4 * i) for i in range(count)]
+    m.b.align(4)
+    at = m.b.here()
+    for ch in chars + [0]:
+        m.b.put32(ch)
+    m.b.set32(r + 28, count + 1)
+    m.b.set32(r + 32, at)
+    n, imports = m.b.u32(r + 48), m.b.u32(r + 52)
+    old = [[m.b.u32(imports + 16 * i + k) for k in (0, 4, 8, 12)] for i in range(n)]
+    m.b.align(4)
+    at = m.b.here()
+    for rec in old:
+        for v in rec:
+            m.b.put32(v)
+    m.b.put32(0)
+    m.b.put32(0)
+    m.b.put32(count)
+    m.b.put32(0)
+    m.b.set32(at + 16 * n, m.b.put_string(source))
+    m.b.set32(at + 16 * n + 4, m.b.put_string(name))
+    m.b.set32(r + 48, n + 1)
+    m.b.set32(r + 52, at)
+    return count
+
+
 def make_mouse_screen(data, const):
     """Audio Options (already made to go back to OPTIONS) made into MOUSE
-    OPTIONS: its Music slider (0..10 by 1) is Mouse Sensitivity through the
-    natives GetMouseSens/SetMouseSens (graphics_menu.cpp, sr_mouse_sensitivity);
-    the Sound FX slider is taken off the screen and its natives renamed to
-    nothing, so the screen never sets the volume."""
+    OPTIONS: its Music slider (0..10 by 1) is the left and right sensitivity
+    (natives GetMouseSens/SetMouseSens, sr_mouse_sensitivity), its Sound FX
+    slider the up and down one (GetMouseSensY/SetMouseSensY,
+    sr_mouse_sensitivity_y), so the screen never sets the volume; below them a
+    Toggle, Y-Axis Inversion (GetMouseInvertY/SetMouseInvertY, sr_mouse_invert_y),
+    in the focus manager's order after the sliders (m_tabIndex 2)."""
     m = apt_edit.MovieEdit(data, const)
     for old, new in (("ScrAudioOpt", "ScrMouseOpt"), ("__Packages.ScrAudioOpt", "__Packages.ScrMouseOpt")):
         m.rename_export(old, new)
         m.c.rename(old, new)
     for old, new in (("Label_ScrAudioOpt", "Label_ScrMouseOpt"), ("AudioOpt_Music_Slider", "MouseOpt_Sens_Slider"),
+                     ("AudioOpt_SoundFX_Slider", "MouseOpt_SensY_Slider"),
                      ("GetMusicVol", "GetMouseSens"), ("SetMusicVol", "SetMouseSens"),
-                     ("GetSFXVol", "srNoSFX"), ("SetSFXVol", "srNoSFX")):
+                     ("GetSFXVol", "GetMouseSensY"), ("SetSFXVol", "SetMouseSensY")):
         m.c.rename(old, new)
+    toggle = add_import(m, "components\\Toggle", "Toggle")
+    code = m.code()
     screen = m.character(2)
     srec, sitems = m.frame_items(screen)
-    m.set_frame_items(srec, [it for it in sitems if m.placement_name(it) != "SoundFX"])
+    template = next(it for it in sitems if m.placement_name(it) == "SoundFX")
+    at = code.start()
+    code.set_variable("mArrowWidth", 200)
+    code.set_variable("mLabel", "Y-Axis Inversion")
+    code.set_variable("mOptionsArray", lambda: code.array(["Off", "On"]))
+    code.set_variable("isWrapping", True)
+    code.set_variable("m_bEnabled", True)
+    code.set_variable("m_refFM", "_global.gFM")
+    code.set_variable("m_initiallySelected", False)
+    code.set_variable("m_tabIndex", 2)
+    code.set_variable("m_bVisible", True)
+    code.end()
+    code.finish()
+    invert = m.place_copy(template, "InvertY", 60, MOUSE_TOGGLE_X, MOUSE_TOGGLE_Y, at)
+    m.b.set32(invert + 12, toggle)
+    m.set_frame_items(srec, sitems + [invert])
+
+    # InitGui and HandleInput wrapped (after the class and Back's wrapper): the
+    # toggle's label, choices and value; after every key its value to the setting.
+    rec, items = m.frame_items(m.root)
+    cls = find_class_init(m, items, "ScrMouseOpt")
+    at = code.start()
+    proto = ("_global", "ScrMouseOpt", "prototype")
+    this = (("r", 1),)
+    g = ("r", 2)
+    row = this + ("InvertY",)
+    code.path(*proto, "srMouseInit0")
+    code.push(None)
+    code.op("Equals2")
+    code.op("Not")
+    done = code.branch_if_true()
+    code.set_member(proto, "srMouseInit0", lambda: code.path(*proto, "InitGui"))
+    code.set_member(proto, "srMouseInput0", lambda: code.path(*proto, "HandleInput"))
+
+    def localized(key):
+        return lambda: code.call_method((g, "LocalizationAdapter"), "GetLocalizedText", [key], keep=True)
+
+    def init_gui():
+        body = code.begin_method()
+        code.call_method(this, "srMouseInit0")
+        code.call_method(row, "SetLabel", [localized("MouseOpt_InvertY")])
+        code.call_method(row, "SetData", [lambda: (
+            code.push("|", 1), localized("GFX_OPT_OFF_ON")(), code.push("split"), code.op("CallMethod"))])
+        code.call_method(row, "SetIndex", [lambda: code.call_method(
+            (g, "SettingsAdapter"), "GetMouseInvertY", keep=True)])
+        code.end_method(body)
+
+    def handle_input():
+        body = code.begin_method(["keyCode", "controllerId", "ascii"], registers=7)
+        code.call_method(this, "srMouseInput0", [("r", 3), ("r", 4), ("r", 5)], keep=True)
+        code.set_register(6)
+        code.call_method((g, "SettingsAdapter"), "SetMouseInvertY", [lambda: code.call_method(
+            row, "GetIndex", keep=True)])
+        code.push(("r", 6))
+        code.op("Return")
+        code.end_method(body)
+
+    code.set_member(proto, "InitGui", init_gui)
+    code.set_member(proto, "HandleInput", handle_input)
+    code.land(done)
+    code.end()
+    code.finish()
+    items.insert(items.index(cls) + 1, m.init_action(m.b.u32(cls + 4), at))
+    m.set_frame_items(rec, items)
     return m.write()
 
 

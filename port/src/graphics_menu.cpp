@@ -96,6 +96,9 @@ const std::vector<Row> kRows = {
     // stays black; contrast keeps black, white and the average (blit.hlsl).
     {106, {"sr_display_brightness"}, {"0.5", "0.6", "0.7", "0.8", "0.9", "1", "1.15", "1.3", "1.5", "1.75", "2"}},
     {107, {"sr_display_contrast"}, {"0.5", "0.6", "0.7", "0.8", "0.9", "1", "1.1", "1.2", "1.3", "1.4", "1.5"}},
+    // MOUSE OPTIONS' second slider (up and down, the first one's scale) and its toggle.
+    {108, {"sr_mouse_sensitivity_y"}, {"6", "8", "10", "12", "15", "18", "22", "26", "30", "40", "50"}},
+    {109, {"sr_mouse_invert_y"}, kOffOn},
 };
 
 }  // namespace
@@ -217,6 +220,27 @@ extern "C" void GetMouseSensNative(PPCContext& ctx, uint8_t* base) {
 }
 extern "C" void SetMouseSensNative(PPCContext& ctx, uint8_t* base) {
   SetRow(105, ArgInt(ctx, base, 0));
+  sub_82686910(ctx, base);
+}
+
+// MOUSE OPTIONS' Sound FX slider (up and down) and its Y-Axis Inversion toggle,
+// GetMouseSensY/GetMouseInvertY() -> index, Set...(v). The toggle is set after every
+// key on the screen, so it writes only a change.
+extern "C" void GetMouseSensYNative(PPCContext& ctx, uint8_t* base) {
+  ctx.r3.u64 = uint32_t(RowIndex(*FindRow(108)));
+  sub_82698550(ctx, base);
+}
+extern "C" void SetMouseSensYNative(PPCContext& ctx, uint8_t* base) {
+  SetRow(108, ArgInt(ctx, base, 0));
+  sub_82686910(ctx, base);
+}
+extern "C" void GetMouseInvertYNative(PPCContext& ctx, uint8_t* base) {
+  ctx.r3.u64 = uint32_t(RowIndex(*FindRow(109)));
+  sub_82698550(ctx, base);
+}
+extern "C" void SetMouseInvertYNative(PPCContext& ctx, uint8_t* base) {
+  const int32_t index = ArgInt(ctx, base, 0);
+  if ((index == 0 || index == 1) && index != RowIndex(*FindRow(109))) SetRow(109, index);
   sub_82686910(ctx, base);
 }
 
@@ -413,6 +437,10 @@ REX_HOOK_RAW(sub_822AF3E8) {
       {"MenuHintKey", &MenuHintKeyNative},
       {"GetMouseSens", &GetMouseSensNative},
       {"SetMouseSens", &SetMouseSensNative},
+      {"GetMouseSensY", &GetMouseSensYNative},
+      {"SetMouseSensY", &SetMouseSensYNative},
+      {"GetMouseInvertY", &GetMouseInvertYNative},
+      {"SetMouseInvertY", &SetMouseInvertYNative},
       {"GetBrightness", &GetBrightnessNative},
       {"SetBrightness", &SetBrightnessNative},
       {"GetContrast", &GetContrastNative},
