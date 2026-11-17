@@ -37,7 +37,9 @@ REXCVAR_DEFINE_DOUBLE(sr_mouse_sensitivity_y, 6.0, "Superman Returns",
                       "Mouse camera sensitivity, up and down (the same units as sr_mouse_sensitivity)")
     .range(0.01, 1000.0);
 REXCVAR_DEFINE_BOOL(sr_mouse_invert_y, false, "Superman Returns", "Mouse camera: moving the mouse up looks down");
-REXCVAR_DEFINE_BOOL(sr_mouse_direct, true, "Superman Returns",
+// Off by default (the user, 2026-11-17: the camera lagged the mouse on foot and in flight, and
+// flew "like a drone"): the mouse is the right stick again, as before the mouse camera.
+REXCVAR_DEFINE_BOOL(sr_mouse_direct, false, "Superman Returns",
                     "Mouse look: the mouse turns the camera by an angle per count, past the stick's dead zone, "
                     "curve and smoothing (camera_mouse in native_input.cpp); off: the mouse is the right stick");
 REXCVAR_DEFINE_BOOL(sr_kbm_auto, true, "Input",

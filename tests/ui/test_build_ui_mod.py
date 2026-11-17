@@ -53,8 +53,9 @@ def test_game_entries_untouched(built):
     # and SCRMOVESLIST, SCRSTATISTICS (their scroll arrows clickable, the user's screenshots 2026-11-09)
     # (SCRGENPOP stays the game's: the boot popup's code is MAIN's, 2026-11-16)
     # and SCRCOSTUMES (the custom costume slots 4 to 6, the user's request 2026-11-16)
+    # and BUTTONMIM (the fights' moment button as a key, issues #4 and #5 of 2026-11-17)
     changed = {'MAIN', 'SCRCONTROLROOM', 'SCRPAUSEMENU', 'SCRGAMEPLAYOPT', 'SCRCONTROLLEROPT', 'SCRAUDIOOPT',
-               'BUTTONICON', 'SCRPRESSSTART', 'SCRMOVESLIST', 'SCRSTATISTICS', 'SCRCOSTUMES'}
+               'BUTTONICON', 'SCRPRESSSTART', 'SCRMOVESLIST', 'SCRSTATISTICS', 'SCRCOSTUMES', 'BUTTONMIM'}
     for e in orig.entries:
         if e['name'] not in changed:
             assert ui.data(ui.find(e['name'])) == orig.data(e), e['name']
@@ -361,6 +362,39 @@ def test_button_icon_shows_keys(built):
     inner = apt_edit.Archive(ui.data(ui.find('HINTKEY65')))
     tex = [inner.data(e) for e in inner.entries if e['flags'] == 0][0]
     assert xtex.size_of(tex)[:2] == (128, 128)
+
+
+def test_fight_prompts_show_keys(built):
+    # issues #4 and #5 (2026-11-17): two fight prompts load the pad's button movie themselves (apt.py
+    # dumps): Main_Hud.SetHudMashButton(visible, "Y") from the mission scripts (objtiv.AST), into
+    # mButtonMash from ../common/buttonIcons/<PLATFORM>/<button>.swf, and ButtonMIM.SetButtonType
+    # through ConstructFilePath (FILEPATH + PLATFORM + "/" + type + ".swf")
+    ui, _ = built
+    m = movie(ui, 'BUTTONMIM')
+    items = m.frames(*m.header()['frames'])[0]
+    inits = [it for it in items if it['type'] == 8 and it['sprite'] == 2]
+    assert len(inits) == 2  # source: the game's class, then ours
+    ours = ' | '.join(strings_pushed(m, inits[-1]['code']))
+    for t in ("'srMimWrap'", "'ButtonMIM'", "'prototype'"):
+        assert t in ours, t
+    main = movie(ui, 'MAIN')
+    texts = ' | '.join(t for it in main.frames(*main.header()['frames'])[0] if it['type'] == 1
+                       for t in strings_pushed(main, it['code']))
+    for t in ("'srHudKey'", "'srHudMash'", "'srMimCFP'", "'srMimSBT'", "'srMimWrap'", "'Main_Hud'",
+              "'SetHudMashButton'", "'srSHMB'", "'ConstructFilePath'", "'srCFP'", "'SetButtonType'", "'srSBT'",
+              "'mButtonMash'", "'mButtonHolder'", "'HintKey'", "'HintKeyMouse'", "'PLATFORM'",
+              "'mCurButtonMash'", "'../common/ButtonHints/'"):
+        assert t in texts, t
+    # the key's movie comes from ButtonHints (ButtonIcon's mFilePath), not the prompts' buttonIcons:
+    # loading buttonIcons/<PLATFORM>/HintKey32.swf stopped the game about a minute later in every
+    # run (New Game, 2026-11-17), the same prompt with the pad's movie did not
+    assert "'../common/buttonIcons/'" not in texts
+    # the names the prompts are given (objtiv.AST: "Y"; buttonIcons' movies A B X Y LT RT) are keys
+    for name in ('A', 'B', 'X', 'Y', 'LT', 'RT'):
+        assert name in build_ui_mod.HINT_KEYS, name
+    # archives find a movie by its file name: the hint movies the prompts load are there
+    for name in ('HINTKEY32', 'HINTKEYMOUSE'):
+        assert ui.find(name), name
 
 
 def test_icon_row_is_clickable(built):

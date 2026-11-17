@@ -521,6 +521,19 @@ def edit_main(data, const):
         code.set_member((("r", 3),), "SetIcon", lambda: code.path(g, "srSetIcon"))
         code.land(same)
         code.land(no_icon)
+        # Main_Hud's "press Y quickly" (define_set_icon's srHudMash), once per class
+        code.path(g, "Main_Hud", "prototype")
+        code.set_register(3)
+        code.push(("r", 3), None)
+        code.op("Equals2")
+        no_hud = code.branch_if_true()
+        code.path(("r", 3), "srMashWrapped")
+        hud_wrapped = code.branch_if_true()
+        code.set_member((("r", 3),), "srSHMB", lambda: code.path(("r", 3), "SetHudMashButton"))
+        code.set_member((("r", 3),), "SetHudMashButton", lambda: code.path(g, "srHudMash"))
+        code.set_member((("r", 3),), "srMashWrapped", True)
+        code.land(hud_wrapped)
+        code.land(no_hud)
         code.end_method(body)
 
     def check_arrows():
@@ -2488,6 +2501,168 @@ def define_set_icon(code):
 
     code.set_member(("_global",), "srSetIcon", set_icon)
 
+    # --- the fights' prompts: keys instead of the pad's buttons -------------
+    # Two of the game's prompts load a pad button's movie themselves, not through
+    # ButtonIcon: Main_Hud.SetHudMashButton(visible, "Y") (the mission scripts'
+    # "press Y quickly", ../common/buttonIcons/<PLATFORM>/Y.swf) and ButtonMIM
+    # (the moments' button, its ConstructFilePath). While the keyboard and mouse
+    # are in use they load the bound key's hint movie instead (archives look a
+    # movie up by its file name, so HintKey<code>.swf there is HINTKEY<code>),
+    # at 240 % and 4 lower: the pad's button is 76 units at (0, 5) in its movie.
+    def hud_key():
+        # _global.srHudKey(name) -> "HintKey<code>", "HintKeyMouse" or undefined
+        body = code.begin_method(params=("name",), registers=6)
+        code.call_method((g, "SettingsAdapter"), "KbmActive", keep=True)
+        code.op("Not")
+        none = [code.branch_if_true()]
+        # no name (the HUD sets its prompt up without one): reading a member of
+        # undefined stops the game here (a read of guest 0x4, 2026-11-17)
+        code.push(("r", 3), None)
+        code.op("Equals2")
+        none.append(code.branch_if_true())
+        code.call_method((("r", 3),), "toUpperCase", keep=True)
+        code.set_register(4)
+        for name, binding in HINT_KEYS.items():
+            code.push(("r", 4), name)
+            code.op("Equals2")
+            code.op("Not")
+            other = code.branch_if_true()
+            code.call_method((g, "SettingsAdapter"), "MenuHintKey", [binding], keep=True)
+            code.set_register(5)
+            code.push(("r", 5), 0)
+            code.op("Equals2")
+            none.append(code.branch_if_true())
+            code.push("HintKey", ("r", 5))
+            code.op("Add2")
+            code.op("Return")
+            code.land(other)
+        for name in HINT_MOUSE:
+            code.push(("r", 4), name)
+            code.op("Equals2")
+            code.op("Not")
+            other = code.branch_if_true()
+            code.push("HintKeyMouse")
+            code.op("Return")
+            code.land(other)
+        for b in none:
+            code.land(b)
+        code.push(None)
+        code.op("Return")
+        code.end_method(body)
+
+    HINT_PATH = "../common/ButtonHints/"  # ButtonIcon's mFilePath
+
+    def key_scale(target, scale, y):
+        for prop, v in (("_xscale", scale), ("_yscale", scale), ("_y", y)):
+            code.set_member(target, prop, v)
+
+    def hud_mash():
+        # Main_Hud.SetHudMashButton(bVisible, strButton), the key's icon with the keyboard
+        body = code.begin_method(params=("bVisible", "strButton"), registers=6)
+        # hiding: the game's own, nothing else touched (the HUD also calls it while
+        # it is set up, without a button's name)
+        code.push(("r", 3))
+        shown = code.branch_if_true()
+        code.call_method(this, "srSHMB", [("r", 3), ("r", 4)])
+        hidden = code.branch()
+        code.land(shown)
+        code.call_method((g,), "srHudKey", [("r", 4)], keep=True)
+        code.set_register(5)
+        code.push(("r", 5), None)
+        code.op("Equals2")
+        pad = code.branch_if_true()
+        # a key: as the game's (shown, the movie loaded once per button, centred on
+        # x 640) but the hint movie from ButtonHints, where ButtonIcon finds it (the
+        # game's buttonIcons/<PLATFORM>/HintKey32.swf stopped the game a minute later,
+        # 3 runs of 3, 2026-11-17)
+        clip = (("r", 1), "mButtonMash")
+        code.set_member(clip, "_visible", True)
+        code.path(("r", 1), "mCurButtonMash")
+        code.push(("r", 5))
+        code.op("Equals2")
+        same_key = code.branch_if_true()
+        code.call_method(clip, "unloadMovie")
+        code.call_method(clip, "loadMovie", [lambda: (
+            code.push(HINT_PATH), code.path(("r", 1), "PLATFORM"), code.op("Add2"), code.push("/"),
+            code.op("Add2"), code.push(("r", 5)), code.op("Add2"), code.push(".swf"), code.op("Add2"))])
+        key_scale(clip, 240, 169)
+        code.set_member(clip, "_x", 602)
+        code.set_member(this, "mCurButtonMash", ("r", 5))
+        code.set_member(this, "srMashKey", True)
+        code.land(same_key)
+        done = code.branch()
+        code.land(pad)
+        code.call_method(this, "srSHMB", [("r", 3), ("r", 4)])
+        code.path(("r", 1), "srMashKey")
+        code.op("Not")
+        never = code.branch_if_true()
+        key_scale((("r", 1), "mButtonMash"), 100, 165)
+        code.set_member(this, "srMashKey", False)
+        code.land(never)
+        code.land(done)
+        code.land(hidden)
+        code.end_method(body)
+
+    def mim_path():
+        # ButtonMIM.ConstructFilePath(buttonType): the key's hint movie, else the game's
+        body = code.begin_method(params=("buttonType",), registers=5)
+        code.call_method((g,), "srHudKey", [("r", 3)], keep=True)
+        code.set_register(4)
+        code.set_member(this, "srKeyed", lambda: (code.push(("r", 4), None), code.op("Equals2"), code.op("Not")))
+        code.push(("r", 4), None)
+        code.op("Equals2")
+        code.op("Not")
+        keyed = code.branch_if_true()
+        code.call_method(this, "srCFP", [("r", 3)], keep=True)
+        code.op("Return")
+        code.land(keyed)
+        code.push(HINT_PATH)
+        code.path(("r", 1), "PLATFORM")
+        code.op("Add2")
+        code.push("/")
+        code.op("Add2")
+        code.push(("r", 4))
+        code.op("Add2")
+        code.push(".swf")
+        code.op("Add2")
+        code.op("Return")
+        code.end_method(body)
+
+    def mim_type():
+        # ButtonMIM.SetButtonType(buttonType): the game's, then a key's icon to the button's size
+        body = code.begin_method(params=("buttonType",), registers=4)
+        code.call_method(this, "srSBT", [("r", 3)])
+        code.path(("r", 1), "srKeyed")
+        code.op("Not")
+        plain = code.branch_if_true()
+        key_scale((("r", 1), "mButtonHolder"), 240, 4)
+        code.land(plain)
+        code.end_method(body)
+
+    code.set_member(("_global",), "srHudKey", hud_key)
+    code.set_member(("_global",), "srHudMash", hud_mash)
+    code.set_member(("_global",), "srMimCFP", mim_path)
+    code.set_member(("_global",), "srMimSBT", mim_type)
+
+    def mim_wrap():
+        # _global.srMimWrap(proto): ButtonMIM's two methods become ours, once
+        body = code.begin_method(params=("proto",), registers=4)
+        code.push(("r", 3), None)
+        code.op("Equals2")
+        none = code.branch_if_true()
+        code.path(("r", 3), "ConstructFilePath")
+        code.path(g, "srMimCFP")
+        code.op("Equals2")
+        same = code.branch_if_true()
+        for method, saved, ours in (("ConstructFilePath", "srCFP", "srMimCFP"), ("SetButtonType", "srSBT", "srMimSBT")):
+            code.set_member((("r", 3),), saved, lambda m_=method: code.path(("r", 3), m_))
+            code.set_member((("r", 3),), method, lambda o=ours: code.path(g, o))
+        code.land(same)
+        code.land(none)
+        code.end_method(body)
+
+    code.set_member(("_global",), "srMimWrap", mim_wrap)
+
     def set_start_text():
         # the game's SetStartText (layout and "PRESS START"), then "PRESS ENTER"
         # while keyboard and mouse are in use; the screen is remembered so the
@@ -3065,6 +3240,25 @@ def edit_button_icon(data, const):
     return m.write()
 
 
+def edit_button_mim(data, const):
+    """After the game's class init (sprite 2): ButtonMIM's ConstructFilePath and
+    SetButtonType become MAIN's srMimCFP and srMimSBT (the keys' icons), the
+    game's kept as srCFP and srSBT; once, as the class may be set up again."""
+    m = apt_edit.MovieEdit(data, const)
+    rec, items = m.frame_items(m.root)
+    cls = find_init_action(m, items, 2)
+    code = m.code()
+    at = code.start()
+    # the archive's constants have room for one name: the wrap is MAIN's srMimWrap
+    code.call_method(("_global",), "srMimWrap", [lambda: code.path("_global", "ButtonMIM", "prototype")])
+    code.end()
+    code.finish()
+    new = m.init_action(2, at)
+    i = items.index(cls)
+    m.set_frame_items(rec, items[:i + 1] + [new] + items[i + 1:])
+    return m.write()
+
+
 def make_keys_screen(data, const):
     """Gameplay Options' movie made into Keys Mapping: eight rows a page, LEFT and
     RIGHT turn the page, A on a row waits for a key or mouse button
@@ -3535,6 +3729,8 @@ def build(data_dir, out_dir):
     add += costume_picture_entries(ui)
     inner, d, c = movie_of(ui, "BUTTONICON")
     replace["BUTTONICON"] = repack(inner, d, c, *edit_button_icon(d[1], c[1]))
+    inner, d, c = movie_of(ui, "BUTTONMIM")
+    replace["BUTTONMIM"] = repack(inner, d, c, *edit_button_mim(d[1], c[1]))
     for entry, sprite, cls_name in (("SCRMOVESLIST", 14, "ScrMovesList"), ("SCRSTATISTICS", 26, "ScrStatistics")):
         inner, d, c = movie_of(ui, entry)
         replace[entry] = repack(inner, d, c, *edit_scroll_screen(d[1], c[1], sprite, cls_name))
