@@ -1,6 +1,8 @@
 #include "input/native_input.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -79,8 +81,8 @@ std::unique_ptr<rex::system::IInputSystem> CreateInputSystem(bool tool_mode) {
 // The camera follows Superman until the right stick moves: rawinput_kbm_driver.cpp holds
 // the stick just past the game's dead zone while the mouse moves (kMouseWakeStick).
 // Flying has its own camera (sub_821855B8, the stick through an acceleration ramp,
-// sub_82160A70): this hook is not called then, DirectMouseAlive turns false and the
-// mouse is the right stick there, as before.
+// sub_82160A70): sub_821FD808 is not called then, and FlightMouse sets the ramp's
+// outputs from the counts instead.
 namespace {
 
 constexpr float kPitchLimit = 1.13f;  // 65 degrees up or down
@@ -101,12 +103,56 @@ void StoreGuestF32(uint8_t* base, uint32_t at, float f) {
   std::memcpy(base + at, &u, 4);
 }
 
+// sub_821FD808 ran within this time: Superman is on foot (the flight camera's update
+// runs on foot too, without effect)
+std::atomic<int64_t> g_on_foot_ms{0};
+
+int64_t SteadyMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// The flight camera (sub_821855B8) turns by its ramped stick, sub_82160A70's outputs
+// +168 (pitch) and +172 (yaw), at a rate linear in them past 1 (measured: 0.5 and 2.0
+// turned the camera 58.7 and 234 deg/s of yaw, 0.5 turned it 34.4 deg/s of pitch, within
+// the game's own +-40 degree pitch limit). After the ramp, the mouse's counts this update
+// become those outputs, so the camera turns the counts' angle in this update.
+constexpr double kFlightYawRate = 2.05;   // radians a second at 1
+constexpr double kFlightPitchRate = 1.2;  // radians a second at 1
+
+void FlightMouse(uint8_t* base, uint32_t self, double dt) {
+  if (!REXCVAR_GET(sr_mouse_direct) || !(dt > 0.0)) return;
+  if (SteadyMs() - g_on_foot_ms.load(std::memory_order_relaxed) < 150) return;
+  double dx = 0, dy = 0;
+  superman_returns::input::DirectMouseTake(dx, dy);
+  if (!dx && !dy) return;  // a pad's stick keeps the ramp's outputs
+  const double per = superman_returns::input::DirectMouseDegreesPerCount() * 0.017453292519943295;
+  // the right stick's directions: right is a negative yaw output, up (dy < 0) a negative
+  // pitch output (as the mouse through the stick before: up looks up)
+  StoreGuestF32(base, self + 172, float(-dx * per / (kFlightYawRate * dt)));
+  StoreGuestF32(base, self + 168, float(dy * per / (kFlightPitchRate * dt)));
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXLOG_INFO("mouse camera (flight): {} {} counts turned the camera {:.3f} / {:.3f} degrees", dx, dy,
+                dx * per * 57.29578, -dy * per * 57.29578);
+  }
+}
+
 }  // namespace
 
+
+REX_HOOK_RAW(sub_82160A70) {
+  const uint32_t self = ctx.r3.u32;
+  const double dt = ctx.f1.f64;
+  __imp__sub_82160A70(ctx, base);
+  FlightMouse(base, self, dt);
+}
 
 REX_HOOK_RAW(sub_821FD808) {
   const uint32_t self = ctx.r3.u32;
   __imp__sub_821FD808(ctx, base);
+  g_on_foot_ms.store(SteadyMs(), std::memory_order_relaxed);
   if (!REXCVAR_GET(sr_mouse_direct)) return;
   double dx = 0, dy = 0;
   superman_returns::input::DirectMouseTake(dx, dy);
