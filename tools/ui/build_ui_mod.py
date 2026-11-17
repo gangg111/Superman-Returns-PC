@@ -2484,6 +2484,27 @@ def gen_popup_methods(code):
         code.op("Not")
         no = code.branch_if_true()
         code.land(yes)
+        # and Start New Game among its buttons: the pause menu's load question
+        # (PromptIGLoad_Title) has the same "LOAD A GAME?" with CONTINUE WITH LOAD /
+        # GO BACK TO GAME, and became this menu (the user 2026-11-17)
+        for k in (0, 1):
+            code.path(p, "buttonLabels")
+            code.push(k)
+            code.op("GetMember")
+            loc(g, "LoadCreate_Create_Btn")()
+            code.op("Equals2")
+            code.path(p, "buttonLabels")
+            code.push(k)
+            code.op("GetMember")
+            code.push("LoadCreate_Create_Btn")
+            code.op("Equals2")
+            code.op("Or")
+            if k == 0:
+                boot = code.branch_if_true()
+            else:
+                code.op("Not")
+                no_create = code.branch_if_true()
+        code.land(boot)
         # the game's two buttons, in whatever order it gives them
         code.push(1)
         code.set_register(4)
@@ -2518,6 +2539,7 @@ def gen_popup_methods(code):
         code.land(default_done)
         code.set_member(this, "srOptionsButton", 2)
         code.land(no)
+        code.land(no_create)
         code.call_method(this, "srPopupInit0", [p])
         code.end_method(body)
 
