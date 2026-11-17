@@ -69,7 +69,7 @@ Next to `superman_returns.exe`, in `textures\Suits`, there is one folder per slo
 | `cape.png` | the outside of the cape |
 | `thumb.png` | the small picture of the slot on the Costumes screen |
 | `fullsize.png` | the large picture shown with View Costume |
-| `costume.toml` | the slot's name, and whether it has the cape |
+| `costume.toml` | the slot's name, whether it has the cape and the colour of the cape's inside |
 
 #### Make a costume
 
@@ -84,8 +84,17 @@ On slots 4 to 6 the Costumes screen shows **CAPE: SHOWN**. Press Y (triangle on 
 
 A file you delete is taken from the game, so a slot with only `cape.png` changes only the cape. Running a new builder keeps your files and names.
 
+#### The colour of the cape's inside
+
+The inside of the cape does not come from a texture: the game paints it with one colour. Set it in the slot's `costume.toml`, as a hex colour in quotes:
+
+```toml
+cape_inside = "#BF0000"
+```
+
+`"#BF0000"` is the game's own red; `"#101010"`, for example, gives a black inside for a black suit. Without this line the inside stays the game's red. Slots made by a builder older than 1.0.12 do not have the line: add it by hand.
+
 #### Good to know
 
-- The inside of the cape does not come from a texture and stays red.
 - Keep the transparency of `body.png` and `briefs_boots.png` where it is; the game uses it.
 - The files in `textures\Suits` are used only while their slot is worn.
