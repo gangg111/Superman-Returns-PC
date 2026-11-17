@@ -6743,8 +6743,13 @@ bool Renderer::UploadConstants(uint8_t* base, uint32_t dev) {
   // V; the only draw of an intro frame with Xenos pixel centres) already sits
   // on the pixel grid. Shifted, it left the top row and the left column of the
   // screen as a thin line in another colour along those edges.
+  // The Fortress of Solitude's screens: their full-screen backdrop (PS 40746066C58DA8D5,
+  // 6 indices) and the mesh over it (PS A73BBFE211BD2178) did the same, the main menu's
+  // flying-over-the-city picture left in the left column and the top row (the user's
+  // photos 2026-11-17; with both unshifted those edges equal their neighbours).
   const bool movie_quad = current_ps_hash_ == 0x84AB4982B9F6D441ull || current_ps_hash_ == 0x797FC52F63D77367ull ||
-                          current_ps_hash_ == 0x79CEC5DBA4D8ADAAull || current_ps_hash_ == 0xFFEDEF7CED88B48Dull;
+                          current_ps_hash_ == 0x79CEC5DBA4D8ADAAull || current_ps_hash_ == 0xFFEDEF7CED88B48Dull ||
+                          current_ps_hash_ == 0x40746066C58DA8D5ull || current_ps_hash_ == 0xA73BBFE211BD2178ull;
   if (REXCVAR_GET(sr_native_half_pixel_offset) && !movie_quad &&
       !(LoadReg(base, dev, rex::graphics::XE_GPU_REG_PA_SU_VTX_CNTL) & 1)) {
     float w = 0.0f, h = 0.0f;

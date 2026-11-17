@@ -957,9 +957,10 @@ def edit_main(data, const):
 
     def icon_steer():
         """Every poll: the icon row's selection walked to _global.srIconTarget (set
-        by icon_row), one LEFT or RIGHT per ICON_STEER_WAIT polls as from a pad (the
-        screen turns its row and its title), then A when the icon was clicked
-        (srIconEnter). The target is dropped on another screen. Uses r5, r6."""
+        by icon_row): at once through the screen's HandleInput(LEFT / RIGHT), else one
+        pad press per ICON_STEER_WAIT polls (the screen turns its row and its title
+        either way), then A when the icon was clicked (srIconEnter). The target is
+        dropped on another screen. Uses r5..r7."""
         g_main = ("r", 2)
         sa_ = (g_main, "SettingsAdapter")
         ends = []
@@ -988,6 +989,30 @@ def edit_main(data, const):
             code.path(g_main, "srIconWait"), code.push(1), code.op("Subtract")))
         ends.append(code.branch())
         code.land(ready)
+        # all the steps at once through the screen's own HandleInput (the row's parent;
+        # ScrFortress: LEFT = mIconMenu.Previous() and SetTitle(), as the arrows): one
+        # pad press per ICON_STEER_WAIT polls lagged behind the cursor (first to last
+        # icon ~0.8 s, the user 2026-11-17). Without one, the pad presses below.
+        code.path(("r", 5), "_parent", "HandleInput")
+        code.push(None)
+        code.op("Equals2")
+        no_direct = code.branch_if_true()
+        code.path(("r", 5), "_parent")
+        code.set_register(7)
+        for _ in range(ICON_ROW_MAX):
+            for key, toward in (("RIGHT", True), ("LEFT", False)):
+                if toward:  # selected < target
+                    code.path(("r", 5), "mSelectedIndex")
+                    code.path(g_main, "srIconTarget")
+                else:  # target < selected
+                    code.path(g_main, "srIconTarget")
+                    code.path(("r", 5), "mSelectedIndex")
+                code.op("LessThan2")
+                code.op("Not")
+                skip = code.branch_if_true()
+                code.call_method((("r", 7),), "HandleInput", [lambda k=key: code.path(g_main, "INPUTCODE", k), 0, 0])
+                code.land(skip)
+        code.land(no_direct)
         code.set_member((g_main,), "srIconWait", ICON_STEER_WAIT)
         code.path(("r", 5), "mSelectedIndex")
         code.set_register(6)
