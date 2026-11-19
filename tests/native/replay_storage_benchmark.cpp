@@ -26,7 +26,7 @@ int main() {
     const auto filled=std::chrono::steady_clock::now();
     for(auto& packet:packets) {
       const auto* draw=GetDraw(packet);if(!draw) return 2;
-      checksum+=draw->command_serial+draw->constants.shared[4095]+draw->constants.ps[0];
+      checksum+=draw->command_serial+draw->constants.shared[4095]+draw->PsWords()[0];
     }
     if(round>=2) {
       auto ms=[](auto a,auto b){return std::chrono::duration<double,std::milli>(b-a).count();};

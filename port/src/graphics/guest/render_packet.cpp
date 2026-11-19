@@ -8,6 +8,7 @@
 #include <bit>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -160,6 +161,19 @@ SurfaceDesc Surface(const CapturedMemory &m, uint32_t object, bool depth) {
                                 U32(m, Address(object, 0x1c)),
                                 U32(m, Address(object, 0x24)), depth)};
 }
+// DrawRegisters keeps exactly the shadowed ranges DeviceState fills (indexed from 0x2000).
+constexpr bool RegistersMatchShadow() {
+  if (std::size(native::profile::kRegisterShadow) != std::size(DrawRegisters::kRanges)) return false;
+  uint32_t total = 0;
+  for (size_t i = 0; i < std::size(DrawRegisters::kRanges); ++i) {
+    const auto& shadow = native::profile::kRegisterShadow[i];
+    const auto& kept = DrawRegisters::kRanges[i];
+    if (shadow.first != 0x2000 + kept.first || shadow.count != kept.count) return false;
+    total += kept.count;
+  }
+  return total == DrawRegisters::kCount;
+}
+static_assert(RegistersMatchShadow(), "DrawRegisters must keep the device shadow ranges (game_profile.h)");
 void DeviceState(DrawPacket &d, uint32_t device,
                  const native::Pm4Mirror &mirror) {
   const auto &layout = native::profile::kDevice;
@@ -357,15 +371,17 @@ void ApplyDeviceState(DrawPacket &d, uint32_t dev, const CapturedMemory &memory)
         REXLOG_INFO("native state compare detail: {} index={} pm4={:08X} device={:08X} prim={} count={} serial={}",
                     what, index, pm4, device, int(d.primitive), d.count, d.command_serial);
     };
-    if (vs != d.constants.vs) {
+    const uint32_t* packet_vs = d.VsWords();
+    const uint32_t* packet_ps = d.PsWords();
+    if (!std::equal(vs.begin(), vs.end(), packet_vs)) {
       ++c.vs;
       for (uint32_t i = 0; i < 1024; ++i)
-        if (vs[i] != d.constants.vs[i]) { detail("vs", i, d.constants.vs[i], vs[i]); break; }
+        if (vs[i] != packet_vs[i]) { detail("vs", i, packet_vs[i], vs[i]); break; }
     }
-    if (ps != d.constants.ps) {
+    if (!std::equal(ps.begin(), ps.end(), packet_ps)) {
       ++c.ps;
       for (uint32_t i = 0; i < 1024; ++i)
-        if (ps[i] != d.constants.ps[i]) { detail("ps", i, d.constants.ps[i], ps[i]); break; }
+        if (ps[i] != packet_ps[i]) { detail("ps", i, packet_ps[i], ps[i]); break; }
     }
     // Inline (UP) draws: the XDK points vertex fetch slot 31 at the ring copy in
     // PM4 only; the renderer binds the captured inline vertices instead.
@@ -396,6 +412,8 @@ void ApplyDeviceState(DrawPacket &d, uint32_t dev, const CapturedMemory &memory)
   }
   d.constants.vs = vs;
   d.constants.ps = ps;
+  d.vs_bank.reset();  // the packet's own banks from here
+  d.ps_bank.reset();
   d.vs_version = d.ps_version = 0;  // from the device, not the mirror
   for (uint32_t i = 0; i < 40; ++i)
     std::memcpy(d.constants.shared.data() + (i < 8 ? 256 + i * 4 : 304 + (i - 8) * 4), &bool_loop[i], 4);
@@ -434,8 +452,28 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
       d.first = d.indexed ? cmd.u[2] : (d.inline_vertices ? 0 : cmd.u[1]);
       d.count = d.indexed ? cmd.u[3] : cmd.u[2];
       d.base_vertex = d.indexed ? int32_t(cmd.u[1]) : 0;
-      d.constants.vs=mirror.FloatConstants(false);
-      d.constants.ps=mirror.FloatConstants(true);
+      // One shared bank per mirror version (ConstantBank) instead of two 4 KB copies per packet.
+      // SR_SHARED_CONSTANT_BANKS=0: the copies, as before.
+      static const bool shared_banks=[] {const char* v=std::getenv("SR_SHARED_CONSTANT_BANKS");return !v || !*v || *v!='0';}();
+      if(shared_banks) {
+        struct Kept {const native::Pm4Mirror* mirror=nullptr;std::shared_ptr<const ConstantBank> bank[2];};
+        thread_local Kept kept;  // the decoding thread's (one worker per renderer)
+        if(kept.mirror!=&mirror) kept={&mirror,{}};
+        for(const bool pixel:{false,true}) {
+          const uint64_t version=pixel?mirror.ps_version:mirror.vs_version;
+          auto& bank=kept.bank[pixel];
+          if(!bank || bank->version!=version) {
+            auto fresh=std::make_shared<ConstantBank>();
+            fresh->version=version;fresh->words=mirror.FloatConstants(pixel);
+            bank=std::move(fresh);
+          }
+          (pixel?d.ps_bank:d.vs_bank)=bank;
+        }
+      } else {
+        d.constants.vs=mirror.FloatConstants(false);
+        d.constants.ps=mirror.FloatConstants(true);
+        d.vs_bank.reset();d.ps_bank.reset();
+      }
       d.vs_version=mirror.vs_version;
       d.ps_version=mirror.ps_version;
       for (uint32_t i = 0; i < 8; ++i) {
@@ -498,10 +536,8 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
                 s.stream, Address(s.offset, offset), s.stride, type};
         }
       }
-      static_assert(sizeof(d.vertex_fetch)==sizeof(d.constants.shared)-512,
-                    "Replay storage requires a complete shared metadata suffix");
-      std::memcpy(d.constants.shared.data() + 512, d.vertex_fetch.data(),
-                  sizeof(d.vertex_fetch));
+      // shared[512,4096) is not filled: the recorders write the vertex fetch table into the GPU block from
+      // vertex_fetch (bindless.cpp, descriptors.cpp), and copying it here too was 3.5 KB a draw nobody read.
       for(auto& stream:d.streams) {
         if(stream.update.bytes.empty()) continue;
         uint32_t stride=stream.stride;
@@ -529,8 +565,6 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
               d.vertex_fetch[usage * 16 + index] = {stream, offset,
                                                     d.inline_stride, type};
           }
-          std::memcpy(d.constants.shared.data() + 512, d.vertex_fetch.data(),
-                      sizeof(d.vertex_fetch));
         }
         SwapVertexElements(d.inline_data,d.inline_stride,0,UINT32_MAX,d.attributes);
       }

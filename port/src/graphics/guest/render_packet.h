@@ -25,6 +25,55 @@ struct SurfaceDesc {
   bool depth = false;
   SurfaceGeometry geometry{};
 };
+// The PM4 registers 0x2000-0x23FF a draw carries, indexed from 0x2000. Decoding sets only the device's shadowed
+// ranges (game_profile.h kRegisterShadow, 121 registers, checked by a static_assert in render_packet.cpp), so
+// every other one reads 0, as in the zero-filled 4 KB array this replaces: 484 bytes a packet instead of
+// 4 KB, none of it zeroed for nothing (mobile renderer plan, E2). Writing outside the ranges is a bug.
+struct DrawRegisterRange {uint32_t first, count;};
+inline constexpr DrawRegisterRange kDrawRegisterRanges[] = {{0x000, 16}, {0x100, 21}, {0x180, 5}, {0x200, 12},
+                                                            {0x280, 21}, {0x300, 38}, {0x380, 8}};
+// Register index (from 0x2000) -> its word in DrawRegisters, 0xff outside the ranges.
+inline constexpr std::array<uint8_t, 0x400> kDrawRegisterSlots = [] {
+  std::array<uint8_t, 0x400> slots{};
+  for (auto& s : slots) s = 0xff;
+  uint32_t next = 0;
+  for (const auto& r : kDrawRegisterRanges)
+    for (uint32_t i = 0; i < r.count; ++i) slots[r.first + i] = uint8_t(next++);
+  return slots;
+}();
+class DrawRegisters {
+public:
+  using Range = DrawRegisterRange;
+  static constexpr const DrawRegisterRange (&kRanges)[7] = kDrawRegisterRanges;
+  static constexpr uint32_t kCount = 121;
+  static constexpr uint32_t kSize = 0x400;
+  uint32_t operator[](uint32_t index) const {
+    const uint8_t slot = index < kSize ? kSlots[index] : kNone;
+    return slot == kNone ? 0u : words_[slot];
+  }
+  // Outside the ranges: a scratch word, zeroed at each access, so a read through a non-const packet still
+  // gives 0 (FinalizeDrawConstants reads 0x80) and a stray write is lost instead of stopping the renderer.
+  uint32_t& operator[](uint32_t index) {
+    const uint8_t slot = index < kSize ? kSlots[index] : kNone;
+    if (slot == kNone) { scratch_ = 0; return scratch_; }
+    return words_[slot];
+  }
+  static constexpr bool Kept(uint32_t index) { return index < kSize && kSlots[index] != kNone; }
+  bool operator==(const DrawRegisters& other) const { return words_ == other.words_; }
+private:
+  static constexpr uint8_t kNone = 0xff;
+  static constexpr const std::array<uint8_t, kSize>& kSlots = kDrawRegisterSlots;
+  std::array<uint32_t, kCount> words_{};
+  uint32_t scratch_ = 0;
+};
+// A float constant bank as the replay mirror held it at one version, shared by every draw decoded while
+// that version stood, instead of a 4 KB copy in each packet (mobile renderer plan, E2): only 24% of a
+// city frame's ~2,700 draws keep the VS bank and 59% the PS bank, but a new version is one copy, not one
+// per draw, and the packets' banks are never written.
+struct ConstantBank {
+  uint64_t version = 0;
+  std::array<uint32_t, 1024> words;
+};
 struct DrawPacket {
   struct ReplayStorageTag {};
   // Keep this user-provided: value-initialization must not add a whole-packet
@@ -46,6 +95,11 @@ struct DrawPacket {
   // bumped on every register change), 0 when the banks came from elsewhere. Equal non-zero versions
   // mean equal contents: the recorder's bank cache compares them instead of 4 KB per bank per draw.
   uint64_t vs_version = 0, ps_version = 0;
+  // The replay's shared banks (ConstantBank); null: constants.vs / constants.ps hold the bank. Read the banks
+  // through VsWords / PsWords, never constants.vs / ps directly.
+  std::shared_ptr<const ConstantBank> vs_bank, ps_bank;
+  const uint32_t* VsWords() const { return vs_bank ? vs_bank->words.data() : constants.vs.data(); }
+  const uint32_t* PsWords() const { return ps_bank ? ps_bank->words.data() : constants.ps.data(); }
   CapturedMemory memory;
   std::vector<VertexStream> streams;
   std::vector<VertexAttribute> attributes;
@@ -56,7 +110,7 @@ struct DrawPacket {
   Viewport viewport;
   Rect scissor{0, 0, 16384, 16384};
   bool tiling_active = false;
-  std::array<uint32_t, 0x400> registers{};
+  DrawRegisters registers;
   // Only PM4 registers 0x2380..0x2383 are consumed by FinalizeDrawConstants.
   // Keep their exact bits; the other 1,020 mirrored registers are not read.
   std::array<uint32_t, 4> polygon_offset_registers{};

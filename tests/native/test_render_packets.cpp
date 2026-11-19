@@ -63,12 +63,13 @@ SR_TEST(replay_storage_matches_initialized_draw_after_complete_decode) {
   DrawPacketArena arena(3,true);
   SR_CHECK(ReplayCapturedRenderPacket(batch,cmd,mirror,ordinary,error));
   auto storage=arena.Next();
-  // Decode must assign the complete suffix, even when there are no attributes.
+  // The suffix shared[512,4096) is no longer written (the vertex fetch table is read from vertex_fetch):
+  // whatever the storage held there stays, and nothing reads it.
   std::fill(storage.payload->constants.shared.begin()+512,storage.payload->constants.shared.end(),0xa5);
   SR_CHECK(ReplayCapturedRenderPacket(batch,cmd,mirror,prepared,error,std::move(storage)));
   const auto& a=*GetDraw(ordinary);const auto& b=*GetDraw(prepared);
-  SR_CHECK(a.constants.vs==b.constants.vs);SR_CHECK(a.constants.ps==b.constants.ps);
-  SR_CHECK(a.constants.shared==b.constants.shared);
+  SR_CHECK(std::equal(a.VsWords(),a.VsWords()+1024,b.VsWords()));SR_CHECK(std::equal(a.PsWords(),a.PsWords()+1024,b.PsWords()));
+  SR_CHECK(std::equal(a.constants.shared.begin(),a.constants.shared.begin()+512,b.constants.shared.begin()));
   SR_CHECK(a.registers==b.registers);SR_CHECK(a.polygon_offset_registers==b.polygon_offset_registers);
   SR_CHECK(a.texture_fetch==b.texture_fetch);
   SR_CHECK_EQ(std::memcmp(a.vertex_fetch.data(),b.vertex_fetch.data(),sizeof(a.vertex_fetch)),0);
@@ -79,7 +80,7 @@ SR_TEST(replay_storage_matches_initialized_draw_after_complete_decode) {
   // A late failure happens after the metadata copy, and still publishes nothing.
   cmd.op=Op::kDrawIndexed;cmd.u[0]=4;cmd.u[3]=3;cmd.has_index=false;
   SR_CHECK(!ReplayCapturedRenderPacket(batch,cmd,mirror,prepared,error,arena.Next()));
-  SR_CHECK(GetDraw(prepared)==published);SR_CHECK(GetDraw(prepared)->constants.shared==a.constants.shared);
+  SR_CHECK(GetDraw(prepared)==published);SR_CHECK(std::equal(a.constants.shared.begin(),a.constants.shared.begin()+512,GetDraw(prepared)->constants.shared.begin()));
 }
 SR_TEST(pm4_sequential_constant_writes_match_individual_writes) {
   using superman_returns::native::Pm4Mirror;
@@ -498,7 +499,7 @@ SR_TEST(packet_owns_constants_and_buffers_after_guest_mutation) {
   batch.Clear();
   mirror = superman_returns::native::Pm4Mirror{};
   const auto &draw = (*GetDraw(packet));
-  SR_CHECK_EQ(draw.constants.vs[0], 0x3f800000);
+  SR_CHECK_EQ(draw.VsWords()[0], 0x3f800000u);
   SR_CHECK_EQ(draw.streams[0].update.bytes[2], 3);
   cmd.vertex_shader.reset();
   SR_CHECK_EQ(draw.vertex_shader->hash, 0x1234u);
@@ -545,7 +546,7 @@ SR_TEST(strip_and_ushort2_metadata_survive_packet) {
   auto owner=storage.Next();
   std::fill(owner.payload->constants.shared.begin()+512,owner.payload->constants.shared.end(),0xa5);
   SR_CHECK(ReplayCapturedRenderPacket(batch,cmd,mirror,replay,error,std::move(owner)));
-  SR_CHECK(GetDraw(replay)->constants.shared==draw.constants.shared);
+  SR_CHECK(std::equal(draw.constants.shared.begin(),draw.constants.shared.begin()+512,GetDraw(replay)->constants.shared.begin()));
   SR_CHECK(std::memcmp(GetDraw(replay)->vertex_fetch.data(),draw.vertex_fetch.data(),sizeof(draw.vertex_fetch))==0);
   SR_CHECK(GetDraw(replay)->indices.normalized==draw.indices.normalized);
     SR_CHECK(draw.primitive == Primitive::kTriangleStrip);
@@ -553,7 +554,7 @@ SR_TEST(strip_and_ushort2_metadata_survive_packet) {
   SR_CHECK_EQ(draw.vertex_fetch[0].type, 0x2c2259);
   SR_CHECK_EQ(draw.vertex_fetch[0].stride, 4);
   VertexFetchMeta metadata;
-  std::memcpy(&metadata, draw.constants.shared.data() + 512, sizeof(metadata));
+  metadata = draw.vertex_fetch[0];
   SR_CHECK_EQ(metadata.type, 0x2c2259);
   // Reused guest addresses and later partial captures must invalidate/override
   // cached declaration bytes without changing an already-owned packet.
@@ -590,9 +591,9 @@ SR_TEST(same_capture_decodes_identically_for_both_backends) {
   SR_CHECK(DecodeRenderPacket(batch,cmd,mirror,vulkan,error));
   auto& a=(*GetDraw(d3d));auto& b=(*GetDraw(vulkan));
   SR_CHECK(a.inline_data==b.inline_data);
-  SR_CHECK(a.constants.vs==b.constants.vs);
-  SR_CHECK(a.constants.ps==b.constants.ps);
-  SR_CHECK(a.constants.shared==b.constants.shared);
+  SR_CHECK(std::equal(a.VsWords(),a.VsWords()+1024,b.VsWords()));
+  SR_CHECK(std::equal(a.PsWords(),a.PsWords()+1024,b.PsWords()));
+  SR_CHECK(std::equal(a.constants.shared.begin(),a.constants.shared.begin()+512,b.constants.shared.begin()));
   SR_CHECK(a.primitive==b.primitive);
   SR_CHECK_EQ(a.count,b.count);SR_CHECK_EQ(a.inline_stride,b.inline_stride);
 }
@@ -763,7 +764,7 @@ SR_TEST(replayed_draw_keeps_latest_capture_and_pm4_constants_after_batch_reuse) 
   batch.bytes.resize(1024, 0xff);
   mirror = superman_returns::native::Pm4Mirror{};
   const auto& draw = (*GetDraw(packet));
-  SR_CHECK_EQ(draw.constants.vs[0], 0x3f800000u);
+  SR_CHECK_EQ(draw.VsWords()[0], 0x3f800000u);
   SR_CHECK_EQ(draw.memory.Read(0x1001, 2)[0], 9);
   SR_CHECK_EQ(draw.memory.Read(0x1000, 4)[1], 2);
 }

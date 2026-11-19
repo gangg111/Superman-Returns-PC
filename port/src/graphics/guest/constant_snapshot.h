@@ -6,8 +6,9 @@
 #include <string>
 namespace superman_returns::graphics::guest {
 struct ConstantSnapshot {
-  // Replay assigns both banks and shared[512,4096) before publication. The
-  // prefix contains partial writes and padding, so it still starts at zero.
+  // Replay storage: the banks are the replay's shared ones (DrawPacket::vs_bank / ps_bank) and
+  // shared[512,4096) is never written or read (the recorders take the vertex fetch table from
+  // DrawPacket::vertex_fetch), so only the prefix, with partial writes and padding, starts at zero.
   // Other callers retain fully initialized default storage.
   struct ReplayStorageTag {};
   ConstantSnapshot() : vs{},ps{},shared{} {}

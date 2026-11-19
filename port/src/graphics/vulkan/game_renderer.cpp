@@ -246,7 +246,7 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
   lap(RecordProfile::kTextures);
   TransientSlice constants;if(!resources_.MapTransient(sizeof(guest::ConstantSnapshot),constants,e)) return false;
   auto reused=constant_bank_cache_enabled_ && constants.offset<=UINT32_MAX
-      ?constant_bank_cache_.Find(serial_,constants.chunk.get(),draw.constants,draw.vs_version,draw.ps_version):ConstantBankCache::Reuse{};
+      ?constant_bank_cache_.Find(serial_,constants.chunk.get(),ConstantBankCache::Of(draw),draw.vs_version,draw.ps_version):ConstantBankCache::Reuse{};
   DrawBindings bindings;if(!BuildBindings(draw,constants.data,bindings,e,(reused.vs?0u:1u)|(reused.ps?0u:2u))) return false;
   lap(RecordProfile::kBindings);
   DescriptorDraw descriptors;if(!descriptors_.Prepare(bindings,draw.texture_fetch,resources_,serial_,constants,descriptors,e)) return false;
@@ -254,7 +254,7 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
   if(reused.ps) descriptors.dynamic_offsets[1]=reused.ps_offset;
   // Prepare flushed this slice; the chunk is held until completion and slices
   // are never overwritten inside a submission. Offset bases remain unchanged.
-  if(constant_bank_cache_enabled_) constant_bank_cache_.Commit(serial_,constants.chunk.get(),uint32_t(constants.offset),draw.constants,reused,draw.vs_version,draw.ps_version);
+  if(constant_bank_cache_enabled_) constant_bank_cache_.Commit(serial_,constants.chunk.get(),uint32_t(constants.offset),ConstantBankCache::Of(draw),reused,draw.vs_version,draw.ps_version);
   lap(RecordProfile::kDescriptors);
   auto pipeline=pipelines_.Acquire(draw,*pass,vs.artifact,ps.artifact,serial_,e);if(!pipeline) {e.message+="; VS="+std::to_string(draw.vertex_shader->hash)+", PS="+std::to_string(draw.pixel_shader?draw.pixel_shader->hash:0)+", RT0="+std::to_string(pass->formats[0])+", DS="+std::to_string(pass->depth_format);return false;}
   struct Binding {uint32_t slot;VkBuffer handle;VkDeviceSize offset;};
