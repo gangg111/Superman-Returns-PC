@@ -441,7 +441,9 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
       // the reference renderer: the owned container determines the stage.
       for(auto& shader:{cmd.vertex_shader,cmd.pixel_shader}) if(shader) (shader->vertex?d.vertex_shader:d.pixel_shader)=shader;
       d.texture_slots=(d.vertex_shader?d.vertex_shader->texture_slots:~0u)|(d.pixel_shader?d.pixel_shader->texture_slots:~0u);
-      d.textures = cmd.textures;
+      // The command's array when the packet's memory keeps the batch alive, a copy otherwise.
+      if (memory.OwnsBatch()) d.command_textures = &cmd.textures;
+      else d.textures = cmd.textures;
       d.texture_errors = cmd.texture_errors;
       d.command_serial = cmd.command_serial;
       d.tiling_active = cmd.tiling_active;

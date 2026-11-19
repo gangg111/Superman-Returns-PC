@@ -111,6 +111,8 @@ public:
                            CapturedMemory&,std::string&);
   std::span<const uint8_t> Read(uint32_t address, uint32_t length) const;
   std::span<const uint8_t> ReadUnambiguous(uint32_t address,uint32_t length) const;
+  // CaptureOwned: the frozen batch (and so its commands) lives as long as this memory.
+  bool OwnsBatch() const {return bool(batch_);}
 
 private:
   struct Snapshot {

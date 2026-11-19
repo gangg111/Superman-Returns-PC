@@ -120,6 +120,12 @@ struct DrawPacket {
   ResourceId shader_a = 0, shader_b = 0;
   std::shared_ptr<const ShaderCapture> vertex_shader, pixel_shader;
   std::array<std::shared_ptr<const TextureCapture>, 32> textures;
+  // Replay: the command's own array, alive as long as `memory` holds the frozen batch, instead of copying
+  // 32 shared_ptrs (an atomic count update per bound texture) into every packet. Read through Texture().
+  const std::array<std::shared_ptr<const TextureCapture>, 32>* command_textures = nullptr;
+  const std::shared_ptr<const TextureCapture>& Texture(uint32_t slot) const {
+    return command_textures ? (*command_textures)[slot] : textures[slot];
+  }
   // Texture fetch slots the shaders can read (shader_slots.h): a bound slot outside it is not a
   // texture of this draw. ~0u when a shader is unknown.
   uint32_t texture_slots = ~0u;

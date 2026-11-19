@@ -10252,7 +10252,7 @@ void Renderer::Execute(uint8_t* base, const WorkBatch& batch, const WorkCmd& cmd
     } else {
       ++stats_.packets_decoded;
       if(auto* draw=graphics::guest::GetDraw(packet)) {
-        for(const auto& texture:draw->textures) if(texture) ++stats_.packet_texture_refs;
+        for(uint32_t slot=0;slot<32;++slot) if(draw->Texture(slot)) ++stats_.packet_texture_refs;
         for(const auto& [slot,reason]:draw->texture_errors) {
           if(++stats_.packet_texture_errors<=8)
             REXLOG_WARN("native texture capture: slot {} format {} dimension {} base {:08X}: {}",slot,

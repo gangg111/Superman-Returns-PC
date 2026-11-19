@@ -103,7 +103,7 @@ bool GameRenderer::Record(const guest::RenderPacket& packet,VkCommandBuffer comm
       s<<"draw vs="<<Hex(d->vertex_shader?d->vertex_shader->hash:0)<<" ps="<<Hex(d->pixel_shader?d->pixel_shader->hash:0)<<" prim="<<int(d->primitive)<<" n="<<d->count<<(d->indexed?" idx":"")<<(d->inline_vertices?" inline":"")
        <<" c0="<<Surface(d->colors[0])<<" c1="<<Surface(d->colors[1])<<" ds="<<Surface(d->depth)<<" mask="<<Hex(d->registers[0x104])<<" depthctl="<<Hex(d->registers[0x200])<<" blend0="<<Hex(d->registers[0x201])
        <<" vp="<<d->viewport.x<<","<<d->viewport.y<<","<<d->viewport.width<<"x"<<d->viewport.height<<" z="<<d->viewport.min_depth<<".."<<d->viewport.max_depth<<" sc="<<d->scissor.left<<","<<d->scissor.top<<","<<d->scissor.right<<","<<d->scissor.bottom<<" tex=";
-      for(uint32_t slot=0;slot<32;++slot) if((d->texture_fetch[slot][0]&3)==2) s<<slot<<":"<<Hex(d->texture_fetch[slot][1])<<(d->textures[slot]?"u":"")<<",";
+      for(uint32_t slot=0;slot<32;++slot) if((d->texture_fetch[slot][0]&3)==2) s<<slot<<":"<<Hex(d->texture_fetch[slot][1])<<(d->Texture(slot)?"u":"")<<",";
     } else if(auto* c=std::get_if<guest::ClearPacket>(&packet)) {
       s<<"clear flags="<<Hex(c->flags)<<" c0="<<Surface(c->colors[0])<<" ds="<<Surface(c->depth_surface)<<" color="<<c->color[0]<<","<<c->color[1]<<","<<c->color[2]<<","<<c->color[3]<<" depth="<<c->depth<<" rects="<<c->rects.size();
     } else if(auto* r=std::get_if<guest::ResolvePacket>(&packet)) {
@@ -237,7 +237,7 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
       if(!state_.Transition(command,current->handle,{VK_IMAGE_ASPECT_COLOR_BIT,0,current->mips,0,current->layers},ImageUsage::Sampled(),e)) return false;
       continue;
     }
-    const auto& capture=draw.textures[slot];if(!capture) return Fail(e,"Bound texture needs a captured upload or resolved image");
+    const auto& capture=draw.Texture(slot);if(!capture) return Fail(e,"Bound texture needs a captured upload or resolved image");
     if(current && current->version==capture->version) continue;
     guest::LinearTexture texture;std::string reason;if(!decoder_ || !decoder_(*capture,texture,reason)) {e={"Game texture",VK_ERROR_FORMAT_NOT_SUPPORTED,reason.empty()?"Captured texture decoder unavailable":reason};return false;}
     if(!resources_.UploadTexture(id,texture,capture->version,e)) return false;
