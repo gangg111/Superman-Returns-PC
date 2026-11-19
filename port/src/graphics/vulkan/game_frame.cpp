@@ -248,7 +248,17 @@ bool GameFrame::RecordFrame(std::vector<guest::RenderPacket>& packets_,const gue
         +" texture_uploads="+std::to_string(p.texture_uploads/t.frames)+" texture_kb="+std::to_string(p.texture_bytes/1024/t.frames)
         +" | descriptor_cache hits="+std::to_string(cache.hits/t.frames)+" misses="+std::to_string(cache.misses/t.frames)+" evicted="+std::to_string(cache.evicted/t.frames)+" entries="+std::to_string(cache.entries)
         +" | pipelines created="+std::to_string(renderer_.PipelineStats().created)+" plans="+std::to_string(renderer_.PipelineStats().plans)+" memo_hits="+std::to_string(renderer_.PipelineStats().memo_hits)
-        +" | live buffers="+std::to_string(LiveMemory().buffers.load())+" ("+std::to_string(LiveMemory().buffer_bytes.load()>>20)+" MB) images="+std::to_string(LiveMemory().images.load())+" ("+std::to_string(LiveMemory().image_bytes.load()>>20)+" MB)");
+        +" | live buffers="+std::to_string(LiveMemory().buffers.load())+" ("+std::to_string(LiveMemory().buffer_bytes.load()>>20)+" MB) images="+std::to_string(LiveMemory().images.load())+" ("+std::to_string(LiveMemory().image_bytes.load()>>20)+" MB)"
+        +[&] {  // buffers given their own GPU memory, per frame, by site
+          static std::array<int64_t,size_t(AllocSite::kCount)> last{};
+          static const char* names[]{"arena","upload","scratch","host","readback"};
+          std::string out=" | allocations/frame";
+          for(size_t i=0;i<last.size();++i) {
+            const int64_t now=LiveMemory().allocations[i].load();
+            out+=std::string(" ")+names[i]+"="+std::to_string(double(now-last[i])/double(t.frames)).substr(0,5);last[i]=now;
+          }
+          return out;
+        }());
       t={};
     }
   }

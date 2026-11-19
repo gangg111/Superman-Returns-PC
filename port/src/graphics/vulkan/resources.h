@@ -2,6 +2,7 @@
 #include "context.h"
 #include "../guest/texture_layout.h"
 #include "../guest/render_packet.h"
+#include <array>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -35,7 +36,13 @@ struct TextureUploadPlan {
 };
 bool PlanTextureUpload(const guest::LinearTexture&,VkDeviceSize alignment,TextureUploadPlan&,Error&);
 // Live VkDeviceMemory owned by buffers/textures of this module (diagnostics).
-struct MemoryCounters {std::atomic<int64_t> buffers{0},buffer_bytes{0},images{0},image_bytes{0};};
+// Where a buffer's own vkAllocateMemory comes from (the profile counts them per frame: on the Fold7
+// a KGSL GPU memory allocation and its free took a third of the recording thread, 2026-11-19).
+enum class AllocSite : uint8_t {kArena, kUpload, kScratch, kHost, kReadback, kCount};
+struct MemoryCounters {
+  std::atomic<int64_t> buffers{0},buffer_bytes{0},images{0},image_bytes{0};
+  std::array<std::atomic<int64_t>,size_t(AllocSite::kCount)> allocations{};  // cumulative, by site
+};
 MemoryCounters& LiveMemory();
 struct BufferResource {
   Context* context=nullptr;
@@ -127,7 +134,7 @@ public:
   void ForgetTexture(guest::ResourceId id) {textures_.erase(id);}
 private:
   bool UploadBufferImpl(guest::ResourceId,std::span<const std::byte>,uint64_t version,bool dynamic,Error&);
-  std::shared_ptr<BufferResource> NewBuffer(VkDeviceSize,VkBufferUsageFlags,VkMemoryPropertyFlags,Error&);
+  std::shared_ptr<BufferResource> NewBuffer(VkDeviceSize,VkBufferUsageFlags,VkMemoryPropertyFlags,Error&,AllocSite);
   bool Write(const std::shared_ptr<BufferResource>&,std::span<const std::byte>,Error&,VkDeviceSize offset=0);
   bool Ready(Error&);
   struct ArenaChunk {std::shared_ptr<BufferResource> buffer;VkDeviceSize used=0;uint64_t serial=0;};
@@ -152,6 +159,9 @@ private:
   VkDeviceSize host_pool_bytes_=0;
   std::map<VkDeviceSize,std::vector<std::shared_ptr<BufferResource>>> dynamic_pool_;
   VkDeviceSize dynamic_pool_bytes_=0;
+  // Resolve scratch buffers, reused once only the pool holds them (the GPU is done with them).
+  std::vector<std::shared_ptr<BufferResource>> scratch_pool_;
+  VkDeviceSize scratch_pool_bytes_=0;
   std::unordered_map<guest::ResourceId,std::shared_ptr<TextureResource>> textures_;
 };
 } // namespace superman_returns::graphics::vulkan

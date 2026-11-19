@@ -150,7 +150,7 @@ void ResourceStore::Retire(uint64_t completed) {completed_=std::max(completed_,c
 bool ResourceStore::Ready(Error& e) {
   return command_ && serial_>completed_ ? true : Fail(e,"Resource upload","No recording submission");
 }
-std::shared_ptr<BufferResource> ResourceStore::NewBuffer(VkDeviceSize size,VkBufferUsageFlags usage,VkMemoryPropertyFlags required,Error& e) {
+std::shared_ptr<BufferResource> ResourceStore::NewBuffer(VkDeviceSize size,VkBufferUsageFlags usage,VkMemoryPropertyFlags required,Error& e,AllocSite site) {
   auto b=std::make_shared<BufferResource>();b->context=&c_;b->size=size;
   VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};ci.size=size;ci.usage=usage;ci.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
   if(!Check(c_.f.vkCreateBuffer(c_.device,&ci,nullptr,&b->handle),"Create resource buffer",e)) return {};
@@ -162,7 +162,7 @@ std::shared_ptr<BufferResource> ResourceStore::NewBuffer(VkDeviceSize size,VkBuf
   VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};alloc.allocationSize=mr.size;alloc.memoryTypeIndex=*type;
   if(!Check(c_.f.vkAllocateMemory(c_.device,&alloc,nullptr,&b->memory),"Allocate resource buffer",e) ||
      !Check(c_.f.vkBindBufferMemory(c_.device,b->handle,b->memory,0),"Bind resource buffer",e)) return {};
-  ++LiveMemory().buffers;LiveMemory().buffer_bytes+=int64_t(b->allocation);
+  ++LiveMemory().buffers;LiveMemory().buffer_bytes+=int64_t(b->allocation);++LiveMemory().allocations[size_t(site)];
   // Host-visible memory stays mapped for its lifetime; freeing it unmaps.
   if((required&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !Check(c_.f.vkMapMemory(c_.device,b->memory,0,VK_WHOLE_SIZE,0,&b->mapped),"Map resource buffer",e)) return {};
   return b;
@@ -196,7 +196,7 @@ bool ResourceStore::Place(Arena& arena,VkDeviceSize size,VkDeviceSize alignment,
     if(chunk.buffer.use_count()!=1 || chunk.buffer->size<size) continue;
     chunk.used=0;chunk.serial=0;arena.current=i;if(fit(chunk)) return true;
   }
-  auto buffer=NewBuffer(std::max(chunk_size,size),arena.usage,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,e);if(!buffer) return false;
+  auto buffer=NewBuffer(std::max(chunk_size,size),arena.usage,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,e,AllocSite::kArena);if(!buffer) return false;
   if(buffer->size==chunk_size && arena.bytes+buffer->allocation<=budget) {
     arena.bytes+=buffer->allocation;arena.chunks.push_back({buffer,0,0});arena.current=arena.chunks.size()-1;return fit(arena.chunks.back());
   }
@@ -263,7 +263,7 @@ bool ResourceStore::UploadBufferImpl(guest::ResourceId id,std::span<const std::b
     }
   }
   if(!gpu) {
-    gpu=NewBuffer(bytes.size(),VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,e);
+    gpu=NewBuffer(bytes.size(),VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,e,AllocSite::kUpload);
     constexpr VkDeviceSize budget=64ull*1024*1024;
     if(dynamic && gpu && gpu->allocation<=budget-dynamic_pool_bytes_) {
       dynamic_pool_[bytes.size()].push_back(gpu);dynamic_pool_bytes_+=gpu->allocation;
@@ -378,7 +378,19 @@ bool ResourceStore::BindTextureView(guest::ResourceId id,std::shared_ptr<Texture
 std::shared_ptr<BufferResource> ResourceStore::ResolveScratch(VkDeviceSize size,Error& e) {
   if(!Ready(e)) return {};
   if(!size || size>c_.properties.limits.maxStorageBufferRange) {Fail(e,"Resolve scratch","Invalid storage buffer size");return {};}
-  auto buffer=NewBuffer(size,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,e);
+  // A new buffer per resolve cost a GPU memory allocation (the kernel zeroes every page) and its
+  // free each frame: 4 a frame in the city, a third of the recording thread in the KGSL ioctls
+  // (Fold7, 2026-11-19). The smallest pooled buffer that fits and only the pool holds is reused.
+  std::shared_ptr<BufferResource> buffer;
+  for(auto& candidate:scratch_pool_)
+    if(candidate.use_count()==1 && candidate->size>=size && (!buffer || candidate->size<buffer->size)) buffer=candidate;
+  if(!buffer) {
+    buffer=NewBuffer(size,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,e,AllocSite::kScratch);
+    constexpr VkDeviceSize budget=256ull*1024*1024;
+    if(buffer && buffer->allocation<=budget-std::min(budget,scratch_pool_bytes_)) {
+      scratch_pool_bytes_+=buffer->allocation;scratch_pool_.push_back(buffer);
+    }
+  }
   if(buffer) {submissions_.Hold(serial_,buffer);e={};}return buffer;
 }
 bool ResourceStore::UploadHostBuffer(guest::ResourceId id,std::span<const std::byte> bytes,uint64_t version,Error& e) {
@@ -393,7 +405,7 @@ bool ResourceStore::UploadHostBuffer(guest::ResourceId id,std::span<const std::b
     if(candidate.use_count()==1) {buffer=candidate;break;}
   }
   if(!buffer) {
-    buffer=NewBuffer(bytes.size(),VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,e);
+    buffer=NewBuffer(bytes.size(),VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_VERTEX_BUFFER_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,e,AllocSite::kHost);
     constexpr VkDeviceSize budget=64ull*1024*1024;
     if(buffer && buffer->allocation<=budget-host_pool_bytes_) {
       host_pool_bytes_+=buffer->allocation;pool.buffers.push_back(buffer);pool.cursor=pool.buffers.size();
@@ -405,7 +417,7 @@ bool ResourceStore::UploadHostBuffer(guest::ResourceId id,std::span<const std::b
 std::shared_ptr<BufferResource> ResourceStore::ReadbackBuffer(VkDeviceSize size,Error& e) {
   if(!Ready(e)) return {};
   if(!size || size>256*1024*1024) {Fail(e,"Readback buffer","Image readback size exceeds limit");return {};}
-  auto buffer=NewBuffer(size,VK_BUFFER_USAGE_TRANSFER_DST_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,e);if(buffer) submissions_.Hold(serial_,buffer);return buffer;
+  auto buffer=NewBuffer(size,VK_BUFFER_USAGE_TRANSFER_DST_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,e,AllocSite::kReadback);if(buffer) submissions_.Hold(serial_,buffer);return buffer;
 }
 bool ResourceStore::Readback(const std::shared_ptr<BufferResource>& buffer,std::vector<uint8_t>& bytes,Error& e) {
   if(!buffer || buffer->context!=&c_) return Fail(e,"Readback buffer","Buffer is absent or belongs to another device");
