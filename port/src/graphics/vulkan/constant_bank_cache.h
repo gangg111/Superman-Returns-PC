@@ -8,19 +8,30 @@ class ConstantBankCache {
 public:
   struct Reuse {bool vs=false,ps=false;uint32_t vs_offset=0,ps_offset=0;};
   void Reset() {chunk_=nullptr;serial_=0;}
-  Reuse Find(uint64_t serial,const void* chunk,const guest::ConstantSnapshot& value) const {
+  // A bank with a known mirror version (DrawPacket::vs_version, 0 unknown) is compared by version,
+  // else by content: the two 4 KB compares and copies per draw were a good part of the recorder's copying.
+  Reuse Find(uint64_t serial,const void* chunk,const guest::ConstantSnapshot& value,uint64_t vs_version=0,uint64_t ps_version=0) const {
     if(!chunk || chunk!=chunk_ || !serial || serial!=serial_) return {};
-    return {std::memcmp(vs_.data(),value.vs.data(),sizeof(vs_))==0,
-            std::memcmp(ps_.data(),value.ps.data(),sizeof(ps_))==0,vs_offset_,ps_offset_};
+    return {Same(vs_,vs_version_,value.vs,vs_version),Same(ps_,ps_version_,value.ps,ps_version),vs_offset_,ps_offset_};
   }
-  void Commit(uint64_t serial,const void* chunk,uint32_t offset,const guest::ConstantSnapshot& value,Reuse reuse) {
+  void Commit(uint64_t serial,const void* chunk,uint32_t offset,const guest::ConstantSnapshot& value,Reuse reuse,uint64_t vs_version=0,uint64_t ps_version=0) {
     if(chunk!=chunk_ || serial!=serial_) reuse={};
-    if(!reuse.vs) {std::memcpy(vs_.data(),value.vs.data(),sizeof(vs_));vs_offset_=offset;}
-    if(!reuse.ps) {std::memcpy(ps_.data(),value.ps.data(),sizeof(ps_));ps_offset_=offset;}
+    if(!reuse.vs) {Keep(vs_,vs_version_,value.vs,vs_version);vs_offset_=offset;}
+    if(!reuse.ps) {Keep(ps_,ps_version_,value.ps,ps_version);ps_offset_=offset;}
     serial_=serial;chunk_=chunk;
   }
 private:
-  std::array<uint32_t,1024> vs_{},ps_{};
+  using Bank=std::array<uint32_t,1024>;
+  static bool Same(const Bank& kept,uint64_t kept_version,const Bank& bank,uint64_t version) {
+    if(kept_version && version) return kept_version==version;
+    return !kept_version && !version && std::memcmp(kept.data(),bank.data(),sizeof(Bank))==0;
+  }
+  static void Keep(Bank& kept,uint64_t& kept_version,const Bank& bank,uint64_t version) {
+    kept_version=version;
+    if(!version) std::memcpy(kept.data(),bank.data(),sizeof(Bank));  // compared by content later
+  }
+  Bank vs_{},ps_{};
+  uint64_t vs_version_=0,ps_version_=0;
   uint64_t serial_=0;const void* chunk_=nullptr;uint32_t vs_offset_=0,ps_offset_=0;
 };
 }

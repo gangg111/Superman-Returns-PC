@@ -42,6 +42,10 @@ struct DrawPacket {
   int32_t base_vertex = 0;
   uint32_t first = 0, count = 0, inline_stride = 0;
   ConstantSnapshot constants;
+  // The replay mirror's bank versions `constants` were taken at (Pm4Mirror vs_version / ps_version:
+  // bumped on every register change), 0 when the banks came from elsewhere. Equal non-zero versions
+  // mean equal contents: the recorder's bank cache compares them instead of 4 KB per bank per draw.
+  uint64_t vs_version = 0, ps_version = 0;
   CapturedMemory memory;
   std::vector<VertexStream> streams;
   std::vector<VertexAttribute> attributes;

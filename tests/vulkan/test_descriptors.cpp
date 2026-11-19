@@ -22,6 +22,19 @@ SR_TEST(constant_bank_cache_requires_exact_bytes_submission_and_chunk) {
   r=cache.Find(2,&chunk2,v);SR_CHECK(r.vs && r.ps);
   r=cache.Find(2,&chunk1,v);SR_CHECK(!r.vs && !r.ps);
 }
+SR_TEST(constant_bank_cache_compares_known_versions_not_bytes) {
+  ConstantBankCache cache;guest::ConstantSnapshot v{};int chunk=0;
+  auto r=cache.Find(1,&chunk,v,7,9);SR_CHECK(!r.vs && !r.ps);
+  cache.Commit(1,&chunk,4096,v,r,7,9);
+  r=cache.Find(1,&chunk,v,7,9);SR_CHECK(r.vs && r.ps);  // same versions
+  r=cache.Find(1,&chunk,v,8,9);SR_CHECK(!r.vs && r.ps);  // a vs register changed: 8
+  v.ps[0]=1;r=cache.Find(1,&chunk,v,7,9);SR_CHECK(r.vs && r.ps);  // equal versions are equal banks
+  r=cache.Find(1,&chunk,v,0,9);SR_CHECK(!r.vs && r.ps);  // unknown never matches a known one
+  cache.Commit(1,&chunk,8192,v,r,0,9);  // vs kept by content now
+  r=cache.Find(1,&chunk,v,0,9);SR_CHECK(r.vs && r.ps);
+  SR_CHECK_EQ(r.vs_offset,8192u);SR_CHECK_EQ(r.ps_offset,4096u);
+  v.vs[3]=5;r=cache.Find(1,&chunk,v,0,9);SR_CHECK(!r.vs && r.ps);  // and its bytes differ
+}
 namespace {
 // The 12 KiB constant block of one draw (vs, ps, shared), as MapTransient hands it out.
 struct Block {

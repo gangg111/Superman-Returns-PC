@@ -396,6 +396,7 @@ void ApplyDeviceState(DrawPacket &d, uint32_t dev, const CapturedMemory &memory)
   }
   d.constants.vs = vs;
   d.constants.ps = ps;
+  d.vs_version = d.ps_version = 0;  // from the device, not the mirror
   for (uint32_t i = 0; i < 40; ++i)
     std::memcpy(d.constants.shared.data() + (i < 8 ? 256 + i * 4 : 304 + (i - 8) * 4), &bool_loop[i], 4);
   d.polygon_offset_registers = poly;
@@ -435,6 +436,8 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
       d.base_vertex = d.indexed ? int32_t(cmd.u[1]) : 0;
       d.constants.vs=mirror.FloatConstants(false);
       d.constants.ps=mirror.FloatConstants(true);
+      d.vs_version=mirror.vs_version;
+      d.ps_version=mirror.ps_version;
       for (uint32_t i = 0; i < 8; ++i) {
         auto v = mirror.reg(native::Pm4Mirror::kBoolConstantBase + i);
         std::memcpy(d.constants.shared.data() + 256 + i * 4, &v, 4);
