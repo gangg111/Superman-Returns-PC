@@ -239,6 +239,7 @@ if(WIN32 AND EXISTS "${SR_REXGPU_SOURCE_DIR}/src/graphics/d3d12/command_processo
             ${SR_NATIVE_ROOT}/../graphics/guest/primitive_expansion.cpp
             ${SR_NATIVE_ROOT}/../graphics/guest/render_packet.cpp
             ${SR_NATIVE_ROOT}/../graphics/guest/constant_snapshot.cpp
+            ${SR_NATIVE_ROOT}/../graphics/guest/shader_slots.cpp
             ${SR_NATIVE_ROOT}/texture_decode.cpp
             ${SR_NATIVE_ROOT}/texture_replace.cpp
             ${SR_NATIVE_ROOT}/shader_registry.cpp

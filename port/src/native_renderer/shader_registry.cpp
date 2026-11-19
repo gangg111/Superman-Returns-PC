@@ -42,6 +42,7 @@
 #include <rex/ppc.h>
 
 #include "game_profile.h"
+#include "../graphics/guest/shader_slots.h"
 #include "native_bridge.h"
 #include "shader_container.h"
 #include "shader_library.h"
@@ -81,6 +82,18 @@ bool GuestRange(uint32_t addr, uint32_t bytes) {
 }
 
 size_t GuestAvailable(uint32_t addr) { return size_t(0x100000000ull - addr); }
+
+// The immutable capture a draw keeps of a shader, with the texture slots it can read.
+std::shared_ptr<graphics::guest::ShaderCapture> NewCapture(uint64_t hash, bool vertex, bool dynamic_vertex_fetch,
+                                                           std::vector<uint8_t> container) {
+  auto capture = std::make_shared<graphics::guest::ShaderCapture>();
+  capture->hash = hash;
+  capture->vertex = vertex;
+  capture->dynamic_vertex_fetch = dynamic_vertex_fetch;
+  capture->container = std::move(container);
+  capture->texture_slots = graphics::guest::ShaderTextureSlots(capture->container);
+  return capture;
+}
 
 struct LoadedLibrary {
   ShaderLibrary library;
@@ -148,12 +161,8 @@ bool TryHashContainer(uint8_t* base, uint32_t container, GuestShaderInfo& info) 
       ShaderHasInstanceData(base + container, header.virtual_size);
   info.container_hash = XXH3_64bits(base + container, header.total_size());
   info.match = PreShaderMatch::kNone;
-  auto capture = std::make_shared<graphics::guest::ShaderCapture>();
-  capture->hash = info.container_hash;
-  capture->vertex = info.is_vertex;
-  capture->dynamic_vertex_fetch = info.dynamic_vertex_fetch;
-  capture->container.assign(base + container, base + container + header.total_size());
-  info.capture = std::move(capture);
+  info.capture = NewCapture(info.container_hash, info.is_vertex, info.dynamic_vertex_fetch,
+                            std::vector<uint8_t>(base + container, base + container + header.total_size()));
   return true;
 }
 
@@ -173,12 +182,7 @@ bool IdentifyAt(uint8_t* base, uint32_t container, GuestShaderInfo& info) {
   info.is_vertex = s->vertex;
   info.dynamic_vertex_fetch = s->dynamic_vertex_fetch;
   info.match = how;
-  auto capture = std::make_shared<graphics::guest::ShaderCapture>();
-  capture->hash = info.container_hash;
-  capture->vertex = info.is_vertex;
-  capture->dynamic_vertex_fetch = info.dynamic_vertex_fetch;
-  capture->container = s->container;
-  info.capture = std::move(capture);
+  info.capture = NewCapture(info.container_hash, info.is_vertex, info.dynamic_vertex_fetch, s->container);
   return true;
 }
 
@@ -200,12 +204,7 @@ uint32_t ResolveInline(uint8_t* base, uint32_t obj, bool vertex, GuestShaderInfo
         candidate.is_vertex = s->vertex;
         candidate.dynamic_vertex_fetch = s->dynamic_vertex_fetch;
         candidate.match = how;
-        auto capture = std::make_shared<graphics::guest::ShaderCapture>();
-        capture->hash = s->container_hash;
-        capture->vertex = s->vertex;
-        capture->dynamic_vertex_fetch = s->dynamic_vertex_fetch;
-        capture->container = s->container;
-        candidate.capture = std::move(capture);
+        candidate.capture = NewCapture(s->container_hash, s->vertex, s->dynamic_vertex_fetch, s->container);
         found = true;
       }
     }

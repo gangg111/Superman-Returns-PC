@@ -9805,7 +9805,12 @@ void Renderer::CaptureBytes(uint8_t* base, uint32_t address, uint32_t length) {
 
 void Renderer::CaptureTextures(uint8_t* base) {
   const bool replay_textures = TextureHashReplayEnabled();
+  // Only the slots the draw's shaders can read (shader_slots.h; a missing shader: every slot). The
+  // game leaves earlier draws' fetch constants bound; decode and recording skip the same slots.
+  const uint32_t slots=(cur_.vertex_shader?cur_.vertex_shader->texture_slots:~0u)|
+                       (cur_.pixel_shader?cur_.pixel_shader->texture_slots:~0u);
   for (uint32_t slot=0;slot<32;++slot) {
+    if(!(slots>>slot&1)) continue;
     std::array<uint32_t,6> fetch{};
     for(uint32_t i=0;i<6;++i) {
       uint32_t reg=Pm4Mirror::kFetchConstantBase+slot*6+i;

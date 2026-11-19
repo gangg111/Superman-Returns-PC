@@ -36,7 +36,7 @@ bool BuildBindings(const guest::DrawPacket& draw,std::byte* block,DrawBindings& 
   std::array<TextureBindingRequest,32> requests;size_t request_count=0;
   for(uint32_t slot=0;slot<32;++slot) {
     const auto& fetch=draw.texture_fetch[slot];
-    if((fetch[0]&3)!=2) continue;
+    if(!(draw.texture_slots>>slot&1) || (fetch[0]&3)!=2) continue;  // not read by the shaders, or no texture
     uint32_t dim=(fetch[5]>>9)&3;
     if(dim==0) dim=1; // SDK prepares 1D as a one-row 2D image.
     uint32_t gamma=0;
@@ -89,7 +89,7 @@ bool BuildBindings(const guest::DrawPacket& draw,std::byte* block,DrawBindings& 
   for(uint32_t slot=0;slot<16;++slot) {
     std::array<uint32_t,3> index{31u,31u,31u};
     const auto& fetch=draw.texture_fetch[slot];
-    if((fetch[0]&3)==2) {
+    if((draw.texture_slots>>slot&1) && (fetch[0]&3)==2) {
       uint32_t dim=(fetch[5]>>9)&3;
       dim=dim?dim-1:0;  // 1D and 2D share the 2D table, as in the requests above
       index[dim]=out.texture_indices[slot];

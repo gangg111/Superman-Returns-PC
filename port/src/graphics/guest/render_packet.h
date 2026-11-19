@@ -62,6 +62,9 @@ struct DrawPacket {
   ResourceId shader_a = 0, shader_b = 0;
   std::shared_ptr<const ShaderCapture> vertex_shader, pixel_shader;
   std::array<std::shared_ptr<const TextureCapture>, 32> textures;
+  // Texture fetch slots the shaders can read (shader_slots.h): a bound slot outside it is not a
+  // texture of this draw. ~0u when a shader is unknown.
+  uint32_t texture_slots = ~0u;
   std::vector<std::pair<uint32_t, std::string>> texture_errors;
   uint64_t command_serial = 0;
   bool has_device_state = false;

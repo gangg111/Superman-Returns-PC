@@ -206,7 +206,7 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
     if(!depth_resolver_.RecordAlias(command,destination,alias,targets_,resources_,state_,e,alias_options_)) return false;
   }
   lap(RecordProfile::kTargets);
-  for(uint32_t slot=0;slot<32;++slot) if((draw.texture_fetch[slot][0]&3)==2) {
+  for(uint32_t slot=0;slot<32;++slot) if((draw.texture_slots>>slot&1) && (draw.texture_fetch[slot][0]&3)==2) {
     auto id=TextureResourceId(draw.texture_fetch[slot]);
     // Only the value is read: look it up in place and Hold it, with no shared_ptr copy per slot.
     auto find_held=[&]() -> TextureResource* {

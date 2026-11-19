@@ -11,5 +11,7 @@ struct ShaderCapture {
   bool vertex = false;
   bool dynamic_vertex_fetch = false;
   std::vector<uint8_t> container;
+  // Texture fetch slots the shader can read (shader_slots.h), ~0u when unknown.
+  uint32_t texture_slots = ~0u;
 };
 } // namespace superman_returns::graphics::guest
