@@ -140,6 +140,12 @@ std::array<float, 4> Color(const CapturedMemory &m, uint32_t a) {
       out[i] = std::bit_cast<float>(U32(m, Address(a, 4 * i)));
   return out;
 }
+}  // namespace
+bool ReplayZeroesVertexFetch() {
+  static const bool zero=[] {const char* v=std::getenv("SR_BINDLESS_META");return v && *v && *v!='1';}();
+  return zero;
+}
+namespace {
 // SR_BUFFER_VIEWS=0: copy the updates into the packet again, as before the views.
 bool BufferViewsEnabled() {
   static const bool on=[] {const char* v=std::getenv("SR_BUFFER_VIEWS");return !v || !*v || *v!='0';}();

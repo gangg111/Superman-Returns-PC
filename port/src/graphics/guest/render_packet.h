@@ -88,15 +88,19 @@ struct ConstantBank {
   uint64_t version = 0;
   std::array<uint32_t, 1024> words;
 };
+// Replay packets zero DrawPacket::vertex_fetch only for the full-walk diagnostics (SR_BINDLESS_META=0 or 2).
+bool ReplayZeroesVertexFetch();
 struct DrawPacket {
   struct ReplayStorageTag {};
   // Keep this user-provided: value-initialization must not add a whole-packet
   // zeroing pass before the individual members initialize themselves.
-  DrawPacket() {}
+  DrawPacket() : vertex_fetch{} {}
   // Only DecodeCapturedPacket may publish this storage: it fills both float
   // banks, polygon offset registers and the shared metadata suffix before their
   // first use. Shared prefix/device/vertex/fetch keep normal initialization.
-  explicit DrawPacket(ReplayStorageTag) : constants(ConstantSnapshot::ReplayStorageTag{}) {}
+  explicit DrawPacket(ReplayStorageTag) : constants(ConstantSnapshot::ReplayStorageTag{}) {
+    if (ReplayZeroesVertexFetch()) vertex_fetch.fill({});
+  }
   int pass = 0;
   Primitive primitive = Primitive::kTriangles;
   bool indexed = false, inline_vertices = false;
@@ -117,7 +121,10 @@ struct DrawPacket {
   CapturedMemory memory;
   std::vector<VertexStream> streams;
   std::vector<VertexAttribute> attributes;
-  std::array<VertexFetchMeta, 224> vertex_fetch{};
+  // Replay storage (mobile renderer plan, E2): only the entries of the draw's attributes (usage < 14,
+  // index < 16) are written and only those are read (bindless.cpp, descriptors.cpp walk `attributes`),
+  // so the other 3.5 KB are not zeroed per packet (ReplayZeroesVertexFetch). Other packets: all zero.
+  std::array<VertexFetchMeta, 224> vertex_fetch;
   BufferUpdate indices;
   std::vector<uint32_t> expanded_indices;
   std::vector<uint8_t> inline_data;

@@ -68,7 +68,14 @@ bool BuildBindings(const guest::DrawPacket& draw,std::byte* block,DrawBindings& 
   if(copy_banks&1) std::memcpy(block,draw.VsWords(),sizeof(draw.constants.vs));
   if(copy_banks&2) std::memcpy(block+sizeof(draw.constants.vs),draw.PsWords(),sizeof(draw.constants.ps));
   std::memcpy(shared+256,draw.constants.shared.data()+256,256);
-  for(uint32_t i=0;i<draw.vertex_fetch.size();++i) {
+  // Unused entries are {31,0,0,0}; the decoder writes an entry only with its attribute (usage < 14,
+  // index < 16) and replay packets leave the others unzeroed (DrawPacket::vertex_fetch), so the entries
+  // come from the attributes.
+  static constexpr guest::VertexFetchMeta kUnused{31,0,0,0};
+  for(uint32_t i=0;i<draw.vertex_fetch.size();++i) std::memcpy(shared+512+i*16,&kUnused,16);
+  for(const auto& attribute:draw.attributes) {
+    if(attribute.usage>=14 || attribute.index>=16) continue;
+    const uint32_t i=attribute.usage*16+attribute.index;
     auto meta=draw.vertex_fetch[i];
     if(meta.type) {
       if(draw.inline_vertices) meta.buffer=0;
