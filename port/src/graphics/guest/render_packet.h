@@ -15,6 +15,17 @@ struct BufferUpdate {
   BufferPlan plan;
   std::vector<uint8_t> bytes;
   std::vector<uint32_t> normalized;
+  // Replay with CapturedMemory::OwnsBatch (mobile renderer plan, E2): the update's raw bytes in the frozen
+  // batch that the packet's `memory` keeps alive, not copied; `bytes` and `normalized` stay empty and the
+  // recorder converts the view as it copies it into its buffer copy: vertex elements swapped with
+  // SwapVertexElements(stride, phase), indices normalized with NormalizeIndicesInto(encoding, primitive).
+  // The per-draw vectors were allocated on the replay worker and freed on the recorder, large ones
+  // through munmap (11% of the recorder thread, Fold7 city, 2026-11-19).
+  std::span<const uint8_t> view;
+  uint32_t swap_stride = 0, swap_phase = 0;
+  IndexEncoding index_encoding{false, 0, UINT32_MAX};
+  Primitive index_primitive = Primitive::kTriangles;
+  bool HasData() const {return !bytes.empty() || !view.empty();}
 };
 struct VertexStream {
   uint32_t stream = 0, offset = 0, size = 0, stride = 0;

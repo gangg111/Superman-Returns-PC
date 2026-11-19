@@ -81,7 +81,7 @@ const shaders::ShaderResult& GameRenderer::ShaderFor(const guest::ShaderCapture&
   kept={capture.hash,capture.container.size(),std::move(scratch)};
   return kept.result;
 }
-bool GameRenderer::Upload(const guest::BufferUpdate& update,bool indices,uint64_t version,Error& e) {
+bool GameRenderer::Upload(const guest::BufferUpdate& update,bool indices,uint64_t version,Error& e,uint32_t stream,std::span<const guest::VertexAttribute> attributes) {
   auto& p=update.plan;if(!p.key || !p.size || p.action>2 || p.begin>p.end || p.end>p.size) return Fail(e,"Invalid guest buffer update");
   // Unchanged: it only has to exist, and be held. Looked up in place: Buffer() returned a shared_ptr copy
   // (two atomic count updates) per stream of every draw only to test it.
@@ -97,10 +97,25 @@ bool GameRenderer::Upload(const guest::BufferUpdate& update,bool indices,uint64_
   auto found=cpu_buffers_.find(p.key);
   if(p.action==1 && (found==cpu_buffers_.end() || found->second.size()!=size)) return Fail(e,"Partial buffer update has no captured base version");
   auto& bytes=cpu_buffers_[p.key];if(p.action==2) bytes.assign(size,0);
-  auto source=indices?std::as_bytes(std::span(update.normalized)):std::as_bytes(std::span(update.bytes));
   size_t begin=indices?size_t(p.begin)/width*4:p.begin,end=indices?size_t(p.end)/width*4:p.end;
-  if(source.size()!=end-begin) return Fail(e,"Buffer update payload length differs from range");
-  std::memcpy(bytes.data()+begin,source.data(),source.size());
+  if(!update.view.empty()) {
+    // The raw bytes in the capture (guest::BufferUpdate::view), converted here as the replay did before.
+    if(end>bytes.size()) return Fail(e,"Buffer update range exceeds buffer");
+    if(indices) {
+      if(update.view.size()%width || update.view.size()/width*4!=end-begin) return Fail(e,"Buffer update payload length differs from range");
+      std::string error;
+      if(!guest::NormalizeIndicesInto(update.view,0,uint32_t(update.view.size()/width),update.index_encoding,update.index_primitive,
+                                      reinterpret_cast<uint32_t*>(bytes.data()+begin),error)) {e={"Index normalization",VK_ERROR_INITIALIZATION_FAILED,error};return false;}
+    } else {
+      if(update.view.size()!=end-begin) return Fail(e,"Buffer update payload length differs from range");
+      std::memcpy(bytes.data()+begin,update.view.data(),update.view.size());
+      guest::SwapVertexElements(std::span(bytes.data()+begin,end-begin),update.swap_stride,update.swap_phase,stream,attributes);
+    }
+  } else {
+    auto source=indices?std::as_bytes(std::span(update.normalized)):std::as_bytes(std::span(update.bytes));
+    if(source.size()!=end-begin) return Fail(e,"Buffer update payload length differs from range");
+    std::memcpy(bytes.data()+begin,source.data(),source.size());
+  }
   if(profiling_) {++profile_.buffer_uploads;profile_.buffer_bytes+=bytes.size();}
   return p.action==1?resources_.UploadDynamicBuffer(p.key,std::as_bytes(std::span(bytes)),version,e)
                     :resources_.UploadBuffer(p.key,std::as_bytes(std::span(bytes)),version,e);
@@ -206,7 +221,7 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
   // packets depend on the first owned version and cannot read guest memory.
   // Single-use geometry is written into mapped transient memory: no copy.
   if(draw.inline_vertices) {auto id=InlineBufferBase|draw.command_serial;if(!resources_.UploadTransient(id,std::as_bytes(inline_data),0,e)) return false;transient_buffers_[serial_].push_back(id);}
-  else for(auto& stream:draw.streams) if(!Upload(stream.update,false,draw.command_serial,e)) return false;
+  else for(auto& stream:draw.streams) if(!Upload(stream.update,false,draw.command_serial,e,stream.stream,draw.attributes)) return false;
   if(draw.indexed && draw.indices.plan.key && !Upload(draw.indices,true,draw.command_serial,e)) return false;
   if(draw.indexed && !draw.indices.plan.key && draw.expanded_indices.empty() && draw.count) return Fail(e,"Indexed draw has no captured indices");
   auto index_id=draw.indices.plan.key;

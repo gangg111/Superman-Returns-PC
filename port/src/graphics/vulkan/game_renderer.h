@@ -53,7 +53,8 @@ private:
   void ClosePass();
   bool DumpImageNow(VkCommandBuffer,const std::string& name,VkImage,VkFormat,VkExtent3D,VkImageAspectFlags,bool target,Error&);
   bool dumping_=false;uint64_t dump_packet_=0;std::vector<std::string> dump_log_;std::vector<DumpImage> dump_images_;
-  bool Upload(const guest::BufferUpdate&,bool indices,uint64_t version,Error&);
+  // A vertex update with a capture view (guest::BufferUpdate::view) is swapped with its stream's attributes.
+  bool Upload(const guest::BufferUpdate&,bool indices,uint64_t version,Error&,uint32_t stream=0,std::span<const guest::VertexAttribute> attributes={});
   // The shared index buffer of non-indexed quad lists (0,1,2,0,2,3, then +4 per quad), drawn at the quad list's
   // first vertex as the vertex offset; grown to at least `quads` quads.
   bool QuadIndices(uint32_t quads,Error&);

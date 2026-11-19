@@ -41,6 +41,9 @@ inline uint32_t LoadIndex(const uint8_t *bytes, uint32_t index, bool index32,
     value |= uint32_t(bytes[(offset + b) ^ IndexByteXor(endian)]) << (8 * b);
   return value;
 }
+// NormalizeIndices without the quad expansion: writes `count` values to `out`.
+bool NormalizeIndicesInto(std::span<const uint8_t>, uint32_t first, uint32_t count,
+                          IndexEncoding, Primitive, uint32_t *out, std::string &);
 // Produces uint32 indices with UINT32_MAX as the enabled strip restart cut.
 bool NormalizeIndices(std::span<const uint8_t>, uint32_t first, uint32_t count,
                       IndexEncoding, Primitive, std::vector<uint32_t> &,

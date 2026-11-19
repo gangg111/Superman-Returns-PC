@@ -140,6 +140,12 @@ std::array<float, 4> Color(const CapturedMemory &m, uint32_t a) {
       out[i] = std::bit_cast<float>(U32(m, Address(a, 4 * i)));
   return out;
 }
+// SR_BUFFER_VIEWS=0: copy the updates into the packet again, as before the views.
+bool BufferViewsEnabled() {
+  static const bool on=[] {const char* v=std::getenv("SR_BUFFER_VIEWS");return !v || !*v || *v!='0';}();
+  return on;
+}
+// A memory that owns its frozen batch hands out a view into it (BufferUpdate::view), else a copy.
 BufferUpdate Buffer(const CapturedMemory &m, const BufferPlan &plan) {
   BufferUpdate out;
   out.plan = plan;
@@ -149,7 +155,8 @@ BufferUpdate Buffer(const CapturedMemory &m, const BufferPlan &plan) {
     auto data =
         m.Read(Address(0xa0000000u, uint64_t(plan.address) + plan.begin),
                plan.end - plan.begin);
-    out.bytes.assign(data.begin(), data.end());
+    if (m.OwnsBatch() && BufferViewsEnabled()) out.view = data;
+    else out.bytes.assign(data.begin(), data.end());
   }
   return out;
 }
@@ -541,11 +548,12 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
       // shared[512,4096) is not filled: the recorders write the vertex fetch table into the GPU block from
       // vertex_fetch (bindless.cpp, descriptors.cpp), and copying it here too was 3.5 KB a draw nobody read.
       for(auto& stream:d.streams) {
-        if(stream.update.bytes.empty()) continue;
+        if(!stream.update.HasData()) continue;
         uint32_t stride=stream.stride;
         if(!stride) {error="Captured vertex update has zero stride";return false;}
         uint32_t phase=uint32_t((uint64_t(stream.update.plan.phase)+stride-
                                 stream.update.plan.begin%stride)%stride);
+        if(!stream.update.view.empty()) {stream.update.swap_stride=stride;stream.update.swap_phase=phase;continue;}
         SwapVertexElements(stream.update.bytes,stride,phase,stream.stream,d.attributes);
       }
       if (d.inline_vertices) {
@@ -575,9 +583,10 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
         if (!cmd.has_index)
           throw std::out_of_range("Guest index capture failed");
         d.indices = Buffer(memory, cmd.index);
-        if (!d.indices.bytes.empty()) {
+        if (d.indices.HasData()) {
           uint32_t width = cmd.index32 ? 4 : 2;
-          if (d.indices.bytes.size() % width || cmd.index.begin % width)
+          const size_t bytes = d.indices.bytes.empty() ? d.indices.view.size() : d.indices.bytes.size();
+          if (bytes % width || cmd.index.begin % width)
             throw std::out_of_range("Unaligned captured indices");
           // Normalize only the captured update; unchanged buffer data stays in
           // the backend cache. Quads are expanded from the actual draw slice
@@ -585,7 +594,11 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
           auto primitive = d.primitive == Primitive::kQuads
                                ? Primitive::kTriangles
                                : d.primitive;
-          if (!NormalizeIndices(
+          if (!d.indices.view.empty()) {
+            // Normalized by the recorder, straight into its buffer copy (BufferUpdate::view).
+            d.indices.index_encoding = {cmd.index32, cmd.index.format >> 2, cmd.index.reset_index};
+            d.indices.index_primitive = primitive;
+          } else if (!NormalizeIndices(
                   d.indices.bytes, 0, uint32_t(d.indices.bytes.size() / width),
                   {cmd.index32, cmd.index.format >> 2, cmd.index.reset_index},
                   primitive, d.indices.normalized, error))
