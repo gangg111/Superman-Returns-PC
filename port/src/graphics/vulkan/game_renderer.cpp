@@ -71,6 +71,15 @@ void GameRenderer::Retire(uint64_t serial) {
   for(auto it=transient_buffers_.begin();it!=transient_buffers_.end() && it->first<=serial;) {for(auto id:it->second) resources_.ForgetBuffer(id);it=transient_buffers_.erase(it);}
   depth_resolver_.Retire(serial);descriptors_.Retire(serial);pipelines_.Retire(serial);targets_.Retire(serial);resources_.Retire(serial);if(serial>=serial_) command_=VK_NULL_HANDLE;
 }
+const shaders::ShaderResult& GameRenderer::ShaderFor(const guest::ShaderCapture& capture,shaders::ShaderResult& scratch) {
+  if(auto found=final_shaders_.find(&capture);found!=final_shaders_.end() &&
+     found->second.hash==capture.hash && found->second.size==capture.container.size()) return found->second.result;
+  scratch=shaders_(capture);
+  if(scratch.status==shaders::ShaderPoll::pending) return scratch;
+  auto& kept=final_shaders_[&capture];
+  kept={capture.hash,capture.container.size(),std::move(scratch)};
+  return kept.result;
+}
 bool GameRenderer::Upload(const guest::BufferUpdate& update,bool indices,uint64_t version,Error& e) {
   auto& p=update.plan;if(!p.key || !p.size || p.action>2 || p.begin>p.end || p.end>p.size) return Fail(e,"Invalid guest buffer update");
   // Unchanged: it only has to exist, and be held. Looked up in place: Buffer() returned a shared_ptr copy
@@ -187,8 +196,10 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
   if(!draw.expanded_indices.empty()) {index_id=ExpandedIndexBufferBase|draw.command_serial;if(!resources_.UploadTransient(index_id,std::as_bytes(std::span(draw.expanded_indices)),0,e)) return false;transient_buffers_[serial_].push_back(index_id);}
   if(!draw.count) {e={};return true;}
   if(!draw.vertex_shader || !shaders_) return Fail(e,"Captured vertex shader/lookup absent");
-  auto vs=shaders_(*draw.vertex_shader);shaders::ShaderResult ps{shaders::ShaderPoll::ready,{},{}};
-  if(draw.pixel_shader) ps=shaders_(*draw.pixel_shader);
+  shaders::ShaderResult vs_scratch,ps_scratch;
+  static const shaders::ShaderResult kNoPixelShader{shaders::ShaderPoll::ready,{},{}};
+  const shaders::ShaderResult& vs=ShaderFor(*draw.vertex_shader,vs_scratch);
+  const shaders::ShaderResult& ps=draw.pixel_shader?ShaderFor(*draw.pixel_shader,ps_scratch):kNoPixelShader;
   if(vs.status==shaders::ShaderPoll::failed || ps.status==shaders::ShaderPoll::failed) {e={"Game shader",VK_ERROR_INITIALIZATION_FAILED,vs.status==shaders::ShaderPoll::failed?vs.diagnostic:ps.diagnostic};return false;}
   if(vs.status==shaders::ShaderPoll::pending || ps.status==shaders::ShaderPoll::pending) {++stats_.pending;e={"Game shader",VK_NOT_READY,"Captured shader compilation pending"};return false;}
   if(!vs.artifact || (draw.pixel_shader && !ps.artifact)) return Fail(e,"Ready shader has no owned artifact");

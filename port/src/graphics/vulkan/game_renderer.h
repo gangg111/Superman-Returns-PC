@@ -54,6 +54,13 @@ private:
   bool DumpImageNow(VkCommandBuffer,const std::string& name,VkImage,VkFormat,VkExtent3D,VkImageAspectFlags,bool target,Error&);
   bool dumping_=false;uint64_t dump_packet_=0;std::vector<std::string> dump_log_;std::vector<DumpImage> dump_images_;
   bool Upload(const guest::BufferUpdate&,bool indices,uint64_t version,Error&);
+  // A capture's final (ready or failed) shader result, by reference: the lookup copied a ShaderResult (a
+  // shared_ptr and a string) through a std::function twice per draw (mobile renderer plan, E3). Captures
+  // are long-lived registry objects; pointer, hash and size must match, as in GameFrame's MemoizeFinal.
+  // A pending result is returned in `scratch` and asked again next time.
+  const shaders::ShaderResult& ShaderFor(const guest::ShaderCapture&,shaders::ShaderResult& scratch);
+  struct FinalShader {uint64_t hash=0;size_t size=0;shaders::ShaderResult result;};
+  std::unordered_map<const guest::ShaderCapture*,FinalShader> final_shaders_;
   static bool StateFilterEnabled();
   static bool AliasCheckEnabled();
   static bool ConstantBankCacheEnabled();
