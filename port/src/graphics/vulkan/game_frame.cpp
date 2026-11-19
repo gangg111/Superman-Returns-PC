@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include "../frame_timeline.h"
 namespace superman_returns::graphics::vulkan {
 namespace {
@@ -115,11 +116,22 @@ void GameFrame::RecorderMain() {
     job_packets_.clear();job_swap_.reset();job_pending_=false;job_cv_.notify_all();
   }
 }
-bool GameFrame::WaitShaders(const std::vector<guest::RenderPacket>& packets,Error& e) {
-  std::vector<std::shared_ptr<const guest::ShaderCapture>> captures;
+bool GameFrame::WaitShaders(std::vector<guest::RenderPacket>& packets,Error& e) {
+#if defined(__ANDROID__)
+  // Android has no runtime shader compiler, only the pre-shader library built on
+  // the PC: a shader missing from it drops the draws that use it (logged once
+  // per shader) instead of stopping the renderer.
+  constexpr bool kSkipFailedShaders=true;
+#else
+  constexpr bool kSkipFailedShaders=false;
+#endif
+  std::vector<std::shared_ptr<const guest::ShaderCapture>> captures,failed;
+  // A set for the distinct shaders: a linear search of the list for each of ~2,700 draws a frame
+  // was 2.3% of the recorder thread (Fold7 city, 2026-11-19). The list keeps the first-seen order.
+  std::unordered_set<const guest::ShaderCapture*> seen;
   for(auto& packet:packets) if(auto* draw=guest::GetDraw(packet);draw && draw->count) {
     if(!draw->vertex_shader) {e={"Game shader",VK_ERROR_INITIALIZATION_FAILED,"Draw has no captured vertex shader"};return false;}
-    for(auto& shader:{draw->vertex_shader,draw->pixel_shader}) if(shader && std::find(captures.begin(),captures.end(),shader)==captures.end()) captures.push_back(shader);
+    for(const auto* shader:{&draw->vertex_shader,&draw->pixel_shader}) if(*shader && seen.insert(shader->get()).second) captures.push_back(*shader);
   }
   const auto deadline=std::chrono::steady_clock::now()+std::chrono::minutes(10);
   auto next_log=std::chrono::steady_clock::now();

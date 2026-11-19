@@ -73,7 +73,13 @@ void GameRenderer::Retire(uint64_t serial) {
 }
 bool GameRenderer::Upload(const guest::BufferUpdate& update,bool indices,uint64_t version,Error& e) {
   auto& p=update.plan;if(!p.key || !p.size || p.action>2 || p.begin>p.end || p.end>p.size) return Fail(e,"Invalid guest buffer update");
-  if(!p.action) return bool(resources_.Buffer(p.key,e));
+  // Unchanged: it only has to exist, and be held. Looked up in place: Buffer() returned a shared_ptr copy
+  // (two atomic count updates) per stream of every draw only to test it.
+  if(!p.action) {
+    const auto* found=resources_.FindBuffer(p.key);
+    if(!found) return Fail(e,"Buffer has no captured upload");
+    resources_.Hold(*found);e={};return true;
+  }
   uint32_t width=indices?((p.format&3)==2?4:2):1;
   if(indices && (p.size%width || p.begin%width || p.end%width)) return Fail(e,"Invalid index update alignment");
   uint64_t size=indices?uint64_t(p.size)/width*4:p.size;
@@ -206,8 +212,10 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
     if(!depth_resolver_.RecordAlias(command,destination,alias,targets_,resources_,state_,e,alias_options_)) return false;
   }
   lap(RecordProfile::kTargets);
+  // Each slot's resource id once per draw (a 24-byte FNV hash), also for the bindless loop below.
+  std::array<guest::ResourceId,32> texture_ids{};
   for(uint32_t slot=0;slot<32;++slot) if((draw.texture_slots>>slot&1) && (draw.texture_fetch[slot][0]&3)==2) {
-    auto id=TextureResourceId(draw.texture_fetch[slot]);
+    auto id=texture_ids[slot]=TextureResourceId(draw.texture_fetch[slot]);
     // Only the value is read: look it up in place and Hold it, with no shared_ptr copy per slot.
     auto find_held=[&]() -> TextureResource* {
       const auto* found=resources_.FindTexture(id);if(!found) return nullptr;
