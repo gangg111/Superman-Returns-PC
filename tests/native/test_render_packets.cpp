@@ -194,6 +194,41 @@ SR_TEST(batch_draw_payloads_remain_distinct_after_arena_release) {
   first=PassPacket{};
   SR_CHECK_EQ(GetDraw(second)->count,6u);
 }
+SR_TEST(recycled_arena_memory_gives_fresh_packets) {
+  // The pool hands the same memory to the next arena: every packet must start as a new one.
+  DrawPacket* used=nullptr;
+  {
+    DrawPacketArena arena(4);
+    auto owner=arena.Next();
+    used=owner.payload.get();
+    used->count=99;used->registers[0x104]=15;used->constants.vs[7]=1234;used->streams.resize(3);
+    used->textures[2]=std::shared_ptr<const TextureCapture>(std::make_shared<int>(1),nullptr);  // an owner only
+    used->command_serial=5;
+  }
+  DrawPacketArena again(4);
+  auto owner=again.Next();
+  DrawPacket* fresh=owner.payload.get();
+  SR_CHECK(fresh==used);  // the recycled memory, not a new block
+  SR_CHECK_EQ(fresh->count,0u);
+  SR_CHECK_EQ(fresh->registers[0x104],0u);
+  SR_CHECK_EQ(fresh->constants.vs[7],0u);
+  SR_CHECK(fresh->streams.empty());
+  SR_CHECK_EQ(fresh->textures[2].use_count(),0);
+  SR_CHECK_EQ(fresh->command_serial,0u);
+}
+SR_TEST(a_packet_outlives_its_arena_and_lets_its_texture_go_with_it) {
+  std::weak_ptr<int> texture;  // stands for the texture capture's lifetime
+  DrawPacketOwner kept;
+  {
+    DrawPacketArena arena(2);
+    kept=arena.Next();
+    auto capture=std::make_shared<int>(1);texture=capture;
+    kept.payload->textures[0]=std::shared_ptr<const TextureCapture>(std::move(capture),nullptr);
+  }
+  SR_CHECK(!texture.expired());  // the arena is gone, the packet and its texture are not
+  kept={};
+  SR_CHECK(texture.expired());   // the last alias let the packets (and the texture) go at once
+}
 SR_TEST(pm4_dependency_capture_preserves_caller_state_between_commands) {
   WorkBatch batch;
   // Type0 writes to VS c0.x, then PS c0.x in a later command.

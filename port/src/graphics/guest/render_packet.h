@@ -130,26 +130,33 @@ struct DrawPacketOwner {
 // One allocation for a batch's payloads instead of one large allocation per
 // draw. Each alias keeps the block alive after replay recycles the WorkBatch.
 // Next hands each freshly initialized element out at most once.
+// The memory is recycled: a batch's packets are ~22 KB each and a city frame has
+// ~2,700, so a fresh block per batch cost ~60 MB of new pages a frame (14.5 ms for
+// 3,008 draws on the PC benchmark, 18-21 ms a frame on the phone). When the last
+// alias goes the packets are destroyed at once (their captures and textures are
+// let go as before) and the bare memory returns to a pool; the next arena
+// constructs fresh packets in it, the same initial state as a new block.
 class DrawPacketArena {
 public:
-  explicit DrawPacketArena(size_t count,bool replay_storage=false) {
-    if(!replay_storage) packets_=std::make_shared<std::vector<DrawPacket>>(count);
-    else {
-      packets_=std::make_shared<std::vector<DrawPacket>>();
-      packets_->reserve(count);
-      for(size_t i=0;i<count;++i) packets_->emplace_back(DrawPacket::ReplayStorageTag{});
-    }
-  }
+  explicit DrawPacketArena(size_t count,bool replay_storage=false);
   DrawPacketArena(const DrawPacketArena&)=delete;
   DrawPacketArena& operator=(const DrawPacketArena&)=delete;
   DrawPacketArena(DrawPacketArena&&)=delete;
   DrawPacketArena& operator=(DrawPacketArena&&)=delete;
   DrawPacketOwner Next() {
-    if(next_>=packets_->size()) throw std::out_of_range("Draw packet arena exhausted");
-    return std::shared_ptr<DrawPacket>(packets_,&(*packets_)[next_++]);
+    if(next_>=block_->count) throw std::out_of_range("Draw packet arena exhausted");
+    return std::shared_ptr<DrawPacket>(block_,block_->packets+next_++);
   }
+  struct Block {
+    DrawPacket* packets=nullptr;
+    size_t count=0,capacity=0;  // constructed packets, room in the memory
+    Block()=default;
+    Block(const Block&)=delete;
+    Block& operator=(const Block&)=delete;
+    ~Block();  // destroys the packets, returns the memory to the pool
+  };
 private:
-  std::shared_ptr<std::vector<DrawPacket>> packets_;
+  std::shared_ptr<Block> block_;
   size_t next_=0;
 };
 using RenderPacket = std::variant<DrawPacketOwner, ClearPacket, ResolvePacket,

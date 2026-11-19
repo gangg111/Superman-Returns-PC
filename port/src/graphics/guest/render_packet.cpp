@@ -10,8 +10,68 @@
 #include <chrono>
 #include <cstring>
 #include <exception>
+#include <memory>
+#include <mutex>
+#include <new>
 #include <stdexcept>
 namespace superman_returns::graphics::guest {
+namespace {
+// Bare packet memory between arenas. A few blocks are in flight at once (the
+// batches of a frame or two still being recorded); idle memory past kKeepBytes is
+// freed so a peak does not stay allocated (a city frame's block is ~60 MB).
+class PacketMemoryPool {
+public:
+  static PacketMemoryPool& Get() {static auto* pool=new PacketMemoryPool;return *pool;}  // outlives every block
+  DrawPacket* Take(size_t count,size_t& capacity) {
+    {
+      std::lock_guard lock(mutex_);
+      // The smallest block that fits, so the large ones stay for the large batches.
+      auto best=free_.end();
+      for(auto it=free_.begin();it!=free_.end();++it)
+        if(it->capacity>=count && (best==free_.end() || it->capacity<best->capacity)) best=it;
+      if(best!=free_.end()) {
+        auto* packets=best->packets;capacity=best->capacity;free_.erase(best);
+        idle_bytes_-=capacity*sizeof(DrawPacket);
+        return packets;
+      }
+    }
+    capacity=(std::max<size_t>(count,1)+kRound-1)/kRound*kRound;
+    return static_cast<DrawPacket*>(::operator new(capacity*sizeof(DrawPacket),std::align_val_t{alignof(DrawPacket)}));
+  }
+  void Give(DrawPacket* packets,size_t capacity) {
+    {
+      std::lock_guard lock(mutex_);
+      if(idle_bytes_+capacity*sizeof(DrawPacket)<=kKeepBytes) {
+        free_.push_back({packets,capacity});
+        idle_bytes_+=capacity*sizeof(DrawPacket);
+        return;
+      }
+    }
+    ::operator delete(packets,std::align_val_t{alignof(DrawPacket)});
+  }
+private:
+  static constexpr size_t kKeepBytes=size_t(256)<<20, kRound=256;  // packets: a block fits batches a little larger
+  size_t idle_bytes_=0;
+  struct Free {DrawPacket* packets;size_t capacity;};
+  std::mutex mutex_;
+  std::vector<Free> free_;
+};
+}  // namespace
+
+DrawPacketArena::DrawPacketArena(size_t count,bool replay_storage) : block_(std::make_shared<Block>()) {
+  block_->packets=PacketMemoryPool::Get().Take(count,block_->capacity);
+  // count stays the number constructed so far: a throwing constructor leaves the rest unconstructed.
+  for(size_t i=0;i<count;++i,++block_->count) {
+    if(replay_storage) std::construct_at(block_->packets+i,DrawPacket::ReplayStorageTag{});
+    else std::construct_at(block_->packets+i);
+  }
+}
+
+DrawPacketArena::Block::~Block() {
+  if(!packets) return;
+  std::destroy_n(packets,count);
+  PacketMemoryPool::Get().Give(packets,capacity);
+}
 namespace {
 bool DecodeCapturedPacket(const WorkBatch&, const WorkCmd&,
                           const native::Pm4Mirror&, const CapturedMemory&,
