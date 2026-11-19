@@ -71,6 +71,7 @@ set(SUPERMANRETURNS_SOURCES
     src/graphics/backend_selection.cpp
     src/sr_preset.cpp
     src/skip_intro.cpp
+    src/net_wait.cpp
     src/flight_tuning.cpp
     src/daynight.cpp
     src/prop_streaming.cpp
