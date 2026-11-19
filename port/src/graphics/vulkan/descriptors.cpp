@@ -5,8 +5,11 @@
 namespace superman_returns::graphics::vulkan {
 guest::ResourceId TextureResourceId(std::span<const uint32_t,6> words) {
   // IDs identify immutable fetch views, not an API's global descriptor index.
+  // A word at a time with a final mix (the byte-wise FNV-1a took 24 multiplies per texture, 1.2% of the
+  // replay threads in the Fold7 city profile). IDs live only in this process's resource maps.
   uint64_t hash=14695981039346656037ull;
-  for(auto word:words) for(uint32_t b=0;b<4;++b) {hash^=(word>>(b*8))&255;hash*=1099511628211ull;}
+  for(auto word:words) {hash=(hash^word)*0x100000001b3ull;hash^=hash>>29;}
+  hash^=hash>>32;hash*=0xbf58476d1ce4e5b9ull;hash^=hash>>31;
   return hash&~InlineBufferBase;
 }
 bool RemapTextureBindings(std::span<const TextureBindingRequest> requests,DrawBindings& out,Error& error) {

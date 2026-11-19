@@ -184,14 +184,21 @@ static_assert(RegistersMatchShadow(), "DrawRegisters must keep the device shadow
 void DeviceState(DrawPacket &d, uint32_t device,
                  const native::Pm4Mirror &mirror) {
   const auto &layout = native::profile::kDevice;
-  for (const auto &range : native::profile::kRegisterShadow) {
+  // The shadow ranges are DrawRegisters' ranges in the same order (RegistersMatchShadow), so each range
+  // is one big-endian block copied into its words in one loop.
+  for (size_t r = 0; r < std::size(native::profile::kRegisterShadow); ++r) {
+    const auto &range = native::profile::kRegisterShadow[r];
     const auto address=Address(device,range.offset);
     const auto bytes=d.memory.ReadUnambiguous(address,range.count*4);
-    for (uint32_t i = 0; i < range.count; ++i) {
-      uint32_t reg = range.first + i;
-      if (reg >= 0x2000 && reg < 0x2400)
-        d.registers[reg - 0x2000] =
-            bytes.empty()?U32(d.memory, Address(address,uint64_t(i)*4)):CapturedWord(bytes,i*4);
+    uint32_t* words = d.registers.RangeWords(r);
+    if (bytes.size() >= size_t(range.count) * 4) {
+      for (uint32_t i = 0; i < range.count; ++i) {
+        uint32_t w;
+        std::memcpy(&w, bytes.data() + size_t(i) * 4, 4);
+        words[i] = __builtin_bswap32(w);
+      }
+    } else {
+      for (uint32_t i = 0; i < range.count; ++i) words[i] = U32(d.memory, Address(address,uint64_t(i)*4));
     }
   }
   uint32_t a = Address(device, layout.viewport);

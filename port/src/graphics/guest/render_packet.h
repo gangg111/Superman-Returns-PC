@@ -70,6 +70,9 @@ public:
     return words_[slot];
   }
   static constexpr bool Kept(uint32_t index) { return index < kSize && kSlots[index] != kNone; }
+  // The words of kRanges[range], in register order: the ranges are stored one after another, so a range
+  // is filled in one pass (DeviceState) instead of a slot lookup per register.
+  uint32_t* RangeWords(size_t range) { return words_.data() + kSlots[kRanges[range].first]; }
   bool operator==(const DrawRegisters& other) const { return words_ == other.words_; }
 private:
   static constexpr uint8_t kNone = 0xff;
