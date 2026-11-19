@@ -396,7 +396,7 @@ void D3D12NativeGraphicsSystem::WriteMmioRegister(uint32_t addr, uint32_t value)
     if (logged++ < 40) REXLOG_INFO("native gpu trace: mmio write {:04X} = {:08X}", r, value);
   }
   if (r < kRegisterCount) registers_[r].store(value);
-  cp_wake_->Set();  // a WAIT_REG_MEM on this register may now pass
+  if (cp_waiting_.load()) cp_wake_->Set();  // a WAIT_REG_MEM on this register may now pass
   if (r == 0x01C5) {  // CP_RB_WPTR: the guest kicked the ring
     static int logged = 0;
     if (logged < 3) {
@@ -750,6 +750,7 @@ bool D3D12NativeGraphicsSystem::ExecuteType3(Reader& reader, uint32_t packet) {
       bool is_memory = (info & 0x10) != 0;
       auto start = std::chrono::steady_clock::now();
       bool reported = false;
+      if (!is_memory) cp_waiting_.store(true);  // before the first read: see cp_waiting_
       for (;;) {
         uint32_t value;
         if (is_memory) {
@@ -777,6 +778,7 @@ bool D3D12NativeGraphicsSystem::ExecuteType3(Reader& reader, uint32_t packet) {
         }
         rex::thread::SyncMemory();
       }
+      if (!is_memory) cp_waiting_.store(false);
       return finish();
     }
     case xenos::PM4_REG_RMW: {

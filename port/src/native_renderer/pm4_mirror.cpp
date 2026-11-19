@@ -115,6 +115,7 @@ void Pm4Mirror::WriteRange(uint32_t first,const uint8_t* words,uint32_t count) {
   // comparison can vectorize instead of branching on every register.
   if(first>=kAluConstantBase && first<kAluConstantBase+0x800 &&
      count<=kAluConstantBase+0x800-first) {
+    if(skip_alu_constants) return;
     while(count) {
       const bool pixel=first>=kAluConstantBase+0x400;
       const uint32_t end=kAluConstantBase+(pixel?0x800:0x400);

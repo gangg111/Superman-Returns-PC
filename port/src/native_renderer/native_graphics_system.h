@@ -132,6 +132,11 @@ class D3D12NativeGraphicsSystem : public INativeGraphicsSystem {
   // Wakes the PM4 consumer while it waits in WAIT_REG_MEM on a register
   // (vblank, MMIO register writes) instead of spinning.
   std::unique_ptr<rex::thread::Event> cp_wake_;
+  // A register WAIT_REG_MEM is waiting on cp_wake_: MMIO writes signal it only then. Setting the
+  // event (mutex + broadcast, a futex syscall) on every guest register write was ~3% of the game's
+  // render thread on the Fold7. Both sides are seq_cst: the waiter sets it before reading the
+  // register, the writer reads it after storing the register, so one of them sees the other.
+  std::atomic<bool> cp_waiting_{false};
  public:
   void SignalGpuProgress() override;
   uint64_t progress_generation() const override { return progress_generation_.load(); }

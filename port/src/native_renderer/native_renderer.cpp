@@ -9757,6 +9757,9 @@ void Renderer::EndCmd(uint8_t* base) {
   DetailScope scope(capture_timings.fe_end_ns);
   if(worker_stop_) return;
   checked_guest_reads.Reset();
+  // The game thread reads no float constant from its mirror (only SR_NATIVE_PM4_AUDIT compares them).
+  static const bool keep_alu=[] {const char* v=std::getenv("SR_NATIVE_PM4_AUDIT");return v && *v && *v!='0';}();
+  capture_mirror_.skip_alu_constants=!keep_alu;
   const auto capture_copies_before=capture_mirror_.copy_draws;
   if (cur_.packet_check && cur_.ring_bytes) {
     const auto started=std::chrono::steady_clock::now();

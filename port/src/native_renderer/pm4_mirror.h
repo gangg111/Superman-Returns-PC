@@ -80,6 +80,11 @@ public:
   uint64_t copy_draws = 0;
   // Bumped when VS / PS float constant contents change (buffer reuse).
   uint64_t vs_version = 1, ps_version = 1;
+  // Bulk ALU constant writes (0x4000-0x47FF) are not stored: for a mirror whose owner never reads
+  // the float constants (the game thread's capture mirror only needs fetch constants, copy state and
+  // the memory a packet references, which the scan still captures). Their copy was most of the
+  // game thread's PM4 scan (Fold7 city, 2026-11-19).
+  bool skip_alu_constants = false;
   uint64_t indirect_dwords = 0;
 
 private:
