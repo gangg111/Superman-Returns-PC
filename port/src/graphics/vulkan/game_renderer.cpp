@@ -25,6 +25,7 @@ std::string Surface(const guest::SurfaceDesc& d) {
   std::ostringstream s;s<<"e"<<d.geometry.edram_base<<"/f"<<d.geometry.format<<"/"<<d.geometry.width<<"x"<<d.geometry.height<<(d.depth?"D":"");return s.str();
 }
 constexpr guest::ResourceId MissingVertex=UINT64_MAX-4;
+constexpr guest::ResourceId QuadIndexBuffer=UINT64_MAX-5;
 bool Fail(Error& e,const char* message) {e={"Game renderer",VK_ERROR_INITIALIZATION_FAILED,message};return false;}
 }
 bool GameRenderer::Initialize(const std::filesystem::path& path,Error& e) {return descriptors_.Initialize(e) && pipelines_.Initialize(descriptors_.Layouts(),path,e);}
@@ -172,29 +173,46 @@ bool GameRenderer::Record(const guest::RenderPacket& packet,VkCommandBuffer comm
     return Fail(e,"Resolve/presentation consumer is not integrated yet");
   } catch(const std::exception& ex) {e={"Game render packet",VK_ERROR_INITIALIZATION_FAILED,ex.what()};++stats_.failed;return false;}
 }
+bool GameRenderer::QuadIndices(uint32_t quads,Error& e) {
+  if(quad_indices_ && quads<=quad_capacity_) return true;
+  // Grows by doubling; the old buffer stays alive through the submissions that hold it.
+  uint32_t capacity=std::max<uint32_t>({quads,quad_capacity_*2,4096});
+  std::vector<uint32_t> indices(size_t(capacity)*6);
+  for(uint32_t q=0;q<capacity;++q) {uint32_t b=q*4;uint32_t* i=indices.data()+size_t(q)*6;i[0]=b;i[1]=b+1;i[2]=b+2;i[3]=b;i[4]=b+2;i[5]=b+3;}
+  if(!resources_.UploadHostBuffer(QuadIndexBuffer,std::as_bytes(std::span(indices)),1,e)) return false;
+  quad_indices_=resources_.Buffer(QuadIndexBuffer,e);resources_.ForgetBuffer(QuadIndexBuffer);
+  if(!quad_indices_) return false;
+  quad_capacity_=capacity;return true;
+}
 bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Error& e) {
+  // The geometry recorded: the packet's own, or (mobile renderer plan, E3) without a copy of the packet:
+  // a non-indexed quad list through the shared quad index buffer at a vertex offset, rectangles expanded
+  // into a reused scratch vector. Both are triangle lists to the pipeline (PlanGamePipeline).
+  bool indexed=draw.indexed,quad_list=false;uint32_t count=draw.count,first=draw.first;int32_t base_vertex=draw.base_vertex;
+  std::span<const uint8_t> inline_data(draw.inline_data);
   if(draw.primitive==guest::Primitive::kRectangles && draw.inline_vertices) {
-    guest::DrawPacket expanded=draw;std::string error;
-    if(!guest::ExpandRectangles(std::as_bytes(std::span(draw.inline_data)),draw.count,draw.inline_stride,draw.attributes,expanded.inline_data,error)) {e={"Rectangle expansion",VK_ERROR_INITIALIZATION_FAILED,error};return false;}
-    expanded.primitive=guest::Primitive::kTriangles;expanded.count=uint32_t(expanded.inline_data.size()/draw.inline_stride);expanded.first=0;return Draw(expanded,command,e);
+    std::string error;
+    if(!guest::ExpandRectangles(std::as_bytes(std::span(draw.inline_data)),draw.count,draw.inline_stride,draw.attributes,rect_scratch_,error)) {e={"Rectangle expansion",VK_ERROR_INITIALIZATION_FAILED,error};return false;}
+    inline_data=rect_scratch_;count=uint32_t(rect_scratch_.size()/draw.inline_stride);first=0;
   }
   if(draw.primitive==guest::Primitive::kQuads && !draw.indexed) {
-    guest::DrawPacket expanded=draw;uint64_t end=uint64_t(draw.first)+draw.count;
-    if(end>UINT32_MAX || draw.count>16*1024*1024) return Fail(e,"Quad expansion range invalid");
-    for(uint32_t q=0;q<draw.count/4;++q) {uint32_t b=draw.first+q*4;expanded.expanded_indices.insert(expanded.expanded_indices.end(),{b,b+1,b+2,b,b+2,b+3});}
-    expanded.primitive=guest::Primitive::kTriangles;expanded.indexed=true;expanded.first=0;expanded.count=uint32_t(expanded.expanded_indices.size());return Draw(expanded,command,e);
+    uint64_t end=uint64_t(draw.first)+draw.count;
+    if(end>UINT32_MAX || draw.first>uint32_t(INT32_MAX) || draw.count>16*1024*1024) return Fail(e,"Quad expansion range invalid");
+    // Index q*4+k at vertex offset `first` is the vertex first+q*4+k, as the per-draw expansion wrote it.
+    indexed=true;quad_list=true;count=draw.count/4*6;base_vertex=int32_t(draw.first);first=0;
   }
   Lap lap(profiling_,profile_);if(profiling_) ++profile_.draws;
   // Consume cache updates even while shaders compile. Later action0/partial
   // packets depend on the first owned version and cannot read guest memory.
   // Single-use geometry is written into mapped transient memory: no copy.
-  if(draw.inline_vertices) {auto id=InlineBufferBase|draw.command_serial;if(!resources_.UploadTransient(id,std::as_bytes(std::span(draw.inline_data)),0,e)) return false;transient_buffers_[serial_].push_back(id);}
+  if(draw.inline_vertices) {auto id=InlineBufferBase|draw.command_serial;if(!resources_.UploadTransient(id,std::as_bytes(inline_data),0,e)) return false;transient_buffers_[serial_].push_back(id);}
   else for(auto& stream:draw.streams) if(!Upload(stream.update,false,draw.command_serial,e)) return false;
   if(draw.indexed && draw.indices.plan.key && !Upload(draw.indices,true,draw.command_serial,e)) return false;
   if(draw.indexed && !draw.indices.plan.key && draw.expanded_indices.empty() && draw.count) return Fail(e,"Indexed draw has no captured indices");
   auto index_id=draw.indices.plan.key;
   if(!draw.expanded_indices.empty()) {index_id=ExpandedIndexBufferBase|draw.command_serial;if(!resources_.UploadTransient(index_id,std::as_bytes(std::span(draw.expanded_indices)),0,e)) return false;transient_buffers_[serial_].push_back(index_id);}
-  if(!draw.count) {e={};return true;}
+  if(quad_list && count && !QuadIndices(count/6,e)) return false;
+  if(!count) {e={};return true;}
   if(!draw.vertex_shader || !shaders_) return Fail(e,"Captured vertex shader/lookup absent");
   shaders::ShaderResult vs_scratch,ps_scratch;
   static const shaders::ShaderResult kNoPixelShader{shaders::ShaderPoll::ready,{},{}};
@@ -279,7 +297,7 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
   if(draw.inline_vertices) {auto* b=held_buffer(InlineBufferBase|draw.command_serial);if(!b) return false;vertices[vertex_count++]={0,b->handle,b->offset};}
   else for(auto& stream:draw.streams) {auto* b=held_buffer(stream.update.plan.key);if(!b || stream.offset>b->size) return Fail(e,"Vertex stream offset exceeds buffer");vertices[vertex_count++]={stream.stream,b->handle,b->offset+stream.offset};}
   auto* missing=held_buffer(MissingVertex);if(!missing) return false;vertices[vertex_count++]={31,missing->handle,missing->offset};
-  const BufferResource* indices=nullptr;if(draw.indexed) {indices=held_buffer(index_id);if(!indices || uint64_t(draw.first+uint64_t(draw.count))*4>indices->size) {e={"Index draw",VK_ERROR_INITIALIZATION_FAILED,"Draw exceeds captured buffer: first="+std::to_string(draw.first)+", count="+std::to_string(draw.count)+", bytes="+std::to_string(indices?indices->size:0)+", plan="+std::to_string(draw.indices.plan.size)+", format="+std::to_string(draw.indices.plan.format)+", action="+std::to_string(draw.indices.plan.action)+", serial="+std::to_string(draw.command_serial)};return false;}}
+  const BufferResource* indices=nullptr;if(indexed) {if(quad_list) {resources_.Hold(quad_indices_);indices=quad_indices_.get();} else indices=held_buffer(index_id);if(!indices || uint64_t(first+uint64_t(count))*4>indices->size) {e={"Index draw",VK_ERROR_INITIALIZATION_FAILED,"Draw exceeds captured buffer: first="+std::to_string(first)+", count="+std::to_string(count)+", bytes="+std::to_string(indices?indices->size:0)+", plan="+std::to_string(draw.indices.plan.size)+", format="+std::to_string(draw.indices.plan.format)+", action="+std::to_string(draw.indices.plan.action)+", serial="+std::to_string(draw.command_serial)};return false;}}
   VkViewport viewport{draw.viewport.x,draw.viewport.y,draw.viewport.width,draw.viewport.height,draw.viewport.min_depth,draw.viewport.max_depth};
   if(viewport.width<=0 || viewport.height<=0) viewport={0,0,float(pass->extent.width),float(pass->extent.height),0,1};
   auto x0=std::clamp(draw.scissor.left,0,int32_t(pass->extent.width)),y0=std::clamp(draw.scissor.top,0,int32_t(pass->extent.height));
@@ -313,10 +331,10 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
   if(shadow_.SetBlend(blend)) c_.f.vkCmdSetBlendConstants(command,blend);
   const uint32_t stencil=draw.registers[0x10d]&255;
   if(shadow_.SetStencil(stencil)) c_.f.vkCmdSetStencilReference(command,VK_STENCIL_FACE_FRONT_AND_BACK,stencil);
-  if(draw.indexed) {
+  if(indexed) {
     if(shadow_.SetIndexBuffer(indices->handle,indices->offset,VK_INDEX_TYPE_UINT32)) c_.f.vkCmdBindIndexBuffer(command,indices->handle,indices->offset,VK_INDEX_TYPE_UINT32);
-    c_.f.vkCmdDrawIndexed(command,draw.count,1,draw.first,draw.base_vertex,0);
-  } else c_.f.vkCmdDraw(command,draw.count,1,draw.first,0);
+    c_.f.vkCmdDrawIndexed(command,count,1,first,base_vertex,0);
+  } else c_.f.vkCmdDraw(command,count,1,first,0);
   if(!merge_passes_) ClosePass();
   targets_.MarkWritten(*pass);++stats_.draws;lap(RecordProfile::kCommands);e={};return true;
 }

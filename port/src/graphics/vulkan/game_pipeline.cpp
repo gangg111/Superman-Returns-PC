@@ -93,6 +93,12 @@ bool PlanGamePipeline(const guest::DrawPacket& draw,const TargetPass& pass,const
   case guest::Primitive::kLineStrip:out.topology=VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;break;
   case guest::Primitive::kTriangles:out.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;break;
   case guest::Primitive::kTriangleStrip:out.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;break;
+  // GameRenderer::Draw records both as triangle lists: quads through the shared quad index buffer, inline
+  // rectangles expanded on the CPU (ExpandRectangles).
+  case guest::Primitive::kQuads:out.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;break;
+  case guest::Primitive::kRectangles:
+    if(!draw.inline_vertices) return Fail(e,"Rectangles without inline vertices have no expansion");
+    out.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;break;
   default:return Fail(e,"Primitive requires guest expansion before pipeline creation");
   }
   uint32_t blend=draw.registers[0x201],mode=draw.registers[0x205],depth=draw.registers[0x200],mask=draw.registers[0x104],stencil=draw.registers[0x10d];

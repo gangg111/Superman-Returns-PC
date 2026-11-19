@@ -54,6 +54,9 @@ private:
   bool DumpImageNow(VkCommandBuffer,const std::string& name,VkImage,VkFormat,VkExtent3D,VkImageAspectFlags,bool target,Error&);
   bool dumping_=false;uint64_t dump_packet_=0;std::vector<std::string> dump_log_;std::vector<DumpImage> dump_images_;
   bool Upload(const guest::BufferUpdate&,bool indices,uint64_t version,Error&);
+  // The shared index buffer of non-indexed quad lists (0,1,2,0,2,3, then +4 per quad), drawn at the quad list's
+  // first vertex as the vertex offset; grown to at least `quads` quads.
+  bool QuadIndices(uint32_t quads,Error&);
   // A capture's final (ready or failed) shader result, by reference: the lookup copied a ShaderResult (a
   // shared_ptr and a string) through a std::function twice per draw (mobile renderer plan, E3). Captures
   // are long-lived registry objects; pointer, hash and size must match, as in GameFrame's MemoizeFinal.
@@ -89,6 +92,9 @@ private:
   // SR_VULKAN_CHECK_ALIASES=1 (read once, at construction): plan aliases on every draw, even on an open pass.
   bool check_aliases_=AliasCheckEnabled();
   std::atomic<VkCommandBuffer> recording_{VK_NULL_HANDLE};
+  // Declared after resources_, so released before the store that made it.
+  std::shared_ptr<BufferResource> quad_indices_;uint32_t quad_capacity_=0;
+  std::vector<uint8_t> rect_scratch_;  // expanded rectangle vertices, reused across draws
   bool profiling_=false;RecordProfile profile_;
   // Adds the time since the previous lap to a phase, in nanoseconds (a lap per phase per draw would lose ~0.5 us
   // each to truncation); free when profiling is off.
