@@ -270,7 +270,14 @@ class Renderer : public NativeFrontend {
     uint32_t watch_seq = 0, checked_seq = 0;  // physical write watch
     bool watched = false;
     BufferContent content;
+    // Volatile: written in kVolatileFrames frames in a row, so watching it only cost a fault, an
+    // mprotect and a hash a frame. It is then copied at every use (no watch) until the next
+    // re-check, kVolatileRecheckFrames later.
+    uint64_t written_frame = 0, volatile_until = 0;
+    uint32_t written_streak = 0;
   };
+  static constexpr uint32_t kVolatileFrames = 4;
+  static constexpr uint64_t kVolatileRecheckFrames = 256;
   static constexpr uint32_t kHashedBufferMax = 32 * 1024;
   uint64_t front_frame_ = 0;  // guest swaps seen by the front end
   // Node-based: TrackedBuffer pointers stay valid (page index below).

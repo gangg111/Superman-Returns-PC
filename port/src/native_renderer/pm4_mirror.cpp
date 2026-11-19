@@ -141,6 +141,22 @@ void Pm4Mirror::WriteRange(uint32_t first,const uint8_t* words,uint32_t count) {
           check_regs[k]=v;
         }
       }
+#if defined(__aarch64__)
+      // ARM64 (Android): the same four-at-a-time swap, compare and store in NEON. Each draw rewrites
+      // ~1000 constant registers, so the scalar loop was 6% of the game's render thread and 10% of
+      // the worker on the Fold7 (2026-11-19). Marks exactly what the scalar loop marks;
+      // SR_PM4_NEON=0 keeps the scalar loop.
+      static const bool neon=[]{const char* e=std::getenv("SR_PM4_NEON");return !(e&&*e=='0');}();
+      for(;neon&&i+4<=length;i+=4) {
+        const uint32x4_t value=vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(words+i*4)));
+        const uint32x4_t same=vceqq_u32(value,vld1q_u32(destination+i));
+        if(vminvq_u32(same)==~0u) continue;
+        vst1q_u32(destination+i,value);
+        uint32_t lanes[4];vst1q_u32(lanes,same);
+        for(uint32_t lane=0;lane<4;++lane)
+          if(!lanes[lane]) {++changes;MarkDirty(first-kAluConstantBase+uint32_t(i)+lane);}
+      }
+#endif
       for(;!scalar&&i+4<=length;i+=4) {
         const __m128i value=_mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(words+i*4)),swap);
         const __m128i old=_mm_loadu_si128(reinterpret_cast<const __m128i*>(destination+i));

@@ -7654,6 +7654,28 @@ const Renderer::BufferEntry* Renderer::ApplyBuffer(uint8_t* base, const BufferPl
 bool Renderer::RefreshTrackedBuffer(TrackedBuffer& t) {
   DetailScope refresh_scope(capture_timings.fb_refresh_ns);
   if (graphics::FrameTimeline::Detail()) ++stream_plan_counters.refresh_calls;
+  // A buffer the game rewrites every frame (particles, the cape, the UI) went round a write fault,
+  // an mprotect to re-arm and a hash at each use: on the Fold7 in the city mprotect and the fault's
+  // syscall took 11% of the game's render thread (2026-11-19). Such a buffer is copied at every use
+  // instead, unwatched (dirty at each draw keeps writes between two draws of a frame), and watched
+  // again after kVolatileRecheckFrames in case it settled. SR_NATIVE_VOLATILE_BUFFERS=0: off.
+  static const bool volatile_buffers=[] {const char* v=std::getenv("SR_NATIVE_VOLATILE_BUFFERS");return !v || *v!='0';}();
+  if (volatile_buffers && t.volatile_until) {
+    if (front_frame_ < t.volatile_until) {
+      t.dirty = true;
+      t.clean.clear();
+      return true;
+    }
+    t.volatile_until = 0;
+    t.written_streak = 0;
+    if (texture_watch_ && t.watched) {
+      t.watch_seq = ArmTextureWatch(t.address, t.size);
+      t.checked_seq = write_seq_.load(std::memory_order_acquire);
+    }
+    t.dirty = true;
+    t.clean.clear();
+    return true;
+  }
   bool page_written = false;
   const bool every_use=t.size<=kHashedBufferMax && SmallBufferHashEveryUse();
   if (texture_watch_ && t.watched && !every_use) {
@@ -7661,9 +7683,20 @@ bool Renderer::RefreshTrackedBuffer(TrackedBuffer& t) {
     if (global != t.checked_seq) {
       t.checked_seq = global;
       if (TextureWrittenSince(t.address, t.size, t.watch_seq)) {
+        page_written = true;
+        if (t.written_frame != front_frame_) {
+          t.written_streak = t.written_frame + 1 == front_frame_ ? t.written_streak + 1 : 1;
+          t.written_frame = front_frame_;
+        }
+        if (volatile_buffers && t.written_streak >= kVolatileFrames) {
+          // Left unarmed: the write fault already lifted the protection.
+          t.volatile_until = front_frame_ + kVolatileRecheckFrames;
+          t.dirty = true;
+          t.clean.clear();
+          return true;
+        }
         // Arm before reading so a later physical write remains observable.
         t.watch_seq = ArmTextureWatch(t.address, t.size);
-        page_written = true;
       }
     }
   }
