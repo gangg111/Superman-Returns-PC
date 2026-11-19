@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <map>
+#include <unordered_map>
 #include <vector>
 #include <array>
 #include <string>
@@ -24,6 +25,16 @@ struct CapturedTextureEntry {
   std::string failure;
 };
 
+// Texture fetch constant words as a key. The ordered map's six-word compares down the tree were
+// 1.2% of the game's render thread in the city (Fold7, 2026-11-19); the order is never used.
+struct FetchConstantHash {
+  size_t operator()(const std::array<uint32_t,6>& fetch) const {
+    uint64_t h=0x9e3779b97f4a7c15ull;
+    for(uint32_t word:fetch) h=(h^word)*0xff51afd7ed558ccdull;
+    return size_t(h^(h>>32));
+  }
+};
+
 struct RingConstants {
   bool pixel;
   uint32_t start, count, ring_ptr;
@@ -39,7 +50,8 @@ struct NativeFrontend {
   Pm4Mirror capture_mirror_;
   uint64_t capture_serial_ = 0;
   bool capture_tiling_active_ = false;
-  std::map<std::array<uint32_t,6>, CapturedTextureEntry> captured_textures_;
+  // Node-based: entry addresses stay valid while others are inserted (texture_slot_lookups_).
+  std::unordered_map<std::array<uint32_t,6>, CapturedTextureEntry, FetchConstantHash> captured_textures_;
   struct TextureSlotLookup {
     std::array<uint32_t,6> fetch{};
     CapturedTextureEntry* entry=nullptr;
@@ -51,7 +63,7 @@ struct NativeFrontend {
       lookup.entry=&captured_textures_[fetch];lookup.fetch=fetch;
     }
     // Cache only the map lookup: callers still validate writes/content on every
-    // use. std::map keeps node addresses stable while new entries are inserted.
+    // use. The node-based map keeps entry addresses stable while new entries are inserted.
     return *lookup.entry;
   }
   void InvalidateTextureSlotLookups() {

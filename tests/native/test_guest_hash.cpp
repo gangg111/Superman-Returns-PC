@@ -39,6 +39,29 @@ SR_TEST(buffer_content_every_use_detects_unnotified_changes_in_the_same_frame) {
   // Original mode still uses the once-per-frame fast path after a full check.
   SR_CHECK(!content.Refresh(12,false,hash));SR_CHECK_EQ(hashes,4u);
 }
+SR_TEST(buffer_content_backoff_spaces_checks_of_an_unchanged_buffer_and_resets_on_change) {
+  superman_returns::native::BufferContent content;
+  uint64_t bytes=5;std::vector<uint64_t> checked;uint64_t now=0;
+  auto hash=[&] {checked.push_back(now);return bytes;};
+  for(now=10;now<=40;++now) content.Refresh(now,false,hash,false,2);
+  // Checks at 10 (new), 11 (1 frame), 13 (2 frames), then every 4: 17, 21 ... 37.
+  SR_CHECK_EQ(checked.size(),size_t(9));
+  SR_CHECK_EQ(checked[0],uint64_t(10));SR_CHECK_EQ(checked[1],uint64_t(11));
+  SR_CHECK_EQ(checked[2],uint64_t(13));SR_CHECK_EQ(checked[3],uint64_t(17));
+  SR_CHECK_EQ(checked[8],uint64_t(37));
+  // A page write is checked at once, and the next frame is checked again.
+  bytes=6;checked.clear();now=38;
+  SR_CHECK(content.Refresh(now,true,hash,false,2));SR_CHECK_EQ(checked.size(),size_t(1));
+  now=39;SR_CHECK(!content.Refresh(now,false,hash,false,2));SR_CHECK_EQ(checked.size(),size_t(2));
+  // An unnotified change (virtual alias) is found at the next scheduled check, never lost.
+  bytes=7;bool found=false;
+  for(now=40;now<60 && !found;++now) found=content.Refresh(now,false,hash,false,2);
+  SR_CHECK(found);SR_CHECK(now-1<=39+4);
+  // max_backoff_log2 0 is the old once-a-frame check.
+  superman_returns::native::BufferContent every;checked.clear();
+  for(now=1;now<=5;++now) every.Refresh(now,false,hash);
+  SR_CHECK_EQ(checked.size(),size_t(5));
+}
 SR_TEST(guest_hash_in_place_matches_hashing_a_copy) {
   for (uint32_t size : {1u, 7u, 4096u, 100003u}) {
     std::vector<uint8_t> bytes(size);

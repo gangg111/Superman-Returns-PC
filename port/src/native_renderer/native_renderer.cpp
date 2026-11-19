@@ -666,6 +666,16 @@ bool TextureWatchScanCaching() {
   }();
   return enabled;
 }
+// SR_NATIVE_BUFFER_BACKOFF: the longest recheck interval (log2 frames) of a watched small buffer
+// found unchanged (buffer_content.h); 0 = every frame, the old behavior. Default 4 (16 frames).
+uint32_t SmallBufferBackoffLog2() {
+  static const uint32_t value=[] {
+    const char* v=std::getenv("SR_NATIVE_BUFFER_BACKOFF");
+    if(!v || !*v) return 4u;
+    return std::clamp<uint32_t>(uint32_t(std::atoi(v)),0u,9u);
+  }();
+  return value;
+}
 bool SmallBufferHashEveryUse() {
   static const bool enabled=[] {
     const char* value=std::getenv("SR_NATIVE_SMALL_BUFFER_HASH_EVERY_USE");
@@ -7709,7 +7719,7 @@ bool Renderer::RefreshTrackedBuffer(TrackedBuffer& t) {
       if (graphics::FrameTimeline::Detail()) {++stream_plan_counters.refresh_hashes;stream_plan_counters.refresh_hash_bytes+=t.size;}
       return TextureHash()(
           REX_KERNEL_MEMORY()->TranslatePhysical<const uint8_t*>(t.address & 0x1FFFFFFF), t.size, 0);
-    },every_use);
+    },every_use,texture_watch_ && t.watched ? SmallBufferBackoffLog2() : 0u);
     if (changed) ++stats_.buffer_hash_dirty;
   }
   if (changed) {
