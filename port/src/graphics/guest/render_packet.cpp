@@ -514,6 +514,11 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
                                 true, d.tiling_active, 1);
       if (cmd.device)
         DeviceState(d, cmd.device, mirror);
+      else {
+        // Replay storage starts with these unwritten (DrawPacket(ReplayStorageTag)).
+        d.registers = DrawRegisters{};
+        d.texture_fetch = {};
+      }
       if (cmd.device) {
         const auto &layout = native::profile::kDevice;
         for (uint32_t i = 0; i < 8; ++i) {

@@ -54,6 +54,11 @@ inline constexpr std::array<uint8_t, 0x400> kDrawRegisterSlots = [] {
 }();
 class DrawRegisters {
 public:
+  // Replay storage leaves the words unwritten: DeviceState writes all of them (DecodeCapturedPacket
+  // zeroes them for a draw without a device).
+  struct Unwritten {};
+  DrawRegisters() : words_{} {}
+  explicit DrawRegisters(Unwritten) {}
   using Range = DrawRegisterRange;
   static constexpr const DrawRegisterRange (&kRanges)[7] = kDrawRegisterRanges;
   static constexpr uint32_t kCount = 121;
@@ -77,7 +82,7 @@ public:
 private:
   static constexpr uint8_t kNone = 0xff;
   static constexpr const std::array<uint8_t, kSize>& kSlots = kDrawRegisterSlots;
-  std::array<uint32_t, kCount> words_{};
+  std::array<uint32_t, kCount> words_;
   uint32_t scratch_ = 0;
 };
 // A float constant bank as the replay mirror held it at one version, shared by every draw decoded while
@@ -94,11 +99,15 @@ struct DrawPacket {
   struct ReplayStorageTag {};
   // Keep this user-provided: value-initialization must not add a whole-packet
   // zeroing pass before the individual members initialize themselves.
-  DrawPacket() : vertex_fetch{} {}
+  DrawPacket() : vertex_fetch{}, texture_fetch{} {}
   // Only DecodeCapturedPacket may publish this storage: it fills both float
   // banks, polygon offset registers and the shared metadata suffix before their
-  // first use. Shared prefix/device/vertex/fetch keep normal initialization.
-  explicit DrawPacket(ReplayStorageTag) : constants(ConstantSnapshot::ReplayStorageTag{}) {
+  // first use, and `registers` / `texture_fetch` in full (DeviceState, or zeroes
+  // for a draw without a device): 1.3 KB a packet not written twice, ~20 of the
+  // 50 cache lines the constructor touched (Fold7 city: 5% of the samples, 2026-11-20).
+  // Shared prefix/device/vertex keep normal initialization.
+  explicit DrawPacket(ReplayStorageTag)
+      : constants(ConstantSnapshot::ReplayStorageTag{}), registers(DrawRegisters::Unwritten{}) {
     if (ReplayZeroesVertexFetch()) vertex_fetch.fill({});
   }
   int pass = 0;
@@ -135,7 +144,7 @@ struct DrawPacket {
   // Only PM4 registers 0x2380..0x2383 are consumed by FinalizeDrawConstants.
   // Keep their exact bits; the other 1,020 mirrored registers are not read.
   std::array<uint32_t, 4> polygon_offset_registers{};
-  std::array<std::array<uint32_t, 6>, 32> texture_fetch{};
+  std::array<std::array<uint32_t, 6>, 32> texture_fetch;  // zeroed by DrawPacket(), see the replay constructor
   std::array<SurfaceDesc, 4> colors{};
   SurfaceDesc depth;
   ResourceId shader_a = 0, shader_b = 0;
