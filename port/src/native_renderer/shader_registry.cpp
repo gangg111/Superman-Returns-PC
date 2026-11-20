@@ -92,6 +92,7 @@ std::shared_ptr<graphics::guest::ShaderCapture> NewCapture(uint64_t hash, bool v
   capture->dynamic_vertex_fetch = dynamic_vertex_fetch;
   capture->container = std::move(container);
   capture->texture_slots = graphics::guest::ShaderTextureSlots(capture->container);
+  capture->float_constants = graphics::guest::ShaderFloatConstants(capture->container);
   return capture;
 }
 
