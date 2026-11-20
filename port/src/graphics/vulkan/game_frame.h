@@ -52,5 +52,22 @@ private:
   // SR_VULKAN_PROFILE=1: per-stage averages logged every 120 frames.
   bool profiling_=false;std::chrono::steady_clock::time_point last_swap_{};
   struct {uint64_t frames=0,packets=0,interval_us=0,shaders_us=0,fence_us=0,record_us=0,queue_us=0,tail_us=0;} timing_;
+  // Destroys a recorded frame's packets on its own thread. Freeing ~2,800 packets (their vectors, the
+  // arena blocks, the frozen batches) made scudo hand pages back to the system on the recorder thread:
+  // madvise + munmap were 13-15% of it (Fold7 city, simpleperf, 2026-11-20), and mallopt(M_DECAY_TIME)
+  // does not change Android's fixed release interval. SR_PACKET_REAPER=0 frees on the recorder (A/B).
+  class PacketReaper {
+  public:
+    PacketReaper();
+    ~PacketReaper();  // frees what is still queued
+    // Takes the packets; `packets` comes back empty, with the capacity of an earlier frame's vector.
+    void Release(std::vector<guest::RenderPacket>& packets);
+  private:
+    void Main();
+    bool enabled_=true;std::mutex mutex_;std::condition_variable cv_;bool stop_=false;
+    std::vector<std::vector<guest::RenderPacket>> dead_,spare_;
+    std::thread thread_;
+  };
+  PacketReaper reaper_;  // last: destroyed first, while everything the packets reference is alive
 };
 }

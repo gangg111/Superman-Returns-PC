@@ -4,6 +4,9 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#if defined(__ANDROID__) || defined(__linux__)
+#include <pthread.h>
+#endif
 #include "../frame_timeline.h"
 namespace superman_returns::graphics::vulkan {
 namespace {
@@ -277,6 +280,41 @@ bool GameFrame::RecordFrame(std::vector<guest::RenderPacket>& packets_,const gue
   if(serial_==1 || serial_%120==0 || ms(started,finished)>100) {
     auto stats=renderer_.Stats();c_.Log("Submitted native Vulkan frame="+std::to_string(serial_)+", draws="+std::to_string(stats.draws)+", pending="+std::to_string(stats.pending)+", failed="+std::to_string(stats.failed)+", shaders_ms="+std::to_string(ms(started,shaders_ready))+", fence_ms="+std::to_string(ms(shaders_ready,fence_ready))+", queue_ms="+std::to_string(ms(submit_started,queue_ready))+", record_submit_ms="+std::to_string(ms(record_started,submit_started)+ms(queue_ready,finished))+", packets="+std::to_string(packets_.size())+", live_buffers="+std::to_string(LiveMemory().buffers.load())+", live_mb="+std::to_string((LiveMemory().buffer_bytes.load()+LiveMemory().image_bytes.load())>>20));
   }
-  packets_.clear();return true;
+  reaper_.Release(packets_);return true;
+}
+GameFrame::PacketReaper::PacketReaper() {
+  const char* v=std::getenv("SR_PACKET_REAPER");enabled_=!v || *v!='0';
+}
+GameFrame::PacketReaper::~PacketReaper() {
+  {std::lock_guard lock(mutex_);stop_=true;}
+  cv_.notify_all();
+  if(thread_.joinable()) thread_.join();
+}
+void GameFrame::PacketReaper::Release(std::vector<guest::RenderPacket>& packets) {
+  if(!enabled_) {packets.clear();return;}
+  std::unique_lock lock(mutex_);
+  if(!thread_.joinable()) thread_=std::thread(&PacketReaper::Main,this);
+  // At most two frames wait: the recorder slows down rather than piling up captured frames.
+  cv_.wait(lock,[&]{return dead_.size()<2;});
+  std::vector<guest::RenderPacket> empty;
+  if(!spare_.empty()) {empty=std::move(spare_.back());spare_.pop_back();}
+  dead_.push_back(std::move(packets));packets=std::move(empty);
+  lock.unlock();cv_.notify_all();
+}
+void GameFrame::PacketReaper::Main() {
+#if defined(__ANDROID__) || defined(__linux__)
+  pthread_setname_np(pthread_self(),"SR packet reap");
+#endif
+  std::unique_lock lock(mutex_);
+  for(;;) {
+    cv_.wait(lock,[&]{return stop_ || !dead_.empty();});
+    if(dead_.empty()) return;  // stop_ and nothing left
+    auto packets=std::move(dead_.front());dead_.erase(dead_.begin());
+    lock.unlock();
+    packets.clear();  // the destructors run here; the vector keeps its capacity for reuse
+    lock.lock();
+    if(spare_.size()<2) spare_.push_back(std::move(packets));
+    cv_.notify_all();
+  }
 }
 }
