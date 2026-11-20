@@ -442,6 +442,33 @@ void ApplyDeviceState(DrawPacket &d, uint32_t dev, const CapturedMemory &memory)
   d.texture_fetch = fetch;
 }
 
+// Reused constant banks. A city frame makes ~3,150 (one per changed bank, each 4 KB with its control
+// block): a fresh allocation each was a good part of the allocator's 25% of the replay worker
+// (Fold7, simpleperf, 2026-11-20). Banks go out in decode order and come back when the frame's packets
+// are freed, so the oldest kept bank is nearly always free again: a bank whose only owner is the pool
+// is rewritten. One pool per decoding thread.
+class ConstantBankPool {
+public:
+  std::shared_ptr<ConstantBank> Take() {
+    for(size_t tries=0;tries<4 && !banks_.empty();++tries) {
+      auto& bank=banks_[next_];next_=(next_+1)%banks_.size();
+      if(bank.use_count()==1) {
+        // The last other owner released it with acq_rel (shared_ptr); this orders its reads before our writes.
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return bank;
+      }
+    }
+    if(banks_.size()>=kMaxBanks) return std::make_shared<ConstantBank>();  // a backlog: not kept
+    banks_.insert(banks_.begin()+next_,std::make_shared<ConstantBank>());
+    auto& bank=banks_[next_];next_=(next_+1)%banks_.size();
+    return bank;
+  }
+private:
+  static constexpr size_t kMaxBanks=32768;  // ~130 MB: several city frames in flight
+  std::vector<std::shared_ptr<ConstantBank>> banks_;
+  size_t next_=0;
+};
+
 // Replay and decoding share the same owned snapshot. Packets retain it after
 // the worker recycles the source batch; no live guest reads are introduced.
 bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
@@ -480,12 +507,14 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
       if(shared_banks) {
         struct Kept {const native::Pm4Mirror* mirror=nullptr;std::shared_ptr<const ConstantBank> bank[2];};
         thread_local Kept kept;  // the decoding thread's (one worker per renderer)
+        thread_local ConstantBankPool pool;
         if(kept.mirror!=&mirror) kept={&mirror,{}};
         for(const bool pixel:{false,true}) {
           const uint64_t version=pixel?mirror.ps_version:mirror.vs_version;
           auto& bank=kept.bank[pixel];
           if(!bank || bank->version!=version) {
-            auto fresh=std::make_shared<ConstantBank>();
+            bank.reset();  // back to the pool if no packet holds it
+            auto fresh=pool.Take();
             fresh->version=version;fresh->words=mirror.FloatConstants(pixel);
             bank=std::move(fresh);
           }
@@ -545,6 +574,10 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
         throw std::out_of_range("Command stream range exceeds batch");
       if (!cmd.streams_ok)
         throw std::out_of_range("Guest stream capture failed");
+      // One allocation each instead of growing push by push (the replay worker's allocator time).
+      d.streams.reserve(cmd.stream_count);
+      if (cmd.stream_count && batch.streams[cmd.stream_first].buffer.decl)
+        d.attributes.reserve(Declaration(memory, batch.streams[cmd.stream_first].buffer.decl).size());
       for (uint64_t i = cmd.stream_first;
            i < uint64_t(cmd.stream_first) + cmd.stream_count; ++i) {
         const auto &s = batch.streams[size_t(i)];
