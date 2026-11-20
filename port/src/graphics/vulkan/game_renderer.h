@@ -3,6 +3,7 @@
 #include "depth_resolve.h"
 #include "state_shadow.h"
 #include "constant_bank_cache.h"
+#include "gpu_pass_profiler.h"
 #include "../guest/texture_capture.h"
 #include <atomic>
 #include <chrono>
@@ -15,6 +16,7 @@ struct GameRenderStats {uint64_t draws=0,pending=0,failed=0,clears=0,alias_viola
 struct RecordProfile {
   enum Phase {kUploads,kTargets,kTextures,kBindings,kDescriptors,kPipeline,kCommands,kResolves,kClears,kCount};
   std::array<uint64_t,kCount> ns{};uint64_t draws=0,texture_uploads=0,texture_bytes=0,buffer_uploads=0,buffer_bytes=0;
+  uint64_t passes=0,resolve_packets=0,clear_packets=0;  // render passes begun for draws, resolve and clear packets
 };
 class GameRenderer {
 public:
@@ -38,6 +40,8 @@ public:
   ResourceStore& Resources() {return resources_;}
   const GameRenderStats& Stats() const {return stats_;}
   const GamePipelineStore::Stats& PipelineStats() const {return pipelines_.stats();}
+  uint64_t ResolveSetsCreated() const {return depth_resolver_.CreatedSets();}  // since start: stays flat once warm
+  void SetGpuPasses(GpuPassProfiler* profiler) {gpu_passes_=profiler;}  // SR_GPU_PASSES, GameFrame's
   bool CheckpointCache(Error& e) {return pipelines_.CheckpointCache(e);}
   void EnableProfile(bool on) {profiling_=on;}
   RecordProfile TakeProfile() {auto p=profile_;profile_={};return p;}
@@ -72,6 +76,7 @@ private:
   ConstantBankCache constant_bank_cache_;
   Context& c_;ShaderLookup shaders_;TextureDecoder decoder_;ImageState state_;ResourceStore resources_;TargetStore targets_;DescriptorStore descriptors_;GamePipelineStore pipelines_;
   DepthResolver depth_resolver_;bool depth_ready_=false;
+  GpuPassProfiler* gpu_passes_=nullptr;
   AliasOptions alias_options_;
   std::map<guest::ResourceId,std::vector<uint8_t>> cpu_buffers_;
   struct ResolvedBinding {std::shared_ptr<TextureResource> image,raw;bool swap=false;uint64_t generation=0;};

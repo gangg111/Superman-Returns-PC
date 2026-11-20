@@ -12,8 +12,48 @@ struct DepthJob {
 };
 bool Fail(Error& e,const char* message) {e={"Depth resolve",VK_ERROR_INITIALIZATION_FAILED,message};return false;}
 }
+void DepthResolver::Destroy(CachedSet& s) {
+  if(s.pool) c_.f.vkDestroyDescriptorPool(c_.device,s.pool,nullptr);
+  if(s.stencil) c_.f.vkDestroyImageView(c_.device,s.stencil,nullptr);
+  s={};
+}
+void DepthResolver::Retire(uint64_t serial) {
+  pending_.Retire(serial);
+  // Drop the sets of targets only this cache keeps and of scratch buffers gone, once no submission reads them.
+  std::erase_if(sets_,[&](CachedSet& s) {
+    if(s.last_serial>serial || (s.source.use_count()>1 && !s.scratch.expired())) return false;
+    Destroy(s);return true;
+  });
+}
+VkDescriptorSet DepthResolver::CachedDescriptors(bool depth,const std::shared_ptr<TargetResource>& source,const std::shared_ptr<BufferResource>& scratch,VkDeviceSize range,uint64_t serial,Error& e) {
+  for(auto& s:sets_)
+    if(s.depth==depth && s.source==source && s.scratch_key==scratch.get() && s.range==range && s.scratch.lock()==scratch) {s.last_serial=serial;return s.set;}
+  CachedSet s;s.source=source;s.scratch=scratch;s.scratch_key=scratch.get();s.range=range;s.depth=depth;s.last_serial=serial;
+  auto fail=[&]{Destroy(s);return VkDescriptorSet(VK_NULL_HANDLE);};
+  if(depth) {
+    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};view.image=source->image;view.viewType=VK_IMAGE_VIEW_TYPE_2D;view.format=source->format;view.subresourceRange={VK_IMAGE_ASPECT_STENCIL_BIT,0,1,0,1};
+    if(!Check(c_.f.vkCreateImageView(c_.device,&view,nullptr,&s.stencil),"Stencil resolve view",e)) return fail();
+  }
+  VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,2},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1}};
+  VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};pool.maxSets=1;pool.poolSizeCount=2;pool.pPoolSizes=sizes;
+  if(!Check(c_.f.vkCreateDescriptorPool(c_.device,&pool,nullptr,&s.pool),depth?"Depth resolve descriptor pool":"Alias descriptor pool",e)) return fail();
+  VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};allocate.descriptorPool=s.pool;allocate.descriptorSetCount=1;allocate.pSetLayouts=&descriptors_;
+  if(!Check(c_.f.vkAllocateDescriptorSets(c_.device,&allocate,&s.set),depth?"Depth resolve descriptors":"Alias descriptor set",e)) return fail();
+  const VkImageLayout layout=depth?VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkDescriptorImageInfo images[]{{VK_NULL_HANDLE,source->sampled,layout},{VK_NULL_HANDLE,s.stencil,layout}};
+  VkDescriptorBufferInfo buffer{scratch->handle,0,range};VkWriteDescriptorSet writes[3]{};uint32_t count=0;
+  for(uint32_t binding=0;binding<3;++binding) {
+    if(binding==1 && !depth) continue;  // the alias copy reads one image
+    auto& w=writes[count++];w={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};w.dstSet=s.set;w.dstBinding=binding;w.descriptorCount=1;
+    w.descriptorType=binding==2?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    if(binding==2) w.pBufferInfo=&buffer;else w.pImageInfo=&images[binding];
+  }
+  c_.f.vkUpdateDescriptorSets(c_.device,count,writes,0,nullptr);
+  ++created_sets_;sets_.push_back(std::move(s));return sets_.back().set;
+}
 DepthResolver::~DepthResolver() {
   if(!c_.device) return;c_.f.vkDeviceWaitIdle(c_.device);pending_.Retire(UINT64_MAX);
+  for(auto& s:sets_) Destroy(s);sets_.clear();
   if(pipeline_) c_.f.vkDestroyPipeline(c_.device,pipeline_,nullptr);
   if(alias_pipeline_) c_.f.vkDestroyPipeline(c_.device,alias_pipeline_,nullptr);
   if(layout_) c_.f.vkDestroyPipelineLayout(c_.device,layout_,nullptr);
@@ -73,14 +113,7 @@ bool DepthResolver::RecordAlias(VkCommandBuffer command,TargetId destination,con
   uint64_t bytes=uint64_t(g.width)*g.height*(destination_kind==2?8:4);
   auto job=std::make_shared<DepthJob>();job->context=&c_;job->source=src;job->destination=dst;job->scratch=resources.ResolveScratch(bytes,e);if(!job->scratch) return false;
   if((g.width+7)/8>c_.properties.limits.maxComputeWorkGroupCount[0] || (g.height+7)/8>c_.properties.limits.maxComputeWorkGroupCount[1]) return Fail(e,"Alias dispatch exceeds device limits");
-  VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,2},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1}};
-  VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};pool.maxSets=1;pool.poolSizeCount=2;pool.pPoolSizes=sizes;
-  if(!Check(c_.f.vkCreateDescriptorPool(c_.device,&pool,nullptr,&job->pool),"Alias descriptor pool",e)) return false;
-  VkDescriptorSet set{};VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};allocation.descriptorPool=job->pool;allocation.descriptorSetCount=1;allocation.pSetLayouts=&descriptors_;
-  if(!Check(c_.f.vkAllocateDescriptorSets(c_.device,&allocation,&set),"Alias descriptor set",e)) return false;
-  VkDescriptorImageInfo image{VK_NULL_HANDLE,src->sampled,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};VkDescriptorBufferInfo buffer{job->scratch->handle,0,bytes};VkWriteDescriptorSet writes[2]{};
-  for(uint32_t i=0;i<2;++i) {writes[i]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};writes[i].dstSet=set;writes[i].dstBinding=i?2:0;writes[i].descriptorCount=1;writes[i].descriptorType=i?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;}
-  writes[0].pImageInfo=&image;writes[1].pBufferInfo=&buffer;c_.f.vkUpdateDescriptorSets(c_.device,2,writes,0,nullptr);
+  const VkDescriptorSet set=CachedDescriptors(false,src,job->scratch,bytes,resources.CurrentSerial(),e);if(!set) return false;
   auto sampled=ImageUsage::Sampled();sampled.stages=VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
   if(!state.Transition(command,src->image,{src->aspects,0,1,0,1},sampled,e)) return false;
   uint32_t push[]{uint32_t(source_kind),uint32_t(destination_kind),g.width,g.height};
@@ -103,17 +136,7 @@ bool DepthResolver::Record(VkCommandBuffer command,const ResolvePlan& plan,guest
   job->depth=resources.ResolveTexture(plan.destination,VK_FORMAT_R32_SFLOAT,plan.destination_size,plan.destination_mips,plan.destination_layers,plan.dimension==3,state,e);if(!job->depth) return false;
   if(raw_id) {job->raw=resources.ResolveTexture(raw_id,VK_FORMAT_R8G8B8A8_UNORM,plan.destination_size,plan.destination_mips,plan.destination_layers,plan.dimension==3,state,e);if(!job->raw) return false;}
   job->scratch=resources.ResolveScratch(pixels*8,e);if(!job->scratch) return false;
-  VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};view.image=job->source->image;view.viewType=VK_IMAGE_VIEW_TYPE_2D;view.format=job->source->format;view.subresourceRange={VK_IMAGE_ASPECT_STENCIL_BIT,0,1,0,1};
-  if(!Check(c_.f.vkCreateImageView(c_.device,&view,nullptr,&job->stencil),"Stencil resolve view",e)) return false;
-  VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,2},{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1}};
-  VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};pool.maxSets=1;pool.poolSizeCount=2;pool.pPoolSizes=sizes;
-  if(!Check(c_.f.vkCreateDescriptorPool(c_.device,&pool,nullptr,&job->pool),"Depth resolve descriptor pool",e)) return false;
-  VkDescriptorSet set{};VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};allocate.descriptorPool=job->pool;allocate.descriptorSetCount=1;allocate.pSetLayouts=&descriptors_;
-  if(!Check(c_.f.vkAllocateDescriptorSets(c_.device,&allocate,&set),"Depth resolve descriptors",e)) return false;
-  VkDescriptorImageInfo images[]{{VK_NULL_HANDLE,job->source->sampled,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},{VK_NULL_HANDLE,job->stencil,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL}};
-  VkDescriptorBufferInfo buffer{job->scratch->handle,0,job->scratch->size};VkWriteDescriptorSet writes[3]{};
-  for(uint32_t i=0;i<3;++i) {writes[i]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};writes[i].dstSet=set;writes[i].dstBinding=i;writes[i].descriptorCount=1;writes[i].descriptorType=i==2?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;if(i==2) writes[i].pBufferInfo=&buffer;else writes[i].pImageInfo=&images[i];}
-  c_.f.vkUpdateDescriptorSets(c_.device,3,writes,0,nullptr);
+  const VkDescriptorSet set=CachedDescriptors(true,job->source,job->scratch,job->scratch->size,resources.CurrentSerial(),e);if(!set) return false;
   auto sampled=ImageUsage::Sampled(true);sampled.stages=VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
   if(!state.Transition(command,job->source->image,{job->source->aspects,0,1,0,1},sampled,e)) return false;
   uint32_t push[]{uint32_t(plan.source_offset.x),uint32_t(plan.source_offset.y),plan.extent.width,plan.extent.height};

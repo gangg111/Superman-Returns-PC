@@ -68,6 +68,7 @@ private:
     std::vector<std::vector<guest::RenderPacket>> dead_,spare_;
     std::thread thread_;
   };
+  GpuPassProfiler gpu_passes_;  // SR_GPU_PASSES=1
   PacketReaper reaper_;  // last: destroyed first, while everything the packets reference is alive
 };
 }

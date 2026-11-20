@@ -36,6 +36,7 @@ GameFrame::~GameFrame() {
     const bool slot1_first=kSlots==2 && slot_swap_[0] && slot_swap_[1] && slot_swap_[0]>slot_swap_[1];
     for(size_t i=0;i<kSlots;++i) HarvestTimestamps(slot1_first?kSlots-1-i:i);
     c_.f.vkDestroyQueryPool(c_.device,timestamps_,nullptr);}
+  renderer_.SetGpuPasses(nullptr);gpu_passes_.Destroy();
   FrameTimeline::Global().FlushAll();
   for(auto fence:fences_) if(fence) c_.f.vkDestroyFence(c_.device,fence,nullptr);
   for(auto pool:pools_) if(pool) c_.f.vkDestroyCommandPool(c_.device,pool,nullptr);
@@ -67,6 +68,13 @@ bool GameFrame::Initialize(const std::filesystem::path& cache,Error& e) {
     } else {
       c_.Log("SR_FRAME_TIMELINE: GPU timestamps unavailable, gpu rows will be missing");
     }
+  }
+  if(GpuPassProfiler::Requested()) {
+    uint32_t count=0;c_.f.vkGetPhysicalDeviceQueueFamilyProperties(c_.physical,&count,nullptr);
+    std::vector<VkQueueFamilyProperties> families(count);c_.f.vkGetPhysicalDeviceQueueFamilyProperties(c_.physical,&count,families.data());
+    const uint32_t bits=c_.graphics_family<count?families[c_.graphics_family].timestampValidBits:0;
+    if(bits && gpu_passes_.Initialize(c_,kSlots,bits)) {renderer_.SetGpuPasses(&gpu_passes_);c_.Log("SR_GPU_PASSES: timing every render pass, resolve and clear");}
+    else c_.Log("SR_GPU_PASSES: GPU timestamps unavailable");
   }
   return true;
 }
@@ -173,6 +181,7 @@ bool GameFrame::RecordFrame(std::vector<guest::RenderPacket>& packets_,const gue
   const size_t slot=(serial_+1)%kSlots;
   if(!WaitSlot(slot,e)) {failed_=true;return false;}
   HarvestTimestamps(slot);
+  if(auto line=gpu_passes_.Harvest(slot);!line.empty()) c_.Log(line);
   pool_=pools_[slot];command_=commands_[slot];upload_=uploads_[slot];fence_=fences_[slot];
   const auto fence_ready=std::chrono::steady_clock::now();
   // This worker owns its command pool, descriptors, pipelines and mutable game
@@ -185,6 +194,7 @@ bool GameFrame::RecordFrame(std::vector<guest::RenderPacket>& packets_,const gue
   VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};begin.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   // Uploads record into upload_, submitted ahead of command_ in one batch.
   if(!Check(c_.f.vkBeginCommandBuffer(upload_,&begin),"Begin game uploads",e) || !Check(c_.f.vkBeginCommandBuffer(command_,&begin),"Begin game frame",e) || !renderer_.BeginSubmission(command_,++serial_,e,upload_)) return fail();
+  gpu_passes_.BeginFrame(upload_,slot);
   if(timestamps_) {c_.f.vkCmdResetQueryPool(upload_,timestamps_,uint32_t(slot*2),2);c_.f.vkCmdWriteTimestamp(upload_,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,timestamps_,uint32_t(slot*2));}
   // Diagnostics: SR_VULKAN_DUMP_FRAME=N [SR_VULKAN_DUMP_DIR=dir] dumps frame N.
   static const uint64_t dump_frame=[] {const char* v=std::getenv("SR_VULKAN_DUMP_FRAME");return v?std::strtoull(v,nullptr,10):0ull;}();
@@ -259,10 +269,10 @@ bool GameFrame::RecordFrame(std::vector<guest::RenderPacket>& packets_,const gue
       c_.Log("Vulkan profile (ms/frame over 120): interval="+avg(t.interval_us)+" shaders="+avg(t.shaders_us)+" fence="+avg(t.fence_us)+" record="+avg(t.record_us)+" queue="+avg(t.queue_us)+" tail="+avg(t.tail_us)
         +" | uploads="+avg_ns(p.ns[RecordProfile::kUploads])+" targets="+avg_ns(p.ns[RecordProfile::kTargets])+" textures="+avg_ns(p.ns[RecordProfile::kTextures])+" bindings="+avg_ns(p.ns[RecordProfile::kBindings])
         +" descriptors="+avg_ns(p.ns[RecordProfile::kDescriptors])+" pipeline="+avg_ns(p.ns[RecordProfile::kPipeline])+" commands="+avg_ns(p.ns[RecordProfile::kCommands])+" resolves="+avg_ns(p.ns[RecordProfile::kResolves])+" clears="+avg_ns(p.ns[RecordProfile::kClears])
-        +" | draws="+std::to_string(p.draws/t.frames)+" packets="+std::to_string(t.packets/t.frames)+" buffer_uploads="+std::to_string(p.buffer_uploads/t.frames)+" buffer_kb="+std::to_string(p.buffer_bytes/1024/t.frames)
+        +" | draws="+std::to_string(p.draws/t.frames)+" passes="+std::to_string(p.passes/t.frames)+" resolve_packets="+std::to_string(p.resolve_packets/t.frames)+" clear_packets="+std::to_string(p.clear_packets/t.frames)+" packets="+std::to_string(t.packets/t.frames)+" buffer_uploads="+std::to_string(p.buffer_uploads/t.frames)+" buffer_kb="+std::to_string(p.buffer_bytes/1024/t.frames)
         +" texture_uploads="+std::to_string(p.texture_uploads/t.frames)+" texture_kb="+std::to_string(p.texture_bytes/1024/t.frames)
         +" | descriptor_cache hits="+std::to_string(cache.hits/t.frames)+" misses="+std::to_string(cache.misses/t.frames)+" evicted="+std::to_string(cache.evicted/t.frames)+" entries="+std::to_string(cache.entries)
-        +" | pipelines created="+std::to_string(renderer_.PipelineStats().created)+" plans="+std::to_string(renderer_.PipelineStats().plans)+" memo_hits="+std::to_string(renderer_.PipelineStats().memo_hits)
+        +" | pipelines created="+std::to_string(renderer_.PipelineStats().created)+" plans="+std::to_string(renderer_.PipelineStats().plans)+" memo_hits="+std::to_string(renderer_.PipelineStats().memo_hits)+" resolve_sets="+std::to_string(renderer_.ResolveSetsCreated())
         +" | live buffers="+std::to_string(LiveMemory().buffers.load())+" ("+std::to_string(LiveMemory().buffer_bytes.load()>>20)+" MB) images="+std::to_string(LiveMemory().images.load())+" ("+std::to_string(LiveMemory().image_bytes.load()>>20)+" MB)"
         +[&] {  // buffers given their own GPU memory, per frame, by site
           static std::array<int64_t,size_t(AllocSite::kCount)> last{};

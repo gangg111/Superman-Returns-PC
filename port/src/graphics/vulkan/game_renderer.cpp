@@ -3,6 +3,7 @@
 #include "../guest/primitive_expansion.h"
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -63,6 +64,7 @@ bool GameRenderer::BeginSubmission(VkCommandBuffer command,uint64_t serial,Error
 }
 void GameRenderer::ClosePass() {
   if(!open_pass_) return;
+  if(gpu_passes_) gpu_passes_->Close(command_);
   c_.f.vkCmdEndRenderPass(command_);open_pass_.reset();bound_pipeline_=VK_NULL_HANDLE;shadow_.Invalidate();
 }
 void GameRenderer::FinishSubmission() {
@@ -144,6 +146,9 @@ bool GameRenderer::Record(const guest::RenderPacket& packet,VkCommandBuffer comm
     if(std::holds_alternative<guest::DrawPacketOwner>(packet)) return Fail(e,"Packet has empty draw payload");
     struct PacketLap {Lap& lap;RecordProfile::Phase phase;~PacketLap(){lap(phase);}} packet_lap{lap,std::holds_alternative<guest::ResolvePacket>(packet)?RecordProfile::kResolves:RecordProfile::kClears};
     ClosePass();
+    if(profiling_) {profile_.clear_packets+=std::holds_alternative<guest::ClearPacket>(packet);profile_.resolve_packets+=std::holds_alternative<guest::ResolvePacket>(packet);}
+    struct GpuSpan {GpuPassProfiler* p;VkCommandBuffer c;~GpuSpan(){if(p) p->Close(c);}} gpu_span{gpu_passes_,command};
+    if(gpu_passes_) gpu_passes_->Open(command,std::holds_alternative<guest::ResolvePacket>(packet)?"resolve":std::holds_alternative<guest::ClearPacket>(packet)?"clear":"tiling");
     if(auto* clear=std::get_if<guest::ClearPacket>(&packet)) {if(!targets_.Clear(*clear,e)) return false;++stats_.clears;return true;}
     if(auto* resolve=std::get_if<guest::ResolvePacket>(&packet)) {
       auto plan=PlanResolve(*resolve,targets_,e);if(!e.message.empty()) return false;
@@ -333,6 +338,15 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
     ClosePass();
     VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};begin.renderPass=pass->render_pass;begin.framebuffer=pass->framebuffer;begin.renderArea={{0,0},pass->extent};
     c_.f.vkCmdBeginRenderPass(command,&begin,VK_SUBPASS_CONTENTS_INLINE);open_pass_=pass;
+    if(profiling_) ++profile_.passes;
+    if(gpu_passes_ && gpu_passes_->enabled()) {
+      // Pass size, attachment formats and the first draw's pixel shader: one label per kind of pass.
+      std::string label="pass "+std::to_string(pass->extent.width)+"x"+std::to_string(pass->extent.height);
+      for(uint32_t i=0;i<pass->color_count;++i) label+=" c"+std::to_string(pass->formats[i]);
+      if(pass->depth_format) label+=" d"+std::to_string(pass->depth_format);
+      char ps[24];std::snprintf(ps,sizeof(ps)," ps%04llx",(unsigned long long)(draw.pixel_shader?draw.pixel_shader->hash&0xffff:0));
+      gpu_passes_->Open(command,label+ps);
+    }
   }
   if(bound_pipeline_!=pipeline->handle) {c_.f.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline->handle);bound_pipeline_=pipeline->handle;}
   // Set 0 (the constants) moves with every draw. Sets 1-3 only when their resources change: every game pipeline
