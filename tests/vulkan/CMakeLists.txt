@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.25)
 project(sr_vulkan_foundation LANGUAGES CXX)
 enable_testing()
 add_subdirectory(../../port/src/graphics/vulkan vulkan)
+# What the game's native library gives sr_vulkan_core: index normalization (draw_state.cpp) for
+# the recorder's uploads, and guest::FixedPointTargetsAsFloat (render_packet.cpp in the game).
+target_sources(sr_vulkan_core PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../port/src/graphics/guest/draw_state.cpp"
+                                      "${CMAKE_CURRENT_SOURCE_DIR}/fixed_point_targets.cpp")
 add_executable(sr_vulkan_tests main.cpp test_policy.cpp test_context.cpp test_frame_loop.cpp test_swapchain.cpp test_triangle.cpp test_smoke_options.cpp test_device_requirements.cpp test_descriptors.cpp test_resources.cpp test_render_targets.cpp test_image_state.cpp test_shader_service.cpp test_game_pipeline.cpp test_resolve.cpp)
 target_include_directories(sr_vulkan_tests PRIVATE ../native)
 target_link_libraries(sr_vulkan_tests PRIVATE sr_vulkan_core)

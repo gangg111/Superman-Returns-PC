@@ -637,7 +637,7 @@ int Run(const std::filesystem::path &shaders_dir, const std::string &uuid,
         fixture.Draw(indices, uint32_t(normalized.size()), target, readback,production?std::function<void()>([&] {
           if(!resources.BeginSubmission(fixture.command,uint64_t(variant)+1,e) || !resources.CreateDummies(e) ||
              !resources.UploadBuffer(7,std::as_bytes(std::span(vertices)),1,e)) throw std::runtime_error(e.operation+": "+e.message);
-          guest::DrawPacket packet;packet.constants=state;packet.vertex_fetch[0]={7,0,4,0x2C2259};
+          guest::DrawPacket packet;packet.constants=state;packet.vertex_fetch[0]={7,0,4,0x2C2259};packet.attributes.push_back({7,0,0x2C2259,0,0});
           guest::VertexStream stream{};stream.stream=7;stream.size=sizeof(vertices);stream.stride=4;stream.update.plan.key=7;packet.streams.push_back(stream);
           packet.texture_fetch[7][0]=2|(3<<10)|(3<<13);packet.texture_fetch[7][1]=0x1006;packet.texture_fetch[7][5]=1<<9;
           guest::LinearTexture linear;linear.width=linear.height=1;linear.format=guest::LinearFormat::kRGBA8Unorm;linear.levels={{1,1,4,1,0}};linear.data={255,255,255,255};

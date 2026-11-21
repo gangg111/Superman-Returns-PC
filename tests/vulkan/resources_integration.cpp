@@ -88,7 +88,8 @@ void BenchmarkMappedBindings(Context& c) {
   guest::DrawPacket draw;
   for(uint32_t i=0;i<8;++i) {draw.texture_fetch[i][0]=2;draw.texture_fetch[i][1]=0x1006+i*4096;draw.texture_fetch[i][5]=1<<9;}
   for(uint32_t i=0;i<4;++i) {guest::VertexStream stream;stream.stream=i;stream.update.plan.key=500+i;draw.streams.push_back(stream);}
-  for(uint32_t i=0;i<16;++i) draw.vertex_fetch[i]={i%4,i*4,64,37};
+  // Each entry with its attribute, as the decoder writes them (BuildBindings reads through attributes).
+  for(uint32_t i=0;i<16;++i) {draw.vertex_fetch[i]={i%4,i*4,64,37};draw.attributes.push_back({i%4,i*4,37,0,i});}
   constexpr uint32_t draws=3000,rounds=16;
   std::vector<TransientSlice> slices(draws);
   std::vector<guest::DrawPacket> packets(draws,draw);

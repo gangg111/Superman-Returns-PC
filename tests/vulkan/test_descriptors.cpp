@@ -4,6 +4,14 @@
 #include <cstring>
 using namespace superman_returns::graphics::vulkan;
 namespace guest=superman_returns::graphics::guest;
+namespace {
+// As the decoder does: a vertex fetch entry (usage * 16 + index) always comes with its attribute,
+// and BuildBindings reads the entries through the attributes.
+void SetVertexFetch(guest::DrawPacket& p,uint32_t entry,guest::VertexFetchMeta meta) {
+  p.vertex_fetch[entry]=meta;
+  p.attributes.push_back({meta.buffer,meta.offset,meta.type,entry/16,entry%16});
+}
+}
 SR_TEST(constant_bank_cache_requires_exact_bytes_submission_and_chunk) {
   ConstantBankCache cache;guest::ConstantSnapshot v{};int chunk1=0,chunk2=0;
   v.vs[0]=0x7fc00001;v.ps[1023]=0x80000000;
@@ -80,7 +88,7 @@ SR_TEST(remap_failure_leaves_the_bindings_untouched) {
 }
 SR_TEST(vertex_descriptor_remap_preserves_ushort2_and_stream_offset) {
   guest::DrawPacket p;
-  p.vertex_fetch[48]={7,14,4,0x2C2259};
+  SetVertexFetch(p,48,{7,14,4,0x2C2259});
   guest::VertexStream stream{};stream.stream=7;stream.offset=12;stream.size=16;stream.stride=4;stream.update.plan.key=1500;
   p.streams.push_back(stream);
   Block block;DrawBindings b;Error e;
@@ -211,13 +219,13 @@ SR_TEST(build_bindings_block_matches_the_reference_implementation_byte_for_byte)
     for(uint32_t s=0;s<3;++s) {
       guest::VertexStream stream{};stream.stream=s*2+1;stream.size=16;stream.stride=4;stream.update.plan.key=1500+s;p.streams.push_back(stream);
     }
-    p.vertex_fetch[0]={1,0,4,0x2C2259};p.vertex_fetch[48]={5,14,4,0x2C2259};p.vertex_fetch[223]={3,2,8,0x1A2086};
+    SetVertexFetch(p,0,{1,0,4,0x2C2259});SetVertexFetch(p,48,{5,14,4,0x2C2259});SetVertexFetch(p,223,{3,2,8,0x1A2086});
     ExpectSameBlockAsReference(p);
   }
   {  // inline vertices
     guest::DrawPacket p;FillConstants(p,3);p.inline_vertices=true;p.inline_stride=32;p.command_serial=77;
     p.texture_fetch[0][0]=2;p.texture_fetch[0][5]=1<<9;p.texture_fetch[31][0]=2;p.texture_fetch[31][5]=2<<9;
-    p.vertex_fetch[0]={9,0,4,0x2C2259};p.vertex_fetch[10]={20,8,4,0x2C23A5};p.vertex_fetch[100]={0,16,4,0x1A2086};
+    SetVertexFetch(p,0,{9,0,4,0x2C2259});SetVertexFetch(p,10,{20,8,4,0x2C23A5});SetVertexFetch(p,100,{0,16,4,0x1A2086});
     ExpectSameBlockAsReference(p);
   }
   {  // the packets composition and immediate build (zero constants)
@@ -233,9 +241,9 @@ SR_TEST(build_bindings_rejects_duplicate_and_missing_streams) {
   guest::DrawPacket no_key;stream.update.plan.key=0;no_key.streams={stream};
   SR_CHECK(!BuildBindings(no_key,block.data(),b,e));
   guest::DrawPacket missing;stream.update.plan.key=1500;missing.streams={stream};
-  missing.vertex_fetch[0]={9,0,4,0x2C2259};   // references stream 9, which the draw does not have
+  SetVertexFetch(missing,0,{9,0,4,0x2C2259});   // references stream 9, which the draw does not have
   SR_CHECK(!BuildBindings(missing,block.data(),b,e));
-  guest::DrawPacket out_of_range;out_of_range.vertex_fetch[0]={40,0,4,0x2C2259};
+  guest::DrawPacket out_of_range;SetVertexFetch(out_of_range,0,{40,0,4,0x2C2259});
   SR_CHECK(!BuildBindings(out_of_range,block.data(),b,e));
 }
 SR_TEST(sampler_plan_preserves_fetch_filters_and_address_modes) {
