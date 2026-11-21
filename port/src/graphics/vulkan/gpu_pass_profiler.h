@@ -35,6 +35,8 @@ public:
     c_->f.vkCmdWriteTimestamp(command,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,pool_,q);
     labels_[slot_].push_back(std::move(label));open_=true;
   }
+  // Names the open span once its details are known (a resolve's size and kind).
+  void Relabel(std::string label) {if(pool_ && open_) labels_[slot_].back()=std::move(label);}
   void Close(VkCommandBuffer command) {
     if(!pool_ || !open_) return;
     const uint32_t q=uint32_t((slot_*kSpans+labels_[slot_].size()-1)*2+1);
@@ -55,7 +57,7 @@ public:
     std::sort(sorted.begin(),sorted.end(),[](const auto& a,const auto& b){return a.second.ns>b.second.ns;});
     uint64_t all=0;for(auto& s:sorted) all+=s.second.ns;
     std::string out="GPU passes (ms/frame over 120): all="+Ms(all);
-    for(size_t i=0;i<sorted.size() && i<16;++i)
+    for(size_t i=0;i<sorted.size() && i<28;++i)
       out+=" | "+sorted[i].first+" "+Ms(sorted[i].second.ns)+" x"+std::to_string(sorted[i].second.count/frames_);
     totals_.clear();frames_=0;return out;
   }

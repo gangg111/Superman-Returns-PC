@@ -8,7 +8,9 @@ VkFormat ColorFormat(uint32_t f) {
   case 0:case 1:return VK_FORMAT_R8G8B8A8_UNORM;
   case 2:case 10:return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
   case 3:case 5:case 7:case 12:return VK_FORMAT_R16G16B16A16_SFLOAT;
-  case 4:return VK_FORMAT_R16G16_SNORM;
+  // k_16_16 stores -32..32 on Xenos: a float target with the clamp in the shader (g_ColorRange), see
+  // guest::FixedPointTargetsAsFloat. R16G16_SNORM clipped the sun's shadow map to -1..1.
+  case 4:return guest::FixedPointTargetsAsFloat()?VK_FORMAT_R32G32_SFLOAT:VK_FORMAT_R16G16_SNORM;
   case 6:return VK_FORMAT_R16G16_SFLOAT;
   case 14:return VK_FORMAT_R32_SFLOAT;
   case 15:return VK_FORMAT_R32G32_SFLOAT;

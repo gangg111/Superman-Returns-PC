@@ -21,7 +21,19 @@ add_custom_command(OUTPUT "${helper_dir}/depth_resolve.spv"
 add_custom_command(OUTPUT "${helper_dir}/depth_resolve_shader.h"
   COMMAND "${CMAKE_COMMAND}" "-DINPUT=${helper_dir}/depth_resolve.spv" "-DOUTPUT=${helper_dir}/depth_resolve_shader.h" -P "${CMAKE_CURRENT_SOURCE_DIR}/shaders/embed_spirv.cmake"
   DEPENDS "${helper_dir}/depth_resolve.spv" shaders/embed_spirv.cmake VERBATIM)
-target_sources(sr_vulkan_core PRIVATE depth_resolve.cpp "${helper_dir}/depth_resolve_shader.h")
+add_custom_command(OUTPUT "${helper_dir}/depth_resolve_image.spv"
+  COMMAND "${SR_VULKAN_DXC}" -spirv -fspv-target-env=vulkan1.1 -T cs_6_0 -E CSMain -Fo "${helper_dir}/depth_resolve_image.spv" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/depth_resolve_image.hlsl"
+  DEPENDS shaders/depth_resolve_image.hlsl VERBATIM)
+add_custom_command(OUTPUT "${helper_dir}/depth_resolve_image_shader.h"
+  COMMAND "${CMAKE_COMMAND}" "-DINPUT=${helper_dir}/depth_resolve_image.spv" "-DOUTPUT=${helper_dir}/depth_resolve_image_shader.h" -DNAME=depth_resolve_image_shader -P "${CMAKE_CURRENT_SOURCE_DIR}/shaders/embed_spirv.cmake"
+  DEPENDS "${helper_dir}/depth_resolve_image.spv" shaders/embed_spirv.cmake VERBATIM)
+add_custom_command(OUTPUT "${helper_dir}/resolve_scale_copy.spv"
+  COMMAND "${SR_VULKAN_DXC}" -spirv -fspv-target-env=vulkan1.1 -T cs_6_0 -E CSMain -Fo "${helper_dir}/resolve_scale_copy.spv" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/resolve_scale_copy.hlsl"
+  DEPENDS shaders/resolve_scale_copy.hlsl VERBATIM)
+add_custom_command(OUTPUT "${helper_dir}/resolve_scale_copy_shader.h"
+  COMMAND "${CMAKE_COMMAND}" "-DINPUT=${helper_dir}/resolve_scale_copy.spv" "-DOUTPUT=${helper_dir}/resolve_scale_copy_shader.h" -DNAME=resolve_scale_copy_shader -P "${CMAKE_CURRENT_SOURCE_DIR}/shaders/embed_spirv.cmake"
+  DEPENDS "${helper_dir}/resolve_scale_copy.spv" shaders/embed_spirv.cmake VERBATIM)
+target_sources(sr_vulkan_core PRIVATE depth_resolve.cpp "${helper_dir}/depth_resolve_shader.h" "${helper_dir}/depth_resolve_image_shader.h" "${helper_dir}/resolve_scale_copy_shader.h")
 target_include_directories(sr_vulkan_core PRIVATE "${helper_dir}")
 add_custom_command(OUTPUT "${helper_dir}/edram_alias.spv"
   COMMAND "${SR_VULKAN_DXC}" -spirv -fspv-target-env=vulkan1.1 -T cs_6_0 -E CSMain -Fo "${helper_dir}/edram_alias.spv" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/edram_alias_compute.hlsl"

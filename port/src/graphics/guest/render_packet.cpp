@@ -237,6 +237,10 @@ void DeviceState(DrawPacket &d, uint32_t device,
   d.has_device_state = true;
 }
 } // namespace
+bool FixedPointTargetsAsFloat() {
+  static const bool enabled = [] {const char* v = std::getenv("SR_FIXED_POINT_FLOAT");return !v || *v != '0';}();
+  return enabled;
+}
 void FinalizeDrawConstants(DrawPacket &d) {
   uint32_t mode=d.registers[0x205];float scale=0,offset=0;
   bool polygonal=d.primitive==Primitive::kTriangles || d.primitive==Primitive::kTriangleStrip || d.primitive==Primitive::kQuads || d.primitive==Primitive::kRectangles;
@@ -288,6 +292,14 @@ void FinalizeDrawConstants(DrawPacket &d) {
     alpha = func == 0 ? 2.0f : std::bit_cast<float>(d.registers[0x10e]);
   }
   putf(75, alpha);
+  // g_ColorRange (c31, patch 0016): Xenos fixed-point targets (k_16_16 = 4, k_16_16_16_16 = 5) clamp every
+  // write to -32..32; the host keeps them as float targets (FixedPointTargetsAsFloat) and clamps in the
+  // shader. 0 = no clamp. Without it the sun's shadow map overflowed and its shadows slid with the camera.
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t format = d.colors[i].geometry.format;
+    const bool host_float = format == 5 || (format == 4 && FixedPointTargetsAsFloat());  // 5 is always RGBA16F
+    putf(124 + i, d.colors[i].id && host_float ? 32.0f : 0.0f);
+  }
   put(112, spec);
   putf(113, 1);
   putf(114, 1);
@@ -694,6 +706,7 @@ bool DecodeCapturedPacket(const WorkBatch &batch, const WorkCmd &cmd,
       r.has_source_rect=cmd.u[1]!=0;r.has_destination_point=cmd.u[3]!=0;r.tiling_active=cmd.tiling_active;
       r.destination = cmd.u[2];
       r.has_copy_draw=cmd.resolve_copy_draw;r.copy_dest_swap=bool((cmd.resolve_copy_dest_info>>24)&1);
+      r.exp_bias=int32_t(cmd.resolve_copy_dest_info<<10)>>26;
       r.memory = memory;
       if (cmd.u[1])
         r.source = Rects(memory, cmd.u[1], 1).front();

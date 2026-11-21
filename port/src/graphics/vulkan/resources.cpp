@@ -333,7 +333,7 @@ std::shared_ptr<TextureResource> ResourceStore::ResolveTexture(guest::ResourceId
   auto old=textures_.find(id);
   if(old!=textures_.end()) {
     auto t=old->second;
-    if(t->state==&state && t->format==format && t->extent.width==extent.width && t->extent.height==extent.height && t->mips==mips && t->layers==layers && t->view_type==view_type && t->usage==usage) {submissions_.Hold(serial_,t);e={};return t;}
+    if(t->state==&state && t->format==format && t->extent.width==extent.width && t->extent.height==extent.height && t->mips==mips && t->layers==layers && t->view_type==view_type && (t->usage&usage)==usage) {submissions_.Hold(serial_,t);e={};return t;}  // more usage (the depth resolve's storage) also serves
   }
   auto flags=cube?VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT:0u;
   VkImageFormatProperties caps{};

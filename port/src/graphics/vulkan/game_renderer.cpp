@@ -3,6 +3,7 @@
 #include "../guest/primitive_expansion.h"
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -152,6 +153,7 @@ bool GameRenderer::Record(const guest::RenderPacket& packet,VkCommandBuffer comm
     if(auto* clear=std::get_if<guest::ClearPacket>(&packet)) {if(!targets_.Clear(*clear,e)) return false;++stats_.clears;return true;}
     if(auto* resolve=std::get_if<guest::ResolvePacket>(&packet)) {
       auto plan=PlanResolve(*resolve,targets_,e);if(!e.message.empty()) return false;
+      if(gpu_passes_) gpu_passes_->Relabel("resolve "+(plan.empty?std::string("empty"):std::to_string(plan.extent.width)+"x"+std::to_string(plan.extent.height)+" op"+std::to_string(int(plan.operation))+" f"+std::to_string(plan.destination_format))+((plan.clear_color||plan.clear_depth)?" +clear":""));
       if(resolve->destination) plan.destination=TextureResourceId(resolve->destination_fetch);
       guest::ResourceId raw_id=0;
       if(!plan.empty && plan.operation==ResolveOperation::kDepthConversion) {
@@ -160,7 +162,20 @@ bool GameRenderer::Record(const guest::RenderPacket& packet,VkCommandBuffer comm
         auto raw_fetch=resolve->destination_fetch;raw_fetch[1]=(raw_fetch[1]&~63u)|6u;
         raw_id=TextureResourceId(raw_fetch);
         if(!depth_resolver_.Record(command,plan,raw_id,targets_,resources_,state_,e)) return false;
-      } else if(!RecordColorResolve(c_,command,plan,targets_,resources_,state_,e)) return false;
+      } else {
+        // copy_dest_exp_bias (the sun's shadow map: -5) multiplies the copy by 2^bias like Xenos;
+        // SR_RESOLVE_EXP_BIAS=0 copies plainly (the old behaviour: the shadows slid with the camera).
+        static const bool exp_bias_on=[] {const char* v=std::getenv("SR_RESOLVE_EXP_BIAS");return !v || *v!='0';}();
+        bool scaled=false;
+        if(exp_bias_on && resolve->exp_bias && !plan.empty) {
+          if(!depth_ready_) {if(!depth_resolver_.Initialize(e)) return false;depth_ready_=true;}
+          scaled=depth_resolver_.RecordScaledCopy(command,plan,std::ldexp(1.0f,resolve->exp_bias),targets_,resources_,state_,e);
+          if(!scaled && !e.message.empty()) return false;
+          static bool logged=false;
+          if(!logged) {logged=true;c_.Log("Resolve exp bias "+std::to_string(resolve->exp_bias)+" ("+std::to_string(plan.extent.width)+"x"+std::to_string(plan.extent.height)+" format "+std::to_string(plan.destination_format)+"): "+(scaled?"scaled":"copied plainly, no scaled copy for this format"));}
+        }
+        if(!scaled && !RecordColorResolve(c_,command,plan,targets_,resources_,state_,e)) return false;
+      }
       if(!plan.empty) {
         auto& latest=resolved_latest_[plan.physical_base];latest.image=resources_.Texture(plan.destination,e);if(!latest.image) return false;
         if(dumping_ && !DumpImageNow(command,"p"+std::to_string(dump_packet_-1)+"_resolve_"+Hex(plan.physical_base),latest.image->handle,latest.image->format,{latest.image->extent.width,latest.image->extent.height,1},VK_IMAGE_ASPECT_COLOR_BIT,false,e)) return false;

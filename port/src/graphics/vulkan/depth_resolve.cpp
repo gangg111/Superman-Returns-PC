@@ -1,5 +1,8 @@
 #include "depth_resolve.h"
 #include "depth_resolve_shader.h"
+#include "depth_resolve_image_shader.h"
+#include "resolve_scale_copy_shader.h"
+#include <cstdlib>
 #include "edram_alias_shader.h"
 #include <algorithm>
 namespace superman_returns::graphics::vulkan {
@@ -22,6 +25,14 @@ void DepthResolver::Retire(uint64_t serial) {
   // Drop the sets of targets only this cache keeps and of scratch buffers gone, once no submission reads them.
   std::erase_if(sets_,[&](CachedSet& s) {
     if(s.last_serial>serial || (s.source.use_count()>1 && !s.scratch.expired())) return false;
+    Destroy(s);return true;
+  });
+  std::erase_if(image_sets_,[&](ImageSet& s) {
+    if(s.last_serial>serial || (s.source.use_count()>1 && s.depth.use_count()>1 && s.raw.use_count()>1)) return false;
+    Destroy(s);return true;
+  });
+  std::erase_if(scale_sets_,[&](ImageSet& s) {
+    if(s.last_serial>serial || (s.source.use_count()>1 && s.depth.use_count()>1)) return false;
     Destroy(s);return true;
   });
 }
@@ -51,9 +62,140 @@ VkDescriptorSet DepthResolver::CachedDescriptors(bool depth,const std::shared_pt
   c_.f.vkUpdateDescriptorSets(c_.device,count,writes,0,nullptr);
   ++created_sets_;sets_.push_back(std::move(s));return sets_.back().set;
 }
+void DepthResolver::Destroy(ImageSet& s) {
+  if(s.pool) c_.f.vkDestroyDescriptorPool(c_.device,s.pool,nullptr);
+  for(auto view:{s.stencil,s.depth_view,s.raw_view}) if(view) c_.f.vkDestroyImageView(c_.device,view,nullptr);
+  s={};
+}
+bool DepthResolver::InitializeImagePath(Error& e) {
+  const char* v=std::getenv("SR_DEPTH_RESOLVE_IMAGE");
+  if(v && *v=='0') return true;
+  for(auto format:{VK_FORMAT_R32_SFLOAT,VK_FORMAT_R8G8B8A8_UNORM}) {
+    VkFormatProperties p{};c_.f.vkGetPhysicalDeviceFormatProperties(c_.physical,format,&p);
+    if(!(p.optimalTilingFeatures&VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return true;  // the buffer path
+  }
+  VkDescriptorSetLayoutBinding bindings[]{
+    {0,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
+    {1,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
+    {2,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
+    {3,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}};
+  VkDescriptorSetLayoutCreateInfo d{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};d.bindingCount=4;d.pBindings=bindings;
+  if(!Check(c_.f.vkCreateDescriptorSetLayout(c_.device,&d,nullptr,&image_descriptors_),"Depth image resolve descriptor layout",e)) return false;
+  VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT,0,32};VkPipelineLayoutCreateInfo l{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};l.setLayoutCount=1;l.pSetLayouts=&image_descriptors_;l.pushConstantRangeCount=1;l.pPushConstantRanges=&push;
+  if(!Check(c_.f.vkCreatePipelineLayout(c_.device,&l,nullptr,&image_layout_),"Depth image resolve pipeline layout",e)) return false;
+  VkShaderModule module{};VkShaderModuleCreateInfo s{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};s.codeSize=sizeof(depth_resolve_image_shader);s.pCode=depth_resolve_image_shader;
+  if(!Check(c_.f.vkCreateShaderModule(c_.device,&s,nullptr,&module),"Depth image resolve shader",e)) return false;
+  VkComputePipelineCreateInfo p{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};p.layout=image_layout_;p.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};p.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;p.stage.module=module;p.stage.pName="CSMain";
+  auto result=c_.f.vkCreateComputePipelines(c_.device,VK_NULL_HANDLE,1,&p,nullptr,&image_pipeline_);c_.f.vkDestroyShaderModule(c_.device,module,nullptr);
+  if(result!=VK_SUCCESS) image_pipeline_=VK_NULL_HANDLE;  // the buffer path
+  return true;
+}
+VkDescriptorSet DepthResolver::ImageDescriptors(const std::shared_ptr<TargetResource>& source,const std::shared_ptr<TextureResource>& depth,const std::shared_ptr<TextureResource>& raw,uint32_t mip,uint32_t layer,uint64_t serial,Error& e) {
+  for(auto& s:image_sets_)
+    if(s.source==source && s.depth==depth && s.raw==raw && s.mip==mip && s.layer==layer) {s.last_serial=serial;return s.set;}
+  ImageSet s;s.source=source;s.depth=depth;s.raw=raw;s.mip=mip;s.layer=layer;s.last_serial=serial;
+  auto fail=[&]{Destroy(s);return VkDescriptorSet(VK_NULL_HANDLE);};
+  // Every binding the shader declares needs a valid descriptor, binding 3 an RGBA8 view: no raw texture, no set.
+  if(!raw) {Fail(e,"Depth image resolve needs the raw texture");return fail();}
+  VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};view.viewType=VK_IMAGE_VIEW_TYPE_2D;
+  view.image=source->image;view.format=source->format;view.subresourceRange={VK_IMAGE_ASPECT_STENCIL_BIT,0,1,0,1};
+  if(!Check(c_.f.vkCreateImageView(c_.device,&view,nullptr,&s.stencil),"Stencil resolve view",e)) return fail();
+  view.image=depth->handle;view.format=VK_FORMAT_R32_SFLOAT;view.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,mip,1,layer,1};
+  if(!Check(c_.f.vkCreateImageView(c_.device,&view,nullptr,&s.depth_view),"Depth resolve storage view",e)) return fail();
+  view.image=raw->handle;view.format=VK_FORMAT_R8G8B8A8_UNORM;
+  if(!Check(c_.f.vkCreateImageView(c_.device,&view,nullptr,&s.raw_view),"Raw depth resolve storage view",e)) return fail();
+  VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,2},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,2}};
+  VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};pool.maxSets=1;pool.poolSizeCount=2;pool.pPoolSizes=sizes;
+  if(!Check(c_.f.vkCreateDescriptorPool(c_.device,&pool,nullptr,&s.pool),"Depth image resolve descriptor pool",e)) return fail();
+  VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};allocate.descriptorPool=s.pool;allocate.descriptorSetCount=1;allocate.pSetLayouts=&image_descriptors_;
+  if(!Check(c_.f.vkAllocateDescriptorSets(c_.device,&allocate,&s.set),"Depth image resolve descriptors",e)) return fail();
+  VkDescriptorImageInfo images[]{{VK_NULL_HANDLE,source->sampled,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},{VK_NULL_HANDLE,s.stencil,VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},
+                                 {VK_NULL_HANDLE,s.depth_view,VK_IMAGE_LAYOUT_GENERAL},{VK_NULL_HANDLE,s.raw_view,VK_IMAGE_LAYOUT_GENERAL}};
+  VkWriteDescriptorSet writes[4]{};
+  for(uint32_t i=0;i<4;++i) {writes[i]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};writes[i].dstSet=s.set;writes[i].dstBinding=i;writes[i].descriptorCount=1;writes[i].descriptorType=i<2?VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;writes[i].pImageInfo=&images[i];}
+  c_.f.vkUpdateDescriptorSets(c_.device,4,writes,0,nullptr);
+  ++created_sets_;image_sets_.push_back(std::move(s));return image_sets_.back().set;
+}
+bool DepthResolver::RecordToImages(VkCommandBuffer command,const ResolvePlan& plan,guest::ResourceId raw_id,TargetStore& targets,ResourceStore& resources,ImageState& state,Error& e) {
+  auto source=targets.Get(plan.source,e);if(!source) return false;
+  if(source->format!=VK_FORMAT_D24_UNORM_S8_UINT || !source->description.depth) return Fail(e,"Depth source must be D24S8");
+  auto depth=resources.ResolveTexture(plan.destination,VK_FORMAT_R32_SFLOAT,plan.destination_size,plan.destination_mips,plan.destination_layers,plan.dimension==3,state,e,VK_IMAGE_USAGE_STORAGE_BIT);if(!depth) return false;
+  auto raw=resources.ResolveTexture(raw_id,VK_FORMAT_R8G8B8A8_UNORM,plan.destination_size,plan.destination_mips,plan.destination_layers,plan.dimension==3,state,e,VK_IMAGE_USAGE_STORAGE_BIT);if(!raw) return false;
+  const VkDescriptorSet set=ImageDescriptors(source,depth,raw,plan.destination_mip,plan.destination_layer,resources.CurrentSerial(),e);if(!set) return false;
+  auto sampled=ImageUsage::Sampled(true);sampled.stages=VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+  if(!state.Transition(command,source->image,{source->aspects,0,1,0,1},sampled,e)) return false;
+  const ImageUsage storage{VK_IMAGE_LAYOUT_GENERAL,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT};
+  for(auto* texture:{depth.get(),raw.get()})
+    if(!state.Transition(command,texture->handle,{VK_IMAGE_ASPECT_COLOR_BIT,plan.destination_mip,1,plan.destination_layer,1},storage,e)) return false;
+  struct {int32_t sx,sy;uint32_t w,h;int32_t dx,dy;uint32_t raw,pad;} push{plan.source_offset.x,plan.source_offset.y,plan.extent.width,plan.extent.height,plan.destination_offset.x,plan.destination_offset.y,1,0};
+  c_.f.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_COMPUTE,image_pipeline_);c_.f.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_COMPUTE,image_layout_,0,1,&set,0,nullptr);
+  c_.f.vkCmdPushConstants(command,image_layout_,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(push),&push);c_.f.vkCmdDispatch(command,(plan.extent.width+7)/8,(plan.extent.height+7)/8,1);
+  for(auto* texture:{depth.get(),raw.get()})
+    if(!state.Transition(command,texture->handle,{VK_IMAGE_ASPECT_COLOR_BIT,plan.destination_mip,1,plan.destination_layer,1},ImageUsage::Sampled(),e)) return false;
+  e={};return true;
+}
+bool DepthResolver::InitializeScaledCopy(Error& e) {
+  VkFormatProperties p{};c_.f.vkGetPhysicalDeviceFormatProperties(c_.physical,VK_FORMAT_R32G32_SFLOAT,&p);
+  if(!(p.optimalTilingFeatures&VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return true;  // plain copies
+  VkDescriptorSetLayoutBinding bindings[]{
+    {0,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
+    {1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}};
+  VkDescriptorSetLayoutCreateInfo d{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};d.bindingCount=2;d.pBindings=bindings;
+  if(!Check(c_.f.vkCreateDescriptorSetLayout(c_.device,&d,nullptr,&scale_descriptors_),"Scaled resolve descriptor layout",e)) return false;
+  VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT,0,32};VkPipelineLayoutCreateInfo l{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};l.setLayoutCount=1;l.pSetLayouts=&scale_descriptors_;l.pushConstantRangeCount=1;l.pPushConstantRanges=&push;
+  if(!Check(c_.f.vkCreatePipelineLayout(c_.device,&l,nullptr,&scale_layout_),"Scaled resolve pipeline layout",e)) return false;
+  VkShaderModule module{};VkShaderModuleCreateInfo s{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};s.codeSize=sizeof(resolve_scale_copy_shader);s.pCode=resolve_scale_copy_shader;
+  if(!Check(c_.f.vkCreateShaderModule(c_.device,&s,nullptr,&module),"Scaled resolve shader",e)) return false;
+  VkComputePipelineCreateInfo cp{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};cp.layout=scale_layout_;cp.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};cp.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;cp.stage.module=module;cp.stage.pName="CSMain";
+  auto result=c_.f.vkCreateComputePipelines(c_.device,VK_NULL_HANDLE,1,&cp,nullptr,&scale_pipeline_);c_.f.vkDestroyShaderModule(c_.device,module,nullptr);
+  if(result!=VK_SUCCESS) scale_pipeline_=VK_NULL_HANDLE;
+  return true;
+}
+bool DepthResolver::RecordScaledCopy(VkCommandBuffer command,const ResolvePlan& plan,float scale,TargetStore& targets,ResourceStore& resources,ImageState& state,Error& e) {
+  e={};
+  if(!scale_pipeline_ || plan.empty || plan.operation!=ResolveOperation::kCopy || plan.destination_format!=VK_FORMAT_R32G32_SFLOAT) return false;
+  auto source=targets.Get(plan.source,e);if(!source) return false;
+  if(source->format!=VK_FORMAT_R32G32_SFLOAT || source->aspects!=VK_IMAGE_ASPECT_COLOR_BIT) {e={};return false;}
+  auto texture=resources.ResolveTexture(plan.destination,plan.destination_format,plan.destination_size,plan.destination_mips,plan.destination_layers,plan.dimension==3,state,e,VK_IMAGE_USAGE_STORAGE_BIT);if(!texture) return false;
+  VkDescriptorSet set=VK_NULL_HANDLE;
+  for(auto& s:scale_sets_) if(s.source==source && s.depth==texture && s.mip==plan.destination_mip && s.layer==plan.destination_layer) {s.last_serial=resources.CurrentSerial();set=s.set;break;}
+  if(!set) {
+    ImageSet s;s.source=source;s.depth=texture;s.mip=plan.destination_mip;s.layer=plan.destination_layer;s.last_serial=resources.CurrentSerial();
+    auto fail=[&]{Destroy(s);return false;};
+    VkImageViewCreateInfo view{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};view.viewType=VK_IMAGE_VIEW_TYPE_2D;view.image=texture->handle;view.format=VK_FORMAT_R32G32_SFLOAT;view.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,s.mip,1,s.layer,1};
+    if(!Check(c_.f.vkCreateImageView(c_.device,&view,nullptr,&s.depth_view),"Scaled resolve storage view",e)) return fail();
+    VkDescriptorPoolSize sizes[]{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1}};
+    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};pool.maxSets=1;pool.poolSizeCount=2;pool.pPoolSizes=sizes;
+    if(!Check(c_.f.vkCreateDescriptorPool(c_.device,&pool,nullptr,&s.pool),"Scaled resolve descriptor pool",e)) return fail();
+    VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};allocate.descriptorPool=s.pool;allocate.descriptorSetCount=1;allocate.pSetLayouts=&scale_descriptors_;
+    if(!Check(c_.f.vkAllocateDescriptorSets(c_.device,&allocate,&s.set),"Scaled resolve descriptors",e)) return fail();
+    VkDescriptorImageInfo images[]{{VK_NULL_HANDLE,source->sampled,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},{VK_NULL_HANDLE,s.depth_view,VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet writes[2]{};
+    for(uint32_t i=0;i<2;++i) {writes[i]={VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};writes[i].dstSet=s.set;writes[i].dstBinding=i;writes[i].descriptorCount=1;writes[i].descriptorType=i?VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;writes[i].pImageInfo=&images[i];}
+    c_.f.vkUpdateDescriptorSets(c_.device,2,writes,0,nullptr);
+    set=s.set;++created_sets_;scale_sets_.push_back(std::move(s));
+  }
+  auto sampled=ImageUsage::Sampled();sampled.stages=VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+  if(!state.Transition(command,source->image,{source->aspects,0,1,0,1},sampled,e)) return false;
+  const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,plan.destination_mip,1,plan.destination_layer,1};
+  if(!state.Transition(command,texture->handle,range,ImageUsage{VK_IMAGE_LAYOUT_GENERAL,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT},e)) return false;
+  struct {int32_t sx,sy;uint32_t w,h;int32_t dx,dy;float scale;uint32_t pad;} push{plan.source_offset.x,plan.source_offset.y,plan.extent.width,plan.extent.height,plan.destination_offset.x,plan.destination_offset.y,scale,0};
+  c_.f.vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_COMPUTE,scale_pipeline_);c_.f.vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_COMPUTE,scale_layout_,0,1,&set,0,nullptr);
+  c_.f.vkCmdPushConstants(command,scale_layout_,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(push),&push);c_.f.vkCmdDispatch(command,(plan.extent.width+7)/8,(plan.extent.height+7)/8,1);
+  if(!state.Transition(command,texture->handle,range,ImageUsage::Sampled(),e)) return false;
+  e={};return true;
+}
 DepthResolver::~DepthResolver() {
   if(!c_.device) return;c_.f.vkDeviceWaitIdle(c_.device);pending_.Retire(UINT64_MAX);
   for(auto& s:sets_) Destroy(s);sets_.clear();
+  for(auto& s:image_sets_) Destroy(s);image_sets_.clear();
+  for(auto& s:scale_sets_) Destroy(s);scale_sets_.clear();
+  if(scale_pipeline_) c_.f.vkDestroyPipeline(c_.device,scale_pipeline_,nullptr);
+  if(scale_layout_) c_.f.vkDestroyPipelineLayout(c_.device,scale_layout_,nullptr);
+  if(scale_descriptors_) c_.f.vkDestroyDescriptorSetLayout(c_.device,scale_descriptors_,nullptr);
+  if(image_pipeline_) c_.f.vkDestroyPipeline(c_.device,image_pipeline_,nullptr);
+  if(image_layout_) c_.f.vkDestroyPipelineLayout(c_.device,image_layout_,nullptr);
+  if(image_descriptors_) c_.f.vkDestroyDescriptorSetLayout(c_.device,image_descriptors_,nullptr);
   if(pipeline_) c_.f.vkDestroyPipeline(c_.device,pipeline_,nullptr);
   if(alias_pipeline_) c_.f.vkDestroyPipeline(c_.device,alias_pipeline_,nullptr);
   if(layout_) c_.f.vkDestroyPipelineLayout(c_.device,layout_,nullptr);
@@ -77,7 +219,7 @@ bool DepthResolver::Initialize(Error& e) {
   s.codeSize=sizeof(edram_alias_shader);s.pCode=edram_alias_shader;
   if(!Check(c_.f.vkCreateShaderModule(c_.device,&s,nullptr,&module),"EDRAM alias shader",e)) return false;
   p.stage.module=module;result=c_.f.vkCreateComputePipelines(c_.device,VK_NULL_HANDLE,1,&p,nullptr,&alias_pipeline_);c_.f.vkDestroyShaderModule(c_.device,module,nullptr);
-  return Check(result,"EDRAM alias pipeline",e);
+  return Check(result,"EDRAM alias pipeline",e) && InitializeImagePath(e) && InitializeScaledCopy(e);
 }
 bool DepthResolver::RecordAlias(VkCommandBuffer command,TargetId destination,const AliasPlan& plan,TargetStore& targets,ResourceStore& resources,ImageState& state,Error& e,AliasOptions options) {
   if(plan.action==AliasAction::kNone) {e={};return true;}
@@ -129,6 +271,8 @@ bool DepthResolver::RecordAlias(VkCommandBuffer command,TargetId destination,con
 bool DepthResolver::Record(VkCommandBuffer command,const ResolvePlan& plan,guest::ResourceId raw_id,TargetStore& targets,ResourceStore& resources,ImageState& state,Error& e) {
   if(plan.empty) {e={};return true;}
   if(!pipeline_ || !command || !resources.CurrentSerial() || plan.operation!=ResolveOperation::kDepthConversion || plan.destination_format!=VK_FORMAT_R32_SFLOAT || raw_id==plan.destination) return Fail(e,"Invalid depth resolve operation or destinations");
+  if(image_pipeline_ && raw_id && (plan.extent.width+7)/8<=c_.properties.limits.maxComputeWorkGroupCount[0] && (plan.extent.height+7)/8<=c_.properties.limits.maxComputeWorkGroupCount[1])
+    return RecordToImages(command,plan,raw_id,targets,resources,state,e);
   uint64_t pixels=uint64_t(plan.extent.width)*plan.extent.height;
   if(!pixels || pixels>UINT32_MAX/8 || (plan.extent.width+7)/8>c_.properties.limits.maxComputeWorkGroupCount[0] || (plan.extent.height+7)/8>c_.properties.limits.maxComputeWorkGroupCount[1]) return Fail(e,"Depth resolve dispatch exceeds device limits");
   auto job=std::make_shared<DepthJob>();job->context=&c_;job->source=targets.Get(plan.source,e);if(!job->source) return false;

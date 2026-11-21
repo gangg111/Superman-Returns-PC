@@ -178,6 +178,9 @@ struct ResolvePacket {
   uint32_t flags, destination;
   bool has_source_rect=false,has_destination_point=false,tiling_active=false;
   bool has_copy_draw=false,copy_dest_swap=false;
+  // RB_COPY_DEST_INFO copy_dest_exp_bias (bits 16-21, signed): Xenos multiplies the copied colour by
+  // 2^exp_bias. The sun's shadow map resolves with -5 (its k_16_16 target's -32..32 becomes -1..1).
+  int32_t exp_bias=0;
   Rect source{};
   std::array<int32_t, 2> destination_point{};
   std::array<float, 4> clear_color{};
@@ -273,4 +276,7 @@ bool ReplayCapturedRenderPacket(const WorkBatch&,const WorkCmd&,native::Pm4Mirro
 // Original scale1/MSAA1 shader ABI state. Descriptor indices are populated by
 // the backend after binding resources; these semantic constants are common.
 void FinalizeDrawConstants(DrawPacket &);
+// Xenos fixed-point colour targets (k_16_16) as R32G32_SFLOAT with a -32..32 clamp in the shader
+// (g_ColorRange) instead of R16G16_SNORM, which clipped them to -1..1. SR_FIXED_POINT_FLOAT=0: SNORM.
+bool FixedPointTargetsAsFloat();
 } // namespace superman_returns::graphics::guest
