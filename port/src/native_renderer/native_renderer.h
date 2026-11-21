@@ -145,6 +145,10 @@ class Renderer : public NativeFrontend {
   // every dependency is captured and no D3D executor is called for this mode.
   bool InstallPacketSink(PacketSink,std::function<void()> cancel);
   void ShutdownWorker();
+  // Initializes the renderer (and precompiles the pipelines, starts DLSS) on a
+  // background thread as soon as presentation exists, while the game boots; the
+  // first frame then waits only for what is left.
+  void StartEarlyInit(rex::ui::Presenter* presenter);
   ~Renderer();
 
   // --- Guest D3D entry points -------------------------------------------
@@ -305,6 +309,7 @@ class Renderer : public NativeFrontend {
   void ExecOnPassEnd(int pass);
 
   bool EnsureInitialized();
+  bool InitializeLocked();  // under init_mutex_
   // GPU time per native frame (timestamp queries), logged every 5 s.
   void BeginFrameTimestamp();
   void EndFrameTimestamp();
@@ -538,8 +543,10 @@ class Renderer : public NativeFrontend {
   static constexpr uint32_t kRtvHeapSize = 256;
   static constexpr uint32_t kDsvHeapSize = 64;
 
-  bool initialized_ = false;
+  std::atomic<bool> initialized_{false};
   bool init_failed_ = false;
+  std::mutex init_mutex_;
+  rex::ui::Presenter* early_presenter_ = nullptr;  // StartEarlyInit
 
   rex::ui::d3d12::D3D12Presenter* presenter_ = nullptr;
   const rex::ui::d3d12::D3D12Provider* provider_ = nullptr;
@@ -958,6 +965,8 @@ class Renderer : public NativeFrontend {
   // surface's contents before the game's post-processing reads them.
   void DlssCaptureCamera();
   void DlssJitter(float half_pixel[2]);
+  // NGX starts on its own thread (about 2 s); true once DLSS can run.
+  bool DlssNgxReady();
   void DlssOnDepthResolve(HostSurface& src);
   void DlssOnColorResolve(HostSurface& src);
   void DlssEndFrame();

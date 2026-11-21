@@ -256,6 +256,12 @@ rex::X_STATUS D3D12NativeGraphicsSystem::SetupPresentation(rex::ui::WindowedAppC
     return X_STATUS_UNSUCCESSFUL;
   }
   REXLOG_INFO("native graphics: {} presentation ready (no GPU plugin)",vulkan?"Vulkan":"D3D12");
+#if SR_NATIVE_RENDERER_BUILD
+  // The renderer used to start on the first frame, i.e. during the first film:
+  // 1.5 s of setup and pipeline compilation froze its picture. Now it runs
+  // while the game boots (about 1.8 s from here to the first frame).
+  if (!vulkan) Renderer::Get().StartEarlyInit(presenter_.get());
+#endif
   return X_STATUS_SUCCESS;
 }
 

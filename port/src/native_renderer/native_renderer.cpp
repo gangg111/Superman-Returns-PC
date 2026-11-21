@@ -1327,10 +1327,34 @@ void Renderer::ShutdownWorker() {
 
 bool PackShaderLookup(uint64_t hash, bool vertex, const void** data, size_t* size);
 
+void Renderer::StartEarlyInit(rex::ui::Presenter* presenter) {
+  if (!presenter) return;
+  {
+    std::lock_guard<std::mutex> lock(init_mutex_);
+    if (initialized_.load(std::memory_order_relaxed) || init_failed_ || early_presenter_) return;
+    early_presenter_ = presenter;
+  }
+  REXLOG_INFO("native: renderer initialization started early, in the background");
+  std::thread([this]() { EnsureInitialized(); }).detach();
+}
+
 bool Renderer::EnsureInitialized() {
-  if (initialized_) {
+  if (initialized_.load(std::memory_order_acquire)) {
     return true;
   }
+  const auto wait_start = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(init_mutex_);
+  if (initialized_.load(std::memory_order_relaxed)) {
+    // The early initialization was still running: what the first frame waited.
+    REXLOG_INFO("native: the first frame waited {} ms for the early renderer initialization",
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - wait_start).count());
+    return true;
+  }
+  return InitializeLocked();
+}
+
+bool Renderer::InitializeLocked() {
   if (init_failed_) {
     return false;
   }
@@ -1395,11 +1419,14 @@ bool Renderer::EnsureInitialized() {
   auto* graphics = kernel_state && kernel_state->emulator()
                        ? kernel_state->emulator()->graphics_system()
                        : nullptr;
-  if (!graphics || !graphics->presenter()) {
+  // Early (StartEarlyInit): the kernel does not exist yet, the presenter does.
+  rex::ui::Presenter* presenter =
+      early_presenter_ ? early_presenter_ : graphics ? graphics->presenter() : nullptr;
+  if (!presenter) {
     REXLOG_ERROR("native: no graphics system / presenter");
     return false;
   }
-  presenter_ = static_cast<rex::ui::d3d12::D3D12Presenter*>(graphics->presenter());
+  presenter_ = static_cast<rex::ui::d3d12::D3D12Presenter*>(presenter);
   graphics_ = graphics;
   // The kit's SDK fork calls back from the Xenos CP after each swap (A/B
   // dumps). The stock SDK has no such hook; the project's own command
@@ -1516,8 +1543,11 @@ bool Renderer::EnsureInitialized() {
     REXLOG_INFO("native: renderer initialized, shaders from {}", where);
   }
   init_failed_ = false;
+  // NGX takes about 2 s; on its own thread it runs next to the pipeline
+  // compilation and the first frames (they go without DLSS until it is ready).
+  if (SrDlssMode()) DlssNgxReady();
   RunPrecompileScreen();
-  initialized_ = true;
+  initialized_.store(true, std::memory_order_release);
   return true;
 }
 

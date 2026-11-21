@@ -24,11 +24,14 @@
 #include "native_renderer.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include <windows.h>
 
@@ -106,6 +109,9 @@ uint32_t Renderer::DlssSceneVariant() const {
 
 struct DlssState {
   bool initialized = false, failed = false;
+  // NGX on its own thread: 0 not started, 1 running, 2 ready, 3 refused.
+  std::atomic<int> ngx{0};
+  std::thread ngx_thread;
   NVSDK_NGX_Parameter* params = nullptr;
   NVSDK_NGX_Handle* feature = nullptr;
   uint32_t width = 0, height = 0, out_width = 0;
@@ -136,6 +142,7 @@ constexpr float kNoHistory = 65000.0f;  // srMotionNdcFor's mark (shader_common.
 
 void DlssDeleter::operator()(DlssState* state) const {
   if (!state) return;
+  if (state->ngx_thread.joinable()) state->ngx_thread.join();
   if (state->feature) NVSDK_NGX_D3D12_ReleaseFeature(state->feature);
   if (state->params) NVSDK_NGX_D3D12_DestroyParameters(state->params);
   if (state->initialized) NVSDK_NGX_D3D12_Shutdown1(nullptr);
@@ -284,14 +291,71 @@ void Renderer::DlssCaptureCamera() {
 }
 
 void Renderer::DlssJitter(float half_pixel[2]) {
+  // No jitter until NGX is ready: those frames are shown without DLSS.
   if (!SrDlssMode() || !dlss_scene_ || dlss_scene_done_ || !bound_rts_[0] ||
-      bound_rts_[0]->resource.Get() != dlss_scene_) {
+      bound_rts_[0]->resource.Get() != dlss_scene_ || !dlss_ || dlss_->ngx.load(std::memory_order_acquire) != 2) {
     return;
   }
   const auto desc = dlss_scene_->GetDesc();
   // NDC: +2/width moves the picture one pixel right, -2/height one pixel down.
   half_pixel[0] += 2.0f * dlss_jitter_[0] / float(desc.Width);
   half_pixel[1] -= 2.0f * dlss_jitter_[1] / float(desc.Height);
+}
+
+bool Renderer::DlssNgxReady() {
+  if (!dlss_) dlss_.reset(new DlssState);
+  DlssState& s = *dlss_;
+  const int state = s.ngx.load(std::memory_order_acquire);
+  if (state == 2) return true;
+  if (state == 3) {
+    if (!s.failed) {
+      s.failed = true;
+      ::g_dlss_hardware = false;  // greyed out in Graphics Options from now on
+    }
+    return false;
+  }
+  if (state == 1) return false;
+  // NGX_D3D12_Init loads and checks every feature's model (about 2 s): on the
+  // render worker it froze the first film. Nothing here records commands.
+  s.ngx.store(1, std::memory_order_relaxed);
+  s.ngx_thread = std::thread([&s, device = device_]() {
+    const auto start = std::chrono::steady_clock::now();
+    wchar_t module[MAX_PATH];
+    GetModuleFileNameW(nullptr, module, MAX_PATH);
+    const std::wstring dir = std::filesystem::path(module).parent_path().wstring();
+    // NGX's own log lines about the model (preset, version) go to our log, so
+    // which DLSS model really runs is on record.
+    NVSDK_NGX_FeatureCommonInfo info{};
+    info.LoggingInfo.LoggingCallback = [](const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
+      std::string_view m(message ? message : "");
+      if (m.find("reset") != m.npos || m.find("ersion") != m.npos || m.find("odel") != m.npos) {
+        while (!m.empty() && (m.back() == '\n' || m.back() == '\r')) m.remove_suffix(1);
+        REXLOG_INFO("dlss: ngx: {}", m);
+      }
+    };
+    info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
+    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init_with_ProjectID(
+        "6a0f5b5e-8a5c-4f8e-9d4c-5f2e1c3b7a90", NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", dir.c_str(), device, &info);
+    if (NVSDK_NGX_FAILED(r)) {
+      REXLOG_ERROR("dlss: NGX init failed ({:08X}); is nvngx_dlss.dll next to the executable?", uint32_t(r));
+      s.ngx.store(3, std::memory_order_release);
+      return;
+    }
+    s.initialized = true;
+    int available = 0;
+    if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_GetCapabilityParameters(&s.params)) ||
+        NVSDK_NGX_FAILED(s.params->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &available)) ||
+        !available) {
+      REXLOG_ERROR("dlss: DLSS is not available on this GPU / driver");
+      s.ngx.store(3, std::memory_order_release);
+      return;
+    }
+    REXLOG_INFO("dlss: NGX initialized, DLSS available ({} ms, background thread)",
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start).count());
+    s.ngx.store(2, std::memory_order_release);
+  });
+  return false;
 }
 
 void Renderer::DlssOnDepthResolve(HostSurface& src) {
@@ -334,41 +398,7 @@ void Renderer::DlssOnColorResolve(HostSurface& src) {
   if (bias != g_dlss_mip_bias) REXLOG_INFO("dlss: texture mip bias {:.3f} (scene {} -> {})", bias, w, out_w);
   g_dlss_mip_bias = bias;
 
-  if (!s.initialized) {
-    wchar_t module[MAX_PATH];
-    GetModuleFileNameW(nullptr, module, MAX_PATH);
-    const std::wstring dir = std::filesystem::path(module).parent_path().wstring();
-    // NGX's own log lines about the model (preset, version) go to our log, so
-    // which DLSS model really runs is on record.
-    NVSDK_NGX_FeatureCommonInfo info{};
-    info.LoggingInfo.LoggingCallback = [](const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
-      std::string_view m(message ? message : "");
-      if (m.find("reset") != m.npos || m.find("ersion") != m.npos || m.find("odel") != m.npos) {
-        while (!m.empty() && (m.back() == '\n' || m.back() == '\r')) m.remove_suffix(1);
-        REXLOG_INFO("dlss: ngx: {}", m);
-      }
-    };
-    info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_ON;
-    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init_with_ProjectID(
-        "6a0f5b5e-8a5c-4f8e-9d4c-5f2e1c3b7a90", NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", dir.c_str(), device_, &info);
-    if (NVSDK_NGX_FAILED(r)) {
-      REXLOG_ERROR("dlss: NGX init failed ({:08X}); is nvngx_dlss.dll next to the executable?", uint32_t(r));
-      s.failed = true;
-      ::g_dlss_hardware = false;  // greyed out in Graphics Options from now on
-      return;
-    }
-    s.initialized = true;
-    int available = 0;
-    if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D12_GetCapabilityParameters(&s.params)) ||
-        NVSDK_NGX_FAILED(s.params->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &available)) ||
-        !available) {
-      REXLOG_ERROR("dlss: DLSS is not available on this GPU / driver");
-      s.failed = true;
-      ::g_dlss_hardware = false;
-      return;
-    }
-    REXLOG_INFO("dlss: NGX initialized, DLSS available");
-  }
+  if (!DlssNgxReady()) return;  // NGX still starting (or refused)
 
   // The resources and the feature for this size and mode.
   if (!s.feature || s.width != w || s.height != h || s.out_width != out_w || s.mode != mode) {
