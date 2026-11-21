@@ -26,7 +26,7 @@ public:
   std::function<void()> compilation_progress;
   GameRenderer& Renderer() {return renderer_;}
 private:
-  bool WaitShaders(const std::vector<guest::RenderPacket>&,Error&);
+  bool WaitShaders(std::vector<guest::RenderPacket>&,Error&);
   bool RecordFrame(std::vector<guest::RenderPacket>&,const guest::SwapPacket&,std::shared_ptr<TextureResource>&,Error&);
   void RecorderMain();
   bool WaitSlot(size_t slot,Error&);
