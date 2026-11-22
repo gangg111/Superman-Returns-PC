@@ -26,6 +26,11 @@ bool RunAudioSelfTest(uint8_t* base);  // native_audio/selftest.cpp
 #include "native_renderer/sr_graphics_system.h"
 #endif
 
+namespace superman_returns {
+void InstallGuestCrashTrace(uint8_t* membase);  // guest_crash_trace.cpp
+}
+using superman_returns::InstallGuestCrashTrace;
+
 class SupermanReturnsApp : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
@@ -136,6 +141,8 @@ class SupermanReturnsApp : public rex::ReXApp {
   // Feed the F3 debug overlay with the guest frame rate.
   void OnPostSetup() override {
     SetGuestFrameStats(SampleGuestFrameStats);
+    // the guest's call stack in the log when the runtime aborts (guest_crash_trace.cpp)
+    InstallGuestCrashTrace(runtime()->virtual_membase());
     // SR_AUDIO_SELFTEST=<report>: native audio DSP vs the recompiled originals, then exit.
     if (native_audio::RunAudioSelfTest(runtime()->virtual_membase())) std::exit(0);
   }
