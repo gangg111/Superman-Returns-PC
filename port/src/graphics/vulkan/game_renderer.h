@@ -7,6 +7,7 @@
 #include "../guest/texture_capture.h"
 #include <atomic>
 #include <chrono>
+#include <unordered_set>
 namespace superman_returns::graphics::vulkan {
 using ShaderLookup=std::function<shaders::ShaderResult(const guest::ShaderCapture&)>;
 using TextureDecoder=std::function<bool(const guest::TextureCapture&,guest::LinearTexture&,std::string&)>;
@@ -42,6 +43,13 @@ public:
   const GamePipelineStore::Stats& PipelineStats() const {return pipelines_.stats();}
   uint64_t ResolveSetsCreated() const {return depth_resolver_.CreatedSets();}  // since start: stays flat once warm
   void SetGpuPasses(GpuPassProfiler* profiler) {gpu_passes_=profiler;}  // SR_GPU_PASSES, GameFrame's
+  // A platform's per-frame counter: when it changes, every texture decoded with
+  // LinearTexture::epoch_bound is uploaded again (PC: another costume slot worn).
+  std::function<uint32_t()> texture_epoch;
+  // A platform's per-draw edits (PC: costume slots, texture_replace.h): leave the
+  // draw out, or replace one pixel shader float constant register.
+  struct DrawEdit {bool skip=false;uint32_t ps_register=UINT32_MAX;std::array<float,4> ps_value{};};
+  std::function<void(const guest::DrawPacket&,DrawEdit&)> draw_edit;
   bool CheckpointCache(Error& e) {return pipelines_.CheckpointCache(e);}
   void EnableProfile(bool on) {profiling_=on;}
   RecordProfile TakeProfile() {auto p=profile_;profile_={};return p;}
@@ -77,6 +85,9 @@ private:
   Context& c_;ShaderLookup shaders_;TextureDecoder decoder_;ImageState state_;ResourceStore resources_;TargetStore targets_;DescriptorStore descriptors_;GamePipelineStore pipelines_;
   DepthResolver depth_resolver_;bool depth_ready_=false;
   GpuPassProfiler* gpu_passes_=nullptr;
+  // texture_epoch's value last seen and the textures decoded epoch_bound since.
+  uint32_t texture_epoch_seen_=0;
+  std::unordered_set<guest::ResourceId> epoch_textures_;
   AliasOptions alias_options_;
   std::map<guest::ResourceId,std::vector<uint8_t>> cpu_buffers_;
   struct ResolvedBinding {std::shared_ptr<TextureResource> image,raw;bool swap=false;uint64_t generation=0;};

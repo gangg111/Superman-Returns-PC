@@ -49,6 +49,8 @@ Format MapFormat(guest::LinearFormat f) {
   case F::kR32Float:return {VK_FORMAT_R32_SFLOAT,1,4,4};
   case F::kRG32Float:return {VK_FORMAT_R32G32_SFLOAT,1,8,8};
   case F::kRGBA32Float:return {VK_FORMAT_R32G32B32A32_SFLOAT,1,16,16};
+  case F::kBC4:return {VK_FORMAT_BC4_UNORM_BLOCK,4,8,8};
+  case F::kBC7:return {VK_FORMAT_BC7_UNORM_BLOCK,4,16,16};
   default:return {VK_FORMAT_UNDEFINED,0,0,0};
   }
 }

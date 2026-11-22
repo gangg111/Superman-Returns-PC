@@ -18,8 +18,22 @@
 #include <string>
 
 #include "texture_decode.h"
+#include "../graphics/guest/texture_capture.h"
+#include "../graphics/guest/texture_layout.h"
 
 namespace superman_returns::native {
+
+// The content hash textures are named by (XXH3, native_renderer.cpp TextureHash).
+uint64_t HashTextureBytes(const void* data, size_t size, uint64_t seed);
+
+// The Vulkan renderer's texture replacement: `game` is the decoded game texture of
+// `capture`; when the textures folder or the worn costume slot has a file for it,
+// `game` becomes that file, with the same rules as the D3D12 renderer (identity
+// mapping, except two-channel game textures keep theirs). `costume` tells the
+// caller the texture is a costume one, so it must be uploaded again when another
+// slot is worn (CustomCostumeGeneration). PC only (WIC decodes the PNGs).
+bool ReplaceCapturedTexture(const graphics::guest::TextureCapture& capture,
+                            graphics::guest::LinearTexture& game, bool& costume);
 
 std::string TextureName(uint64_t content_hash, const DecodedTexture& decoded);
 

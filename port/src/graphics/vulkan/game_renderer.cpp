@@ -60,6 +60,14 @@ bool GameRenderer::BeginSubmission(VkCommandBuffer command,uint64_t serial,Error
   open_pass_.reset();bound_pipeline_=VK_NULL_HANDLE;shadow_.Invalidate();
   if(!resources_.BeginSubmission(command,serial,e,upload) || !targets_.BeginSubmission(command,serial,e)) return false;
   command_=command;serial_=serial;merge_passes_=upload!=VK_NULL_HANDLE;recording_.store(command,std::memory_order_relaxed);
+  // Another costume slot (texture_epoch): its textures decode again from the next draw.
+  // The submissions still holding the old images keep them alive until they retire.
+  if(texture_epoch) if(const uint32_t epoch=texture_epoch();epoch!=texture_epoch_seen_) {
+    texture_epoch_seen_=epoch;
+    for(const auto id:epoch_textures_) resources_.ForgetTexture(id);
+    if(!epoch_textures_.empty()) c_.Log("texture epoch "+std::to_string(epoch)+": "+std::to_string(epoch_textures_.size())+" texture(s) decoded again");
+    epoch_textures_.clear();
+  }
   if(!dummies_) {float missing[]{0,0,0,1};if(!resources_.CreateDummies(e) || !resources_.UploadBuffer(MissingVertex,std::as_bytes(std::span(missing)),1,e)) return false;dummies_=true;}
   e={};return true;
 }
@@ -220,6 +228,8 @@ bool GameRenderer::QuadIndices(uint32_t quads,Error& e) {
   quad_capacity_=capacity;return true;
 }
 bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Error& e) {
+  DrawEdit edit;
+  if(draw_edit) draw_edit(draw,edit);
   // The geometry recorded: the packet's own, or (mobile renderer plan, E3) without a copy of the packet:
   // a non-indexed quad list through the shared quad index buffer at a vertex offset, rectangles expanded
   // into a reused scratch vector. Both are triangle lists to the pipeline (PlanGamePipeline).
@@ -247,7 +257,9 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
   auto index_id=draw.indices.plan.key;
   if(!draw.expanded_indices.empty()) {index_id=ExpandedIndexBufferBase|draw.command_serial;if(!resources_.UploadTransient(index_id,std::as_bytes(std::span(draw.expanded_indices)),0,e)) return false;transient_buffers_[serial_].push_back(index_id);}
   if(quad_list && count && !QuadIndices(count/6,e)) return false;
-  if(!count) {e={};return true;}
+  // A draw left out (draw_edit) still took its geometry's updates above: later
+  // draws' partial updates build on them.
+  if(!count || edit.skip) {e={};return true;}
   if(!draw.vertex_shader || !shaders_) return Fail(e,"Captured vertex shader/lookup absent");
   shaders::ShaderResult vs_scratch,ps_scratch;
   static const shaders::ShaderResult kNoPixelShader{shaders::ShaderPoll::ready,{},{}};
@@ -305,6 +317,7 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
     if(current && current->version==capture->version) continue;
     guest::LinearTexture texture;std::string reason;if(!decoder_ || !decoder_(*capture,texture,reason)) {e={"Game texture",VK_ERROR_FORMAT_NOT_SUPPORTED,reason.empty()?"Captured texture decoder unavailable":reason};return false;}
     if(!resources_.UploadTexture(id,texture,capture->version,e)) return false;
+    if(texture.epoch_bound) epoch_textures_.insert(id);
     if(profiling_) {++profile_.texture_uploads;profile_.texture_bytes+=texture.data.size();}
   }
   lap(RecordProfile::kTextures);
@@ -318,16 +331,21 @@ bool GameRenderer::Draw(const guest::DrawPacket& draw,VkCommandBuffer command,Er
 #else
   const guest::ShaderConstantUse* vs_use=nullptr;const guest::ShaderConstantUse* ps_use=nullptr;
 #endif
-  auto reused=constant_bank_cache_enabled_ && constants.offset<=UINT32_MAX
+  // An edited PS constant: this draw's banks are written whole and not shared with
+  // the cache (another draw with the game's same constants must not get the edit).
+  const bool edited=edit.ps_register<256;
+  auto reused=constant_bank_cache_enabled_ && !edited && constants.offset<=UINT32_MAX
       ?constant_bank_cache_.Find(serial_,constants.chunk.get(),ConstantBankCache::Of(draw),draw.vs_version,draw.ps_version,vs_use,ps_use):ConstantBankCache::Reuse{};
   DrawBindings bindings;if(!BuildBindings(draw,constants.data,bindings,e,(reused.vs?0u:1u)|(reused.ps?0u:2u))) return false;
+  // Before Prepare, which flushes the slice: the PS bank follows the VS bank in the block (BuildBindings).
+  if(edited) std::memcpy(constants.data+sizeof(draw.constants.vs)+size_t(edit.ps_register)*16,edit.ps_value.data(),16);
   lap(RecordProfile::kBindings);
   DescriptorDraw descriptors;if(!descriptors_.Prepare(bindings,draw.texture_fetch,resources_,serial_,constants,descriptors,e)) return false;
   if(reused.vs) descriptors.dynamic_offsets[0]=reused.vs_offset;
   if(reused.ps) descriptors.dynamic_offsets[1]=reused.ps_offset;
   // Prepare flushed this slice; the chunk is held until completion and slices
   // are never overwritten inside a submission. Offset bases remain unchanged.
-  if(constant_bank_cache_enabled_) constant_bank_cache_.Commit(serial_,constants.chunk.get(),uint32_t(constants.offset),ConstantBankCache::Of(draw),reused,draw.vs_version,draw.ps_version,vs_use,ps_use);
+  if(constant_bank_cache_enabled_ && !edited) constant_bank_cache_.Commit(serial_,constants.chunk.get(),uint32_t(constants.offset),ConstantBankCache::Of(draw),reused,draw.vs_version,draw.ps_version,vs_use,ps_use);
   lap(RecordProfile::kDescriptors);
   auto pipeline=pipelines_.Acquire(draw,*pass,vs.artifact,ps.artifact,serial_,e);if(!pipeline) {e.message+="; VS="+std::to_string(draw.vertex_shader->hash)+", PS="+std::to_string(draw.pixel_shader?draw.pixel_shader->hash:0)+", RT0="+std::to_string(pass->formats[0])+", DS="+std::to_string(pass->depth_format);return false;}
   struct Binding {uint32_t slot;VkBuffer handle;VkDeviceSize offset;};

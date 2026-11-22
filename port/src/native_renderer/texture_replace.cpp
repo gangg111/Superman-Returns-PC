@@ -1,7 +1,9 @@
 #include "texture_replace.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -241,6 +243,8 @@ const std::vector<CostumeFile>& CostumeFiles() {
       {"body.png", {"4817CA35041A47A3"}, false},
       {"briefs_boots.png", {"BABD6E1873DAE219"}, false},
       {"cape.png", {"1DDFD929C1386395", "37723AEE4F1D9AE1", "156E060938442B71"}, false},
+      // The body's normal map (Xenos DXN, issue #7): the S and the belt are relief in it.
+      {"body_normal.png", {"2CE8A7839B12F6D5"}, false},
       {"thumb.png", {"D597E26BDE5373A9", "A3EC202389B3DF1A", "ACF323EDE2C52B6B"}, true},
       {"fullsize.png", {"ECDE511A52384ADF", "0FAEA40EE38407CC", "F1B7D42AE0D96D82"}, true},
   };
@@ -298,6 +302,52 @@ void NoteCapeSetting(int slot) {
   else if (!inside.empty()) REXLOG_WARN("costumes: slot {} cape_inside = {} is not \"#RRGGBB\"", slot + 3, inside);
 }
 
+// A name starting with a game texture's content hash, as the textures folder
+// names them (2CE8A7839B12F6D5_512x512_f49.png): 16 hex digits, then the end or '_'.
+bool HashNamed(const std::string& stem) {
+  if (stem.size() < 16 || (stem.size() > 16 && stem[16] != '_')) return false;
+  return std::all_of(stem.begin(), stem.begin() + 16, [](char c) { return std::isxdigit(uint8_t(c)) != 0; });
+}
+
+// Each slot's files named by a texture's hash (upper case), PNG or DDS: any of the
+// costume's textures, its normal maps included (issue #7), not only the named
+// files above. Listed again when another slot is worn (the files are read then).
+std::mutex g_slot_files_mutex;
+std::array<std::unordered_map<std::string, fs::path>, kCustomCostumes + 1> g_slot_files;
+uint32_t g_slot_files_generation = ~0u;
+
+void ListSlotFilesLocked() {
+  const uint32_t generation = g_costume_generation.load();
+  if (generation == g_slot_files_generation) return;
+  g_slot_files_generation = generation;
+  for (int slot = 1; slot <= kCustomCostumes; ++slot) {
+    auto& files = g_slot_files[slot];
+    files.clear();
+    std::error_code ec;
+    for (fs::directory_iterator it(CostumeDir(slot), ec), end; !ec && it != end; it.increment(ec)) {
+      if (!it->is_regular_file(ec)) continue;
+      std::string ext = it->path().extension().string();
+      std::transform(ext.begin(), ext.end(), ext.begin(), [](char c) { return char(std::tolower(uint8_t(c))); });
+      const std::string stem = it->path().stem().string();
+      if ((ext != ".png" && ext != ".dds") || !HashNamed(stem)) continue;
+      std::string hash = stem.substr(0, 16);
+      std::transform(hash.begin(), hash.end(), hash.begin(), [](char c) { return char(std::toupper(uint8_t(c))); });
+      // Two files for one texture: the DDS, as in the textures folder, else the first
+      // name in sort order; never the listing's order, which the file system decides.
+      auto [at, fresh] = files.emplace(hash, it->path());
+      if (!fresh) {
+        const bool old_dds = at->second.extension() == ".dds" || at->second.extension() == ".DDS";
+        const bool dds = ext == ".dds";
+        const bool wins = dds != old_dds ? dds : it->path().filename() < at->second.filename();
+        const fs::path loser = wins ? at->second : it->path();
+        if (wins) at->second = it->path();
+        REXLOG_WARN("costumes: slot {} has two files for {}, {} not used", slot + 3, hash, loser.string());
+      }
+    }
+    if (!files.empty()) REXLOG_INFO("costumes: slot {}: {} file(s) named by texture hash", slot + 3, files.size());
+  }
+}
+
 // The player's file standing for texture `name`, if the worn slot has one.
 bool CostumePath(const std::string& name, fs::path& out) {
   const std::string hash = name.substr(0, 16);
@@ -308,11 +358,21 @@ bool CostumePath(const std::string& name, fs::path& out) {
     if (slot <= 0) return false;
     std::error_code ec;
     const fs::path p = CostumeDir(slot) / f.file;
-    if (!fs::is_regular_file(p, ec)) return false;
+    if (!fs::is_regular_file(p, ec)) {
+      if (f.picture) return false;  // the screen's pictures: only the slots' own files
+      break;                        // a file named by the hash may stand for it
+    }
     out = p;
     return true;
   }
-  return false;
+  const int slot = CustomCostume();
+  if (slot <= 0) return false;
+  std::lock_guard lock(g_slot_files_mutex);
+  ListSlotFilesLocked();
+  const auto it = g_slot_files[slot].find(hash);
+  if (it == g_slot_files[slot].end()) return false;
+  out = it->second;
+  return true;
 }
 
 }  // namespace
@@ -341,6 +401,12 @@ bool IsCostumeTexture(const std::string& name) {
   const std::string hash = name.substr(0, 16);
   for (const auto& f : CostumeFiles())
     if (!f.picture && std::find(f.hashes.begin(), f.hashes.end(), hash) != f.hashes.end()) return true;
+  // A texture any slot has a hash-named file for: recreated on every change, so
+  // taking that slot off gives the game's texture back.
+  std::lock_guard lock(g_slot_files_mutex);
+  ListSlotFilesLocked();
+  for (int slot = 1; slot <= kCustomCostumes; ++slot)
+    if (g_slot_files[slot].count(hash)) return true;
   return false;
 }
 
@@ -553,24 +619,29 @@ bool LoadReplacement(const std::string& name, DecodedTexture& out) {
       REXLOG_INFO("textures: {} replaced by {} ({}x{}, {} mips, PNG {})", name, path.string(), t.width,
                   t.height, t.mip_levels, how);
   };
+  std::shared_ptr<const std::vector<uint8_t>> bytes;
   if (from_costume) {
-    const auto bytes = ReadWhole(path);
-    DecodedTexture t;
-    const char* why = nullptr;
-    if (!IsPng(*bytes) || !DecodePng(*bytes, t, why)) return fail(why ? why : "not a PNG file");
-    png_log(t, "of the custom costume");
-    out = std::move(t);
-    return true;
+    // A slot's PNG here; a slot's DDS (hash-named files) goes on as the textures folder's.
+    bytes = ReadWhole(path);
+    if (IsPng(*bytes)) {
+      DecodedTexture t;
+      const char* why = nullptr;
+      if (!DecodePng(*bytes, t, why)) return fail(why);
+      png_log(t, "of the custom costume");
+      out = std::move(t);
+      return true;
+    }
+  } else {
+    if (auto png = CachedPng(name)) {
+      png_log(*png, "decoded in advance");
+      out = *png;
+      return true;
+    }
+    // The file's bytes from the in-memory copy the prefetch thread reads at start
+    // (a read on the render worker stalled fast flight), else from disk now.
+    bytes = CachedFile(name);
+    if (!bytes) bytes = ReadWhole(path);
   }
-  if (auto png = CachedPng(name)) {
-    png_log(*png, "decoded in advance");
-    out = *png;
-    return true;
-  }
-  // The file's bytes from the in-memory copy the prefetch thread reads at start
-  // (a read on the render worker stalled fast flight), else from disk now.
-  std::shared_ptr<const std::vector<uint8_t>> bytes = CachedFile(name);
-  if (!bytes) bytes = ReadWhole(path);
   const std::vector<uint8_t>& b = *bytes;
   if (IsPng(b)) {
     DecodedTexture t;
@@ -629,6 +700,114 @@ bool LoadReplacement(const std::string& name, DecodedTexture& out) {
                   path.filename().string(), width, height, mips, uint32_t(format));
   }
   out = std::move(t);
+  return true;
+}
+
+namespace {
+// A replacement's DXGI format as the Vulkan renderer's linear format, kUnknown
+// when it has none (the game's texture is kept and that is logged).
+graphics::guest::LinearFormat LinearFromDxgi(DXGI_FORMAT f) {
+  using L = graphics::guest::LinearFormat;
+  switch (f) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: return L::kRGBA8Unorm;
+    // BGRA DDS files: the same bytes read as RGBA, red and blue swapped in the view.
+    case DXGI_FORMAT_B8G8R8A8_UNORM: return L::kRGBA8Unorm;
+    case DXGI_FORMAT_R8_UNORM: return L::kR8Unorm;
+    case DXGI_FORMAT_R8G8_UNORM: return L::kRG8Unorm;
+    case DXGI_FORMAT_R10G10B10A2_UNORM: return L::kRGB10A2Unorm;
+    case DXGI_FORMAT_BC1_UNORM: return L::kBC1;
+    case DXGI_FORMAT_BC2_UNORM: return L::kBC2;
+    case DXGI_FORMAT_BC3_UNORM: return L::kBC3;
+    case DXGI_FORMAT_BC4_UNORM: return L::kBC4;
+    case DXGI_FORMAT_BC5_UNORM: return L::kBC5;
+    case DXGI_FORMAT_BC7_UNORM: return L::kBC7;
+    case DXGI_FORMAT_R16_UNORM: return L::kR16Unorm;
+    case DXGI_FORMAT_R16G16_UNORM: return L::kRG16Unorm;
+    case DXGI_FORMAT_R16G16B16A16_UNORM: return L::kRGBA16Unorm;
+    case DXGI_FORMAT_R16_FLOAT: return L::kR16Float;
+    case DXGI_FORMAT_R16G16_FLOAT: return L::kRG16Float;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return L::kRGBA16Float;
+    case DXGI_FORMAT_R32_FLOAT: return L::kR32Float;
+    case DXGI_FORMAT_R32G32_FLOAT: return L::kRG32Float;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return L::kRGBA32Float;
+    default: return L::kUnknown;
+  }
+}
+}  // namespace
+
+bool ReplaceCapturedTexture(const graphics::guest::TextureCapture& capture,
+                            graphics::guest::LinearTexture& game, bool& costume) {
+  using L = graphics::guest::LinearFormat;
+  costume = false;
+  if (game.dimension != 1 || game.depth != 1) return false;  // as the D3D12 renderer: 2D only
+  // The A/B from a swap on is the D3D12 renderer's (it turns replacement on at that swap).
+  static const bool ab_warned = [] {
+    if (ReplaceFromSwap()) REXLOG_WARN("textures: sr_texture_replace_from_swap is D3D12 only; Vulkan uses no replacements");
+    return true;
+  }();
+  (void)ab_warned;
+  // The name D3D12's CreateTexture gives it: the same ranges in the same order,
+  // read from the capture (cached view, as the capture stored them).
+  uint64_t hash = 0;
+  for (const auto& range : capture.ranges) {
+    const auto bytes = capture.memory.Read(0xa0000000u + range.address, range.length);
+    if (bytes.size() < range.length) return false;
+    hash = HashTextureBytes(bytes.data(), range.length, hash);
+  }
+  DecodedTexture named;
+  named.width = game.width;
+  named.height = game.height;
+  named.guest_format = game.guest_format;
+  const std::string name = TextureName(hash, named);
+  costume = IsCostumeTexture(name);
+  DecodedTexture r;
+  if (!LoadReplacement(name, r)) return false;
+  if (r.dimension != 1 || r.depth != 1 || r.levels.empty()) return false;
+  const L format = LinearFromDxgi(r.format);
+  if (format == L::kUnknown) {
+    static std::mutex m;
+    static std::set<std::string> logged;
+    std::lock_guard lock(m);
+    if (logged.insert(name).second)
+      REXLOG_WARN("textures: {} replacement has DXGI format {}, which Vulkan does not take; game texture kept",
+                  name, uint32_t(r.format));
+    return false;
+  }
+  // The D3D12 rule (native_renderer.cpp CreateTexture): identity mapping, but a
+  // two-channel game texture keeps its own unless the replacement has one channel.
+  const bool two_channel = game.format == L::kBC5 || game.format == L::kRG8Unorm ||
+                           game.format == L::kRG16Unorm || game.format == L::kRG16Float;
+  const bool one_channel = format == L::kBC4 || format == L::kR8Unorm || format == L::kR16Unorm ||
+                           format == L::kR16Float || format == L::kR32Float;
+  graphics::guest::LinearTexture out;
+  out.width = r.width;
+  out.height = r.height;
+  out.depth = 1;
+  out.dimension = 1;
+  out.mip_levels = r.mip_levels;
+  out.format = format;
+  // The file's own channel order (BGRA read as RGBA), then the game's mapping on
+  // top where it applies: game component s of the view is the file's base[s].
+  const std::array<uint32_t, 4> base = r.format == DXGI_FORMAT_B8G8R8A8_UNORM
+                                           ? std::array<uint32_t, 4>{2, 1, 0, 3}
+                                           : std::array<uint32_t, 4>{0, 1, 2, 3};
+  out.swizzle = base;
+  if (two_channel && !one_channel)
+    for (int i = 0; i < 4; ++i) out.swizzle[i] = game.swizzle[i] < 4 ? base[game.swizzle[i]] : game.swizzle[i];
+  out.guest_format = game.guest_format;
+  out.base_address = game.base_address;
+  out.base_size = game.base_size;
+  for (const auto& l : r.levels) out.levels.push_back({l.width, l.height, l.row_pitch, l.rows, l.offset});
+  out.data = std::move(r.data);
+  {
+    static std::mutex m;
+    static std::set<std::string> logged;
+    std::lock_guard lock(m);
+    if (logged.insert(name).second)
+      REXLOG_INFO("textures: {} replaced in Vulkan ({}x{} -> {}x{}, {} mips)", name, game.width, game.height,
+                  out.width, out.height, out.mip_levels);
+  }
+  game = std::move(out);
   return true;
 }
 

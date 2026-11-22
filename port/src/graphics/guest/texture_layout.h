@@ -25,7 +25,10 @@ enum class LinearFormat {
   kRGBA16Float,
   kR32Float,
   kRG32Float,
-  kRGBA32Float
+  kRGBA32Float,
+  // Not game formats: replacement DDS files (texture_replace.h) may use them.
+  kBC4,
+  kBC7
 };
 struct LinearTexture {
   uint32_t width = 0, height = 0, depth = 1, mip_levels = 1, dimension = 1;
@@ -39,6 +42,10 @@ struct LinearTexture {
   // Mip-major, then array slice (or z slice for volume base level).
   std::vector<Level> levels;
   std::vector<uint8_t> data;
+  // Set by a platform decoder whose result depends on more than the guest bytes
+  // (PC: the worn costume slot's files): GameRenderer uploads it again whenever
+  // its texture_epoch changes.
+  bool epoch_bound = false;
 };
 struct TextureRange {
   uint32_t address, length;

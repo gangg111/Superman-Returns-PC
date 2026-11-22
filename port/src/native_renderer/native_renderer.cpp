@@ -1168,6 +1168,10 @@ D3D12_TEXTURE_ADDRESS_MODE MapClamp(uint32_t clamp) {
 
 }  // namespace
 
+// texture_replace.h: the content hash CreateTexture names textures by, for the
+// Vulkan renderer's captured textures (the same function, so the same names).
+uint64_t HashTextureBytes(const void* data, size_t size, uint64_t seed) { return TextureHash()(data, size, seed); }
+
 namespace {
 // Shader pack embedded in superman_returns.exe (RCDATA 2, tools/shaders/pack_shaders.py);
 // format and lookup in shader_pack.h.
@@ -5616,11 +5620,23 @@ uint32_t Renderer::CreateTexture(const uint32_t fetch[6], TextureEntry& entry) {
       if (++replaced <= 64)
         REXLOG_INFO("textures: {} replaced ({}x{} -> {}x{}, dxgi {})", tex_name, decoded.width,
                     decoded.height, replacement.width, replacement.height, int(replacement.format));
-      // Authored after the fetch swizzle: identity mapping.
+      // Authored after the fetch swizzle: identity mapping. Except a game texture
+      // with two channels (normal maps: DXN = BC5, sampled as R,G,G,G): the
+      // replacement keeps the game's mapping, so its R and G reach the shader
+      // exactly where the game's did and its B and A are not read (issue #7).
+      const DXGI_FORMAT f = decoded.format;
+      const bool two_channel = f == DXGI_FORMAT_BC5_UNORM || f == DXGI_FORMAT_R8G8_UNORM ||
+                               f == DXGI_FORMAT_R16G16_UNORM || f == DXGI_FORMAT_R16G16_FLOAT;
+      const uint32_t game_mapping = decoded.component_mapping;
       replacement.guest_format = decoded.guest_format;
       replacement.base_address = decoded.base_address;
       replacement.base_size = decoded.base_size;
       decoded = std::move(replacement);
+      // A one-channel replacement (BC4, R8) has no G for the mapping to read: identity.
+      const DXGI_FORMAT r = decoded.format;
+      const bool one_channel = r == DXGI_FORMAT_BC4_UNORM || r == DXGI_FORMAT_BC4_SNORM ||
+                               r == DXGI_FORMAT_R8_UNORM || r == DXGI_FORMAT_R16_UNORM || r == DXGI_FORMAT_R16_FLOAT;
+      if (two_channel && !one_channel) decoded.component_mapping = game_mapping;
     }
   }
   D3D12_HEAP_PROPERTIES heap{};

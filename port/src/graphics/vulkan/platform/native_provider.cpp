@@ -7,6 +7,8 @@
 #include "../frame_generation_policy.h"
 #include "../../../native_renderer/native_renderer.h"
 #include "../../../native_renderer/hang_watchdog.h"
+#include "../../../native_renderer/texture_replace.h"
+#include <cstring>
 #include <rex/ui/surface_win.h>
 #include <rex/logging.h>
 #include <algorithm>
@@ -60,8 +62,27 @@ struct Host {
     REXLOG_INFO("native Vulkan: {} precompiled shaders from {}",shaders->PrecompiledCount(),config.shaders.library.string());
     if(!shaders->LibraryDiagnostic().empty()) REXLOG_WARN("native Vulkan: pre-shader library unavailable: {}; compiling misses at runtime",shaders->LibraryDiagnostic());
     ShaderLookup lookup=[this](const guest::ShaderCapture& capture) {auto key=shaders->Request(capture.container,capture.vertex?shaders::ShaderStage::kVertex:shaders::ShaderStage::kPixel);return shaders->Poll(key);};
-    TextureDecoder decode=[](const guest::TextureCapture& capture,guest::LinearTexture& result,std::string& error){return guest::DecodeTextureLayout(capture.fetch,capture.memory,result,error);};
+    // The textures folder and the costume slots (texture_replace.h), as in the D3D12 renderer.
+    TextureDecoder decode=[](const guest::TextureCapture& capture,guest::LinearTexture& result,std::string& error){
+      if(!guest::DecodeTextureLayout(capture.fetch,capture.memory,result,error)) return false;
+      bool costume=false;native::ReplaceCapturedTexture(capture,result,costume);
+      result.epoch_bound=costume;
+      return true;
+    };
     game=std::make_unique<GameFrame>(context,gpu_mutex,std::move(lookup),std::move(decode));
+    game->Renderer().texture_epoch=[] {return native::CustomCostumeGeneration();};
+    // The worn slot's cape (native_renderer.cpp, the same shaders): cape = false leaves
+    // the cape's draws out; cape_inside sets its inside's colour, PS constant c45 (w the game's).
+    game->Renderer().draw_edit=[](const guest::DrawPacket& draw,GameRenderer::DrawEdit& edit) {
+      constexpr uint64_t kCapeVs=0xA5232A3184AA617Cull,kCapePs=0x71CB82D791DE8E77ull;
+      if(!draw.vertex_shader || draw.vertex_shader->hash!=kCapeVs) return;
+      if(native::CostumeCapeHidden()) {edit.skip=true;return;}
+      float rgb[3];
+      if(!draw.pixel_shader || draw.pixel_shader->hash!=kCapePs || !native::CostumeCapeInside(rgb)) return;
+      edit.ps_register=45;
+      std::memcpy(edit.ps_value.data(),draw.PsWords()+45*4,16);
+      for(int i=0;i<3;++i) edit.ps_value[i]=rgb[i];
+    };
     game->compilation_progress=[] {native::HangWatchdogBeat();};
     resources=std::make_unique<ResourceStore>(context);compositor=std::make_unique<FrontbufferCompositor>(context);immediate=std::make_unique<ImmediateRenderer>(context);
     return game->Initialize(config.driver_cache,e) && compositor->Initialize(e) && immediate->Initialize(e);
