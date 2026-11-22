@@ -39,6 +39,12 @@ REXCVAR_DEFINE_DOUBLE(sr_night_windows, 1.0, "Superman Returns",
 REXCVAR_DEFINE_DOUBLE(sr_daynight_cycle_minutes, 0.0, "Superman Returns",
                       "Day and night: real minutes per 24-hour day from sr_time_of_day on; 0 = the time stays put")
     .range(0.0, 1440.0);
+REXCVAR_DEFINE_DOUBLE(sr_shadow_sun_step_minutes, 1.0, "Superman Returns",
+                      "Day and night: the shadow-map sun moves in steps of this many game minutes "
+                      "(a sun turning every frame makes the edges crawl); 0 = every frame. "
+                      "Ray-traced shadows always follow the sun smoothly")
+    .range(0.0, 60.0);
+REXCVAR_DECLARE(bool, sr_rt_shadows);
 
 namespace {
 
@@ -193,7 +199,13 @@ REX_HOOK_RAW(sub_823028A8) {
     const double anchor = 6.0 + 12.0 * (1.0 - std::asin(std::clamp(el0 / kNoonElevation, -1.0, 1.0)) / kPi);
     g_game_elevation.store(el0, std::memory_order_relaxed);
     g_anchor_hour.store(anchor, std::memory_order_relaxed);
-    const double h = CurrentHour();
+    double h = CurrentHour();
+    // Raster cascades: a light that turns a little every frame rotates the
+    // texel grid every frame, and the game's texel snap only covers camera
+    // movement, so edges crawl. Hold the direction between steps instead.
+    const double step_min = REXCVAR_GET(sr_shadow_sun_step_minutes);
+    if (step_min > 0.0 && !REXCVAR_GET(sr_rt_shadows) && REXCVAR_GET(sr_daynight_cycle_minutes) > 0.0)
+      h = std::floor(h * 60.0 / step_min) * step_min / 60.0;
     const double el = std::clamp(SunElevation(h), kShadowMinElevation, kShadowMaxElevation) * kPi / 180.0;
     const double az = az0 + (h - anchor) * (kPi / 12.0);  // 15 degrees an hour
     const V3 sun{std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az)};
