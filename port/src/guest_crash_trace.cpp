@@ -8,6 +8,7 @@
 // stack: a frame's back chain at [sp], the caller's saved LR at back chain - 8
 // (prolog stw r12,-8(r1) + stwu). Every read is checked with VirtualQuery: a walk
 // past the stack's end must not fault inside the handler.
+#include <atomic>
 #include <csignal>
 #include <cstdint>
 #include <cstring>
@@ -16,12 +17,16 @@
 
 #include <string>
 
+#include <rex/cvar.h>
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/system/thread_state.h>
 
 #include "generated/default/superman_returns_init.h"
+
+REXCVAR_DEFINE_BOOL(sr_apt_check_fast, true, "Superman Returns",
+                    "Apt release check: plain reads guarded by SEH (false: VirtualQuery before every read, as 1.0.16)");
 
 namespace superman_returns {
 namespace {
@@ -34,6 +39,31 @@ bool Readable(const void* p, size_t n) {
   if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return false;
   const auto end = reinterpret_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
   return reinterpret_cast<const uint8_t*>(p) + n <= end;
+}
+
+// The release hook's reads: a plain load, an access violation (a page not
+// committed) caught by SEH. VirtualQuery before each read cost ~15 us per table
+// entry in the guest's huge reservation (the region's extent is walked page by
+// page): up to 1.35 s per 10 s in fights, the stutter of 1.0.16 (2026-11-22).
+__declspec(noinline) bool GuestU32Seh(uint32_t address, uint32_t& value) {
+  if (!g_membase || address < 0x1000) return false;
+  __try {
+    value = _byteswap_ulong(*reinterpret_cast<const volatile uint32_t*>(g_membase + address));
+    return true;
+  } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                               : EXCEPTION_CONTINUE_SEARCH) {
+    return false;
+  }
+}
+
+__declspec(noinline) bool GuestClearU32Seh(uint32_t address) {
+  __try {
+    *reinterpret_cast<volatile uint32_t*>(g_membase + address) = 0;
+    return true;
+  } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                               : EXCEPTION_CONTINUE_SEARCH) {
+    return false;
+  }
 }
 
 bool GuestU32(uint32_t address, uint32_t& value) {
@@ -141,16 +171,16 @@ std::string GuestText(uint32_t p, int n) {
 REX_HOOK_RAW(sub_82697398) {
   using namespace superman_returns;
   static int logged = 0;
+  LARGE_INTEGER t0;
+  QueryPerformanceCounter(&t0);
+  const bool fast = REXCVAR_GET(sr_apt_check_fast);
+  auto read = [fast](uint32_t a, uint32_t& v) { return fast ? GuestU32Seh(a, v) : GuestU32(a, v); };
   const uint32_t box = ctx.r3.u32;
   uint32_t count = 0, entries = 0;
-  if (logged < 10 && GuestU32(box, count) && GuestU32(box + 4, entries) && count && count <= 256) {
-    bool bad = false;
-    for (uint32_t i = 0; i < count && !bad; ++i) {
-      uint32_t v = 0, vt = 0, fn = 0;
-      if (!GuestU32(entries + 8 * i + 4, v) || !v) continue;
-      if (!GuestU32(v, vt) || !GuestU32(vt + 4, fn) || fn < 0x82000000 || fn >= 0x82A00000) bad = true;
-    }
-    if (bad) {
+  // the first freed value of this table: the whole table logged (up to 10 tables)
+  // while its keys and values are still there, before any slot is cleared
+  auto log_table = [&] {
+    {
       ++logged;
       REXLOG_CRITICAL("crash trace: table {:08X} with a freed value (lr {:08X}), {} slot(s):", box, uint32_t(ctx.lr),
                       count);
@@ -170,23 +200,41 @@ REX_HOOK_RAW(sub_82697398) {
       }
       if (auto logger = rex::GetLogger()) logger->flush();
     }
-  }
+  };
   // Fix: a value whose vtable[1] is not game code is an object already freed (its
   // memory taken by another): releasing it called garbage (0x20). Its slot is
   // cleared, so the loop below skips it as it skips empty slots (the game's own
   // latent use after free, the TimerStop event's Data: the menu poll's allocations
   // reuse the freed memory; Costumes then METROPOLIS crashed the game, 2026-11-22).
-  if (GuestU32(box, count) && GuestU32(box + 4, entries) && count && count <= 4096) {
+  if (read(box, count) && read(box + 4, entries) && count && count <= 4096) {
+    bool table_logged = false;
     for (uint32_t i = 0; i < count; ++i) {
       uint32_t v = 0, vt = 0, fn = 0;
-      if (!GuestU32(entries + 8 * i + 4, v) || !v) continue;
-      if (GuestU32(v, vt) && GuestU32(vt + 4, fn) && fn >= 0x82000000 && fn < 0x82A00000) continue;
-      uint8_t* slot = g_membase + entries + 8 * i + 4;
-      if (!Readable(slot, 4)) continue;
-      std::memset(slot, 0, 4);
+      if (!read(entries + 8 * i + 4, v) || !v) continue;
+      if (read(v, vt) && read(vt + 4, fn) && fn >= 0x82000000 && fn < 0x82A00000) continue;
+      if (!table_logged && logged < 10 && count <= 256) log_table();
+      table_logged = true;
+      if (!GuestClearU32Seh(entries + 8 * i + 4)) continue;
       static int skipped = 0;
       if (skipped++ < 20)
         REXLOG_WARN("apt: freed object {:08X} in table {:08X} slot {} not released again", v, box, i);
+    }
+  }
+  // the check's own cost, every 10 s with calls (a slowdown here shows in the log)
+  {
+    static std::atomic<uint64_t> calls{0}, ticks{0}, last{0}, slots{0};
+    LARGE_INTEGER t1, f;
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    calls.fetch_add(1, std::memory_order_relaxed);
+    slots.fetch_add(count <= 4096 ? count : 0, std::memory_order_relaxed);
+    ticks.fetch_add(uint64_t(t1.QuadPart - t0.QuadPart), std::memory_order_relaxed);
+    uint64_t prev = last.load(std::memory_order_relaxed);
+    if (!prev) last.compare_exchange_strong(prev, uint64_t(t1.QuadPart));
+    else if (uint64_t(t1.QuadPart) - prev >= uint64_t(f.QuadPart) * 10 &&
+             last.compare_exchange_strong(prev, uint64_t(t1.QuadPart))) {
+      const uint64_t n = calls.exchange(0), t = ticks.exchange(0), e = slots.exchange(0);
+      REXLOG_INFO("apt release check: {} calls, {} slots in 10 s, {:.2f} ms spent", n, e, double(t) * 1000.0 / double(f.QuadPart));
     }
   }
   __imp__sub_82697398(ctx, base);
