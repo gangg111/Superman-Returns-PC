@@ -5615,7 +5615,18 @@ uint32_t Renderer::CreateTexture(const uint32_t fetch[6], TextureEntry& entry) {
     DumpTextureOnce(tex_name, decoded,
                     IsGammaFetch(fetch) && REXCVAR_GET(sr_native_texture_gamma) == 1);
     DecodedTexture replacement;
-    if (LoadReplacement(tex_name, replacement)) {
+    // The game's base level, for a <name>.rgb.png (its alpha, issue #2).
+    GameAlpha alpha;
+    if (!decoded.levels.empty() && decoded.levels[0].offset <= decoded.data.size()) {
+      alpha.format = decoded.format;
+      alpha.width = decoded.levels[0].width;
+      alpha.height = decoded.levels[0].height;
+      alpha.row_pitch = decoded.levels[0].row_pitch;
+      alpha.data = decoded.data.data() + decoded.levels[0].offset;
+      alpha.size = decoded.data.size() - decoded.levels[0].offset;
+      alpha.select = (decoded.component_mapping >> 9) & 7;
+    }
+    if (LoadReplacement(tex_name, replacement, &alpha)) {
       static uint32_t replaced = 0;
       if (++replaced <= 64)
         REXLOG_INFO("textures: {} replaced ({}x{} -> {}x{}, dxgi {})", tex_name, decoded.width,

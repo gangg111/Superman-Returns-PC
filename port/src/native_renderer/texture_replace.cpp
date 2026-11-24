@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -85,6 +86,20 @@ bool IsPng(const std::vector<uint8_t>& b) {
 }
 
 bool DecodePng(const std::vector<uint8_t>& b, DecodedTexture& t, const char*& why);
+void BuildRgbaMips(std::vector<uint8_t> level, uint32_t width, uint32_t height, DecodedTexture& t);
+bool ApplyGameAlpha(DecodedTexture& t, const GameAlpha& g, const char*& why);
+
+// <name>.rgb.png: the player's colour with the game texture's alpha (issue #2).
+bool IsRgbOnly(const fs::path& path) {
+  const std::string stem = path.stem().string();
+  return stem.size() > 4 && _stricmp(stem.c_str() + stem.size() - 4, ".rgb") == 0;
+}
+
+// The texture name a file stands for: its stem, without ".rgb" for <name>.rgb.png.
+std::string ReplacementKey(const fs::path& path) {
+  const std::string stem = path.stem().string();
+  return IsRgbOnly(path) ? stem.substr(0, stem.size() - 4) : stem;
+}
 
 const ReplaceIndex& Index() {
   static const ReplaceIndex index = [] {
@@ -119,7 +134,7 @@ const ReplaceIndex& Index() {
       if (ext == ".dds")
         r.files.insert_or_assign(e.path().stem().string(), e.path());
       else if (ext == ".png")
-        r.files.emplace(e.path().stem().string(), e.path());
+        r.files.emplace(ReplacementKey(e.path()), e.path());  // <name>.png or <name>.rgb.png
     }
     REXLOG_INFO("textures: {} replacement(s) in {}", r.files.size(), r.dir.string());
     // All of them into memory on a background thread (about 100 MB), so the
@@ -564,6 +579,13 @@ bool DecodePng(const std::vector<uint8_t>& b, DecodedTexture& t, const char*& wh
     why = "PNG pixels unreadable";
     return false;
   }
+  BuildRgbaMips(std::move(level), width, height, t);
+  return true;
+}
+
+// `level` (RGBA8, width x height) and every mip below it into `t`, each a 2x2 box
+// of the one above (the last row or column kept for an odd size).
+void BuildRgbaMips(std::vector<uint8_t> level, uint32_t width, uint32_t height, DecodedTexture& t) {
   t = {};
   t.width = width;
   t.height = height;
@@ -590,12 +612,115 @@ bool DecodePng(const std::vector<uint8_t>& b, DecodedTexture& t, const char*& wh
     h = nh;
   }
   t.mip_levels = uint32_t(t.levels.size());
+}
+
+// The game texture's alpha as it reaches the shader, one byte per pixel.
+bool GameAlphaPlane(const GameAlpha& g, std::vector<uint8_t>& a, const char*& why) {
+  const uint32_t w = g.width, h = g.height;
+  if (!w || !h) {
+    why = "the game texture has no size";
+    return false;
+  }
+  a.assign(size_t(w) * h, 255);
+  if (g.select == 4 || g.select == 5) {
+    if (g.select == 4) std::fill(a.begin(), a.end(), uint8_t(0));
+    return true;
+  }
+  if (g.select > 3 || !g.data) {
+    why = "the game texture's alpha is not readable";
+    return false;
+  }
+  const auto u16 = [](const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1]) << 8; };
+  switch (g.format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: {
+      const bool bgra = g.format == DXGI_FORMAT_B8G8R8A8_UNORM || g.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+      const uint32_t byte = bgra ? std::array<uint32_t, 4>{2, 1, 0, 3}[g.select] : g.select;
+      if (g.row_pitch < w * 4 || g.size < size_t(g.row_pitch) * (h - 1) + w * 4) break;
+      for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) a[size_t(y) * w + x] = g.data[size_t(y) * g.row_pitch + x * 4 + byte];
+      return true;
+    }
+    case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB: {
+      if (g.select != 3) {
+        why = "the game texture's alpha comes from a colour channel";
+        return false;
+      }
+      const bool bc1 = g.format == DXGI_FORMAT_BC1_UNORM || g.format == DXGI_FORMAT_BC1_UNORM_SRGB;
+      const bool bc2 = g.format == DXGI_FORMAT_BC2_UNORM || g.format == DXGI_FORMAT_BC2_UNORM_SRGB;
+      const uint32_t block = bc1 ? 8 : 16, bw = (w + 3) / 4, bh = (h + 3) / 4;
+      if (g.row_pitch < bw * block || g.size < size_t(g.row_pitch) * (bh - 1) + bw * block) break;
+      for (uint32_t by = 0; by < bh; ++by)
+        for (uint32_t bx = 0; bx < bw; ++bx) {
+          const uint8_t* b = g.data + size_t(by) * g.row_pitch + size_t(bx) * block;
+          uint8_t px[16];
+          if (bc1) {
+            // index 3 is transparent when colour 0 <= colour 1
+            const bool punch = u16(b) <= u16(b + 2);
+            const uint32_t idx = u16(b + 4) | u16(b + 6) << 16;
+            for (int i = 0; i < 16; ++i) px[i] = punch && ((idx >> (2 * i)) & 3) == 3 ? 0 : 255;
+          } else if (bc2) {
+            for (int i = 0; i < 16; ++i) px[i] = uint8_t(((u16(b + 2 * (i / 4)) >> (4 * (i % 4))) & 0xF) * 17);
+          } else {
+            const uint32_t a0 = b[0], a1 = b[1];
+            uint8_t pal[8] = {uint8_t(a0), uint8_t(a1)};
+            if (a0 > a1)
+              for (int k = 1; k < 7; ++k) pal[k + 1] = uint8_t(((7 - k) * a0 + k * a1 + 3) / 7);
+            else {
+              for (int k = 1; k < 5; ++k) pal[k + 1] = uint8_t(((5 - k) * a0 + k * a1 + 2) / 5);
+              pal[6] = 0;
+              pal[7] = 255;
+            }
+            uint64_t bits = 0;
+            for (int k = 0; k < 6; ++k) bits |= uint64_t(b[2 + k]) << (8 * k);
+            for (int i = 0; i < 16; ++i) px[i] = pal[(bits >> (3 * i)) & 7];
+          }
+          for (int i = 0; i < 16; ++i) {
+            const uint32_t x = bx * 4 + i % 4, y = by * 4 + i / 4;
+            if (x < w && y < h) a[size_t(y) * w + x] = px[i];
+          }
+        }
+      return true;
+    }
+    default:
+      why = "the game texture's format has no alpha this reads (BC1, BC2, BC3, RGBA8)";
+      return false;
+  }
+  why = "the game texture's data is shorter than its size";
+  return false;
+}
+
+// `t` (an RGBA8 PNG, all mips) with the game's alpha in its base level, resampled
+// to the PNG's size (bilinear, texel centres), and its mips made again.
+bool ApplyGameAlpha(DecodedTexture& t, const GameAlpha& g, const char*& why) {
+  std::vector<uint8_t> a;
+  if (!GameAlphaPlane(g, a, why)) return false;
+  const uint32_t w = t.width, h = t.height;
+  std::vector<uint8_t> level(t.data.begin() + t.levels[0].offset,
+                             t.data.begin() + t.levels[0].offset + size_t(w) * h * 4);
+  const auto at = [&](int x, int y) {
+    x = std::clamp(x, 0, int(g.width) - 1);
+    y = std::clamp(y, 0, int(g.height) - 1);
+    return float(a[size_t(y) * g.width + x]);
+  };
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x) {
+      const float u = (x + 0.5f) * g.width / w - 0.5f, v = (y + 0.5f) * g.height / h - 0.5f;
+      const int x0 = int(std::floor(u)), y0 = int(std::floor(v));
+      const float fu = u - x0, fv = v - y0;
+      const float value = (at(x0, y0) * (1 - fu) + at(x0 + 1, y0) * fu) * (1 - fv) +
+                          (at(x0, y0 + 1) * (1 - fu) + at(x0 + 1, y0 + 1) * fu) * fv;
+      level[(size_t(y) * w + x) * 4 + 3] = uint8_t(std::clamp(value + 0.5f, 0.0f, 255.0f));
+    }
+  BuildRgbaMips(std::move(level), w, h, t);
   return true;
 }
 
 }  // namespace
 
-bool LoadReplacement(const std::string& name, DecodedTexture& out) {
+bool LoadReplacement(const std::string& name, DecodedTexture& out, const GameAlpha* game) {
   std::call_once(g_replace_init, [] { g_replace_enabled = ReplaceFromSwap() == 0; });
   if (!g_replace_enabled) return false;
   // The worn custom costume's file first; it is read now (the prefetched copies
@@ -619,6 +744,18 @@ bool LoadReplacement(const std::string& name, DecodedTexture& out) {
       REXLOG_INFO("textures: {} replaced by {} ({}x{}, {} mips, PNG {})", name, path.string(), t.width,
                   t.height, t.mip_levels, how);
   };
+  // A decoded PNG into `out`; a <name>.rgb.png first gets the game texture's alpha.
+  const bool rgb_only = IsRgbOnly(path);
+  const auto use_png = [&](DecodedTexture t, const char* how) {
+    if (rgb_only) {
+      const char* why = nullptr;
+      if (!game) return fail("a .rgb.png needs the game's texture (not one of the port's own)");
+      if (!ApplyGameAlpha(t, *game, why)) return fail(why);
+    }
+    png_log(t, rgb_only ? "with the game texture's alpha" : how);
+    out = std::move(t);
+    return true;
+  };
   std::shared_ptr<const std::vector<uint8_t>> bytes;
   if (from_costume) {
     // A slot's PNG here; a slot's DDS (hash-named files) goes on as the textures folder's.
@@ -627,16 +764,10 @@ bool LoadReplacement(const std::string& name, DecodedTexture& out) {
       DecodedTexture t;
       const char* why = nullptr;
       if (!DecodePng(*bytes, t, why)) return fail(why);
-      png_log(t, "of the custom costume");
-      out = std::move(t);
-      return true;
+      return use_png(std::move(t), "of the custom costume");
     }
   } else {
-    if (auto png = CachedPng(name)) {
-      png_log(*png, "decoded in advance");
-      out = *png;
-      return true;
-    }
+    if (auto png = CachedPng(name)) return use_png(*png, "decoded in advance");
     // The file's bytes from the in-memory copy the prefetch thread reads at start
     // (a read on the render worker stalled fast flight), else from disk now.
     bytes = CachedFile(name);
@@ -647,10 +778,9 @@ bool LoadReplacement(const std::string& name, DecodedTexture& out) {
     DecodedTexture t;
     const char* why = nullptr;
     if (!DecodePng(b, t, why)) return fail(why);
-    png_log(t, "decoded on the render thread (not prefetched yet)");
-    out = std::move(t);
-    return true;
+    return use_png(std::move(t), "decoded on the render thread (not prefetched yet)");
   }
+  if (rgb_only) return fail("a .rgb file must be a PNG");
   if (b.size() < 128 || std::memcmp(b.data(), "DDS ", 4) != 0) return fail("not a DDS or PNG file");
   uint32_t h[31];
   std::memcpy(h, b.data() + 4, sizeof(h));
@@ -760,8 +890,25 @@ bool ReplaceCapturedTexture(const graphics::guest::TextureCapture& capture,
   named.guest_format = game.guest_format;
   const std::string name = TextureName(hash, named);
   costume = IsCostumeTexture(name);
+  // The game's base level, for a <name>.rgb.png (the Vulkan formats with alpha).
+  GameAlpha alpha;
+  switch (game.format) {
+    case L::kBC1: alpha.format = DXGI_FORMAT_BC1_UNORM; break;
+    case L::kBC2: alpha.format = DXGI_FORMAT_BC2_UNORM; break;
+    case L::kBC3: alpha.format = DXGI_FORMAT_BC3_UNORM; break;
+    case L::kRGBA8Unorm: alpha.format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+    default: break;
+  }
+  if (!game.levels.empty() && game.levels[0].offset <= game.data.size()) {
+    alpha.width = game.levels[0].width;
+    alpha.height = game.levels[0].height;
+    alpha.row_pitch = game.levels[0].row_pitch;
+    alpha.data = game.data.data() + game.levels[0].offset;
+    alpha.size = game.data.size() - game.levels[0].offset;
+  }
+  alpha.select = game.swizzle[3];
   DecodedTexture r;
-  if (!LoadReplacement(name, r)) return false;
+  if (!LoadReplacement(name, r, &alpha)) return false;
   if (r.dimension != 1 || r.depth != 1 || r.levels.empty()) return false;
   const L format = LinearFromDxgi(r.format);
   if (format == L::kUnknown) {

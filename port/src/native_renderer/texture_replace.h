@@ -11,7 +11,8 @@
 // <name>.dds there is uploaded instead of the game's texture, with its own
 // size, mip count and DXGI format (any DX10 DDS: RGBA8, BC1-BC7). It is
 // authored after the swizzle (what the player sees), so it is sampled with
-// the identity mapping; gamma textures keep their sRGB view.
+// the identity mapping; gamma textures keep their sRGB view. A <name>.rgb.png
+// gives only the colour: the alpha stays the game texture's (GameAlpha below).
 #pragma once
 
 #include <cstdint>
@@ -40,8 +41,22 @@ std::string TextureName(uint64_t content_hash, const DecodedTexture& decoded);
 // Writes <dir>/<name>.dds and .json once per name; no-op without a dump dir.
 void DumpTextureOnce(const std::string& name, const DecodedTexture& decoded, bool gamma);
 
-// Loads the replacement for `name`, if any, into `out` (2D, one slice).
-bool LoadReplacement(const std::string& name, DecodedTexture& out);
+// The base level of the game's own texture, for replacements named
+// <name>.rgb.png (issue #2): their red, green and blue are used with the game's
+// alpha, which in many textures is a mask (the face, BC2: 0 = skin) that paint
+// programs lose. Read from BC1, BC2, BC3, RGBA8 and BGRA8.
+struct GameAlpha {
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  uint32_t width = 0, height = 0;
+  uint32_t row_pitch = 0;  // bytes per row of pixels, or of 4x4 blocks
+  const uint8_t* data = nullptr;
+  size_t size = 0;
+  uint32_t select = 3;  // the view's alpha: decoded channel 0..3, 4 = zero, 5 = one
+};
+
+// Loads the replacement for `name`, if any, into `out` (2D, one slice). A
+// <name>.rgb.png takes its alpha from `game` and is not used without it.
+bool LoadReplacement(const std::string& name, DecodedTexture& out, const GameAlpha* game = nullptr);
 
 bool IsBlockCompressed(DXGI_FORMAT format);
 
